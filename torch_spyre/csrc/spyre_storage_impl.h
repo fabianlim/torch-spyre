@@ -33,6 +33,10 @@ class SpyreStorageImpl : public c10::StorageImpl {
  public:
   SpyreStorageImpl(use_byte_size_t, c10::SymInt size_bytes,
                    at::Allocator* allocator, bool resizable);
+
+  // Constructor for wrapping existing device memory without allocation
+  SpyreStorageImpl(use_byte_size_t, c10::SymInt size_bytes,
+                   at::DataPtr data_ptr);
 };
 
 }  // namespace spyre

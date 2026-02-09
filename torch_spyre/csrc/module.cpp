@@ -256,6 +256,8 @@ PYBIND11_MODULE(_C, m) {
   m.def("spyre_empty_with_layout", &spyre::spyre_empty_with_layout);
   m.def("to_with_layout", &spyre::to_with_layout);
   m.def("empty_with_layout", &spyre::empty_with_layout);
+  m.def("spyre_from_blob", &spyre::spyre_from_blob);
+  m.def("from_blob", &spyre::from_blob);
 
   py::enum_<DataFormats>(m, "DataFormats")
       .value("SEN169_FP16", DataFormats::SEN169_FP16)

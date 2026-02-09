@@ -22,4 +22,9 @@ SpyreStorageImpl::SpyreStorageImpl(use_byte_size_t, c10::SymInt size_bytes,
                                    at::Allocator* allocator, bool resizable)
     : c10::StorageImpl(use_byte_size_t(), size_bytes, allocator, resizable) {}
 
+SpyreStorageImpl::SpyreStorageImpl(use_byte_size_t, c10::SymInt size_bytes,
+                                   at::DataPtr data_ptr)
+    : c10::StorageImpl(use_byte_size_t(), size_bytes, std::move(data_ptr),
+                       /*allocator=*/nullptr, /*resizable=*/false) {}
+
 }  // namespace spyre

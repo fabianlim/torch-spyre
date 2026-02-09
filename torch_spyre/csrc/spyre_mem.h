@@ -45,4 +45,16 @@ at::Tensor empty_with_layout(
     std::optional<c10::Layout> layout_opt,
     std::optional<c10::Device> device_opt, std::optional<bool> pin_memory_opt,
     std::optional<c10::MemoryFormat> memory_format_opt);
+
+at::Tensor spyre_from_blob(void* data_ptr, c10::IntArrayRef size,
+                           c10::IntArrayRef stride, c10::ScalarType dtype,
+                           SpyreTensorLayout device_layout);
+
+at::Tensor from_blob(void* data_ptr, c10::IntArrayRef size,
+                     SpyreTensorLayout device_layout,
+                     std::optional<c10::ScalarType> dtype_opt,
+                     std::optional<c10::Layout> layout_opt,
+                     std::optional<c10::Device> device_opt,
+                     std::optional<bool> pin_memory_opt,
+                     std::optional<c10::MemoryFormat> memory_format_opt);
 }  // namespace spyre

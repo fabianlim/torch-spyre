@@ -725,6 +725,79 @@ at::Tensor empty_with_layout(
   DEBUGINFO("SpyreTensorLayout: ", device_layout.toString());
   return tensor;
 }
+
+at::Tensor spyre_from_blob(void* data_ptr, c10::IntArrayRef size,
+                           c10::IntArrayRef stride, c10::ScalarType dtype,
+                           SpyreTensorLayout device_layout) {
+  at::detail::check_size_nonnegative(size);
+  c10::Device device =
+      c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice();
+  size_t size_bytes = get_device_size_in_bytes(device_layout);
+
+  DEBUGINFO("Creating tensor from existing device memory at ", data_ptr,
+            " with ", size_bytes, " bytes");
+
+  // Create a no-op deleter since we don't own this memory
+  auto no_op_deleter = [](void* ctx_void) {
+    // Do nothing - caller owns the memory
+    DEBUGINFO("from_blob: no-op deleter called (memory not freed)");
+  };
+
+  // Wrap the existing device pointer without taking ownership
+  auto data_ptr_wrapped =
+      at::DataPtr(data_ptr, /*ctx=*/nullptr, no_op_deleter, device);
+
+  // Create storage that wraps the existing memory
+  auto spyre_storage_impl = c10::make_intrusive<SpyreStorageImpl>(
+      c10::StorageImpl::use_byte_size_t(), size_bytes,
+      std::move(data_ptr_wrapped));
+  auto spyre_storage = c10::Storage(spyre_storage_impl);
+
+  // Create the Spyre Tensor
+  const c10::DeviceGuard device_guard(device);
+  constexpr c10::DispatchKeySet pu1_dks(c10::DispatchKey::PrivateUse1);
+  auto tensor = at::detail::make_tensor_base<SpyreTensorImpl>(
+      std::move(spyre_storage), pu1_dks, c10::scalarTypeToTypeMeta(dtype));
+
+  auto tensorImpl = tensor.unsafeGetTensorImpl();
+  tensorImpl->set_sizes_and_strides(size, stride);
+
+  static_cast<SpyreTensorImpl*>(tensorImpl)->spyre_layout = device_layout;
+  DEBUGINFO("SpyreTensorLayout: ", device_layout.toString());
+  return tensor;
+}
+
+at::Tensor from_blob(void* data_ptr, c10::IntArrayRef size,
+                     SpyreTensorLayout device_layout,
+                     std::optional<c10::ScalarType> dtype_opt,
+                     std::optional<c10::Layout> layout_opt,
+                     std::optional<c10::Device> device_opt,
+                     std::optional<bool> pin_memory_opt,
+                     std::optional<c10::MemoryFormat> memory_format_opt) {
+  c10::Device device = device_opt.value_or(
+      c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice());
+  DEBUGINFO("from_blob: shape=", size, " on Spyre ", device);
+  const auto dtype = c10::dtype_or_default(dtype_opt);
+  TORCH_CHECK(device.is_privateuseone(),
+              "from_blob only supports Spyre device");
+  TORCH_CHECK(c10::layout_or_default(layout_opt) == c10::Layout::Strided,
+              "Non strided layout not supported");
+  TORCH_CHECK(!c10::pinned_memory_or_default(pin_memory_opt),
+              "Pin memory can only be on CPU");
+  const c10::DeviceGuard device_guard(device);
+
+  // Compute default strides (contiguous)
+  std::vector<int64_t> default_strides(size.size());
+  if (size.size() > 0) {
+    default_strides[size.size() - 1] = 1;
+    for (int64_t i = size.size() - 2; i >= 0; --i) {
+      default_strides[i] = default_strides[i + 1] * size[i + 1];
+    }
+  }
+
+  return spyre_from_blob(data_ptr, size, default_strides, dtype, device_layout);
+}
+
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("empty.memory_format", TORCH_FN(spyre_empty));
   m.impl("empty_strided", TORCH_FN(spyre_empty_strided));

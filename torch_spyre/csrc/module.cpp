@@ -234,6 +234,15 @@ DataFormats get_device_dtype(c10::ScalarType torch_dtype) {
   return sen_dtype_dev;
 }
 
+uint64_t get_dmpa(const at::Tensor& tensor) {
+  TORCH_CHECK(tensor.is_privateuseone(),
+              "get_dmpa: tensor must be on Spyre device");
+  auto* ctx =
+      static_cast<SharedOwnerCtx*>(tensor.storage().data_ptr().get_context());
+  TORCH_CHECK(ctx, "get_dmpa: tensor has no device allocation context");
+  return ctx->owner->DmpaAsBytes();
+}
+
 }  // namespace spyre
 
 PYBIND11_MODULE(_C, m) {
@@ -264,6 +273,9 @@ PYBIND11_MODULE(_C, m) {
       .def(py::init<std::vector<int64_t>, std::vector<int32_t>, DataFormats>(),
            py::arg("device_size"), py::arg("dim_map"), py::arg("device_dtype"));
 
+  m.def("spyre_from_blob", &spyre::spyre_from_blob, py::arg("dmpa"),
+        py::arg("size"), py::arg("stride"), py::arg("dtype"));
+  m.def("get_dmpa", &spyre::get_dmpa, py::arg("tensor"));
   m.def("spyre_empty_with_layout", &spyre::spyre_empty_with_layout);
   m.def("to_with_layout", &spyre::to_with_layout);
   m.def("empty_with_layout", &spyre::py_empty_with_layout);

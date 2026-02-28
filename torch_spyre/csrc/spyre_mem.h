@@ -57,4 +57,7 @@ at::Tensor as_strided_with_layout(const at::Tensor& self, c10::IntArrayRef size,
                                   std::optional<int64_t> storage_offset_,
                                   SpyreTensorLayout device_layout);
 
+at::Tensor spyre_from_blob(uint64_t dmpa, c10::IntArrayRef size,
+                           c10::IntArrayRef stride, c10::ScalarType dtype);
+
 }  // namespace spyre

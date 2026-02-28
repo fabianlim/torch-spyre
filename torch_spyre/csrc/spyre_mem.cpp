@@ -760,6 +760,49 @@ at::Tensor as_strided_with_layout(const at::Tensor& self, c10::IntArrayRef size,
   return result;
 }
 
+at::Tensor spyre_from_blob(uint64_t dmpa, c10::IntArrayRef size,
+                           c10::IntArrayRef stride, c10::ScalarType dtype) {
+  auto device_layout = SpyreTensorLayout(size.vec(), dtype);
+  size_t size_bytes = get_device_size_in_bytes(device_layout);
+
+  c10::Device device =
+      c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice();
+  auto device_id = device.index();
+  auto dev_allocator = GlobalRuntime::get()
+                           ->GetDeviceHandle(device_id)
+                           ->GetDeviceMemoryAllocator();
+  uint64_t alignment = dev_allocator->GetPlatformAlignment();
+
+  // Create non-owning DeviceMemoryAllocation: real allocator for constructor,
+  // custom deleter to free C++ object without calling destructor (which would
+  // call allocator->Free() on device memory we don't own).
+  auto* raw_alloc = new flex::DeviceMemoryAllocation(
+      size_bytes, dmpa, alignment, dev_allocator.get(), 0);
+  auto non_owning = flex::DeviceMemoryAllocationPtr(
+      raw_alloc, [](flex::DeviceMemoryAllocation* p) {
+        ::operator delete(p);
+      });
+
+  auto* ctx = new SharedOwnerCtx{std::move(non_owning), device_id};
+  at::DataPtr data_ptr(static_cast<void*>(ctx->owner.get()),
+                       static_cast<void*>(ctx),
+                       &SpyreAllocator::ReportAndDelete, device);
+
+  auto storage = c10::Storage(c10::make_intrusive<SpyreStorageImpl>(
+      c10::StorageImpl::use_byte_size_t(), size_bytes, std::move(data_ptr)));
+
+  constexpr c10::DispatchKeySet pu1_dks(c10::DispatchKey::PrivateUse1);
+  const c10::DeviceGuard device_guard(device);
+  auto tensor = at::detail::make_tensor_base<SpyreTensorImpl>(
+      std::move(storage), pu1_dks, c10::scalarTypeToTypeMeta(dtype));
+
+  tensor.unsafeGetTensorImpl()->set_sizes_and_strides(size, stride);
+  static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl())->spyre_layout =
+      device_layout;
+
+  return tensor;
+}
+
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("empty.memory_format", TORCH_FN(spyre_empty));
   m.impl("empty_strided", TORCH_FN(spyre_empty_strided));

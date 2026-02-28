@@ -271,6 +271,32 @@ class TestSpyre(TestCase):
             t2 = t.to(device="spyre")  # noqa: F841
         assert len(rec) == 0
 
+    def test_from_blob(self):
+        from torch_spyre._C import spyre_from_blob, get_dmpa
+
+        # Create a normal Spyre tensor to get a valid DMPA
+        x_cpu = torch.rand(4, 64, dtype=torch.float16)
+        x_spyre = x_cpu.to("spyre")
+
+        # Extract DMPA from the existing tensor
+        dmpa = get_dmpa(x_spyre)
+        self.assertIsInstance(dmpa, int)
+
+        # Create from_blob tensor wrapping the same device memory
+        t = spyre_from_blob(
+            dmpa, size=(4, 64), stride=(64, 1), dtype=torch.float16
+        )
+
+        # Verify tensor metadata
+        self.assertEqual(t.shape, torch.Size([4, 64]))
+        self.assertEqual(t.stride(), (64, 1))
+        self.assertEqual(t.dtype, torch.float16)
+        self.assertEqual(t.device.type, "spyre")
+
+        # Verify data matches by copying both tensors to CPU
+        t_cpu = t.to("cpu")
+        torch.testing.assert_close(x_cpu, t_cpu)
+
     def test_hooks_on_import(self):
         import torch
 

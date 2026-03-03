@@ -768,16 +768,18 @@ at::Tensor spyre_from_blob(uint64_t dmpa, c10::IntArrayRef size,
   c10::Device device =
       c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice();
   auto device_id = device.index();
+  // NOTE: dev_allocator is only needed for GetPlatformAlignment(). If the
+  // alignment can be obtained another way, this fetch can be removed entirely.
   auto dev_allocator = GlobalRuntime::get()
                            ->GetDeviceHandle(device_id)
                            ->GetDeviceMemoryAllocator();
   uint64_t alignment = dev_allocator->GetPlatformAlignment();
 
-  // Create non-owning DeviceMemoryAllocation: real allocator for constructor,
-  // custom deleter to free C++ object without calling destructor (which would
-  // call allocator->Free() on device memory we don't own).
+  // Create non-owning DeviceMemoryAllocation: pass nullptr for allocator since
+  // the custom shared_ptr deleter below uses ::operator delete (skipping the
+  // destructor), so allocator_->Free() is never called.
   auto* raw_alloc = new flex::DeviceMemoryAllocation(
-      size_bytes, dmpa, alignment, dev_allocator.get(), 0);
+      size_bytes, dmpa, alignment, /*allocator=*/nullptr, 0);
   auto non_owning = flex::DeviceMemoryAllocationPtr(
       raw_alloc, [](flex::DeviceMemoryAllocation* p) {
         ::operator delete(p);

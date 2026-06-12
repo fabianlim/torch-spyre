@@ -157,12 +157,17 @@ def _autoload():
             device=DEVICE_NAME, device_op_overrides=SpyreDeviceOpOverrides()
         )
 
-        from .scheduler import SuperDSCScheduling
+        from .scheduler import SuperDSCScheduling, SpyreTritonScheduling
         from .wrapper import SpyrePythonWrapperCodegen
+
+        if config.codegen_target == "triton":
+            scheduler_cls = SpyreTritonScheduling
+        else:
+            scheduler_cls = SuperDSCScheduling
 
         register_backend_for_device(
             DEVICE_NAME,
-            SuperDSCScheduling,
+            scheduler_cls,
             SpyrePythonWrapperCodegen,
             device_custom_config=config,
         )

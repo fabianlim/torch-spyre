@@ -68,6 +68,9 @@ layout_solver: Literal["greedy", "bestfit", "firstfit"] = "greedy"
 # Kernel emission target for the Spyre Inductor backend.
 # "spyre_ir": emit Spyre IR bundles via SpyreKernel (default).
 # "triton":    emit Triton kernels via SpyreTritonKernel.
-codegen_target: Literal["spyre_ir", "triton"] = "spyre_ir"
+# Set SPYRE_CODEGEN_TARGET=triton to enable the Triton path.
+codegen_target: Literal["spyre_ir", "triton"] = os.environ.get(
+    "SPYRE_CODEGEN_TARGET", "spyre_ir"
+)
 
 install_config_module(sys.modules[__name__])

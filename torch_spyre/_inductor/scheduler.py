@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Sequence, Union
+from typing import Any, Sequence, Union
 
 import sympy
 
@@ -27,12 +27,16 @@ from torch._inductor.scheduler import (
     BaseSchedulerNode,
     FusedSchedulerNode,
     SchedulerNode,
+    Scheduler,
 )
+from torch._inductor.codegen.simd_kernel_features import SIMDKernelFeatures
+from torch._inductor.codegen.triton import TritonScheduling
 from torch._inductor.virtualized import V
 from torch._inductor.codecache import code_hash
 from torch.utils._ordered_set import OrderedSet
 
 from .spyre_kernel import SpyreKernel
+from .spyre_triton_kernel import SpyreTritonKernel
 from .pass_utils import iteration_space
 from .logging_utils import get_inductor_logger
 from .op_spec import LoopSpec
@@ -268,6 +272,23 @@ def build_loop_scheduler_nodes(
                 seen[key] = name
 
     return result
+
+
+class SpyreTritonScheduling(TritonScheduling):
+    """Spyre-specific Triton scheduling that uses SpyreTritonKernel."""
+
+    kernel_type: type = SpyreTritonKernel  # type: ignore[assignment]
+
+    def create_kernel_choices(  # type: ignore[override]
+        self,
+        kernel_features: SIMDKernelFeatures,
+        kernel_args: list[Any],
+        kernel_kwargs: dict[str, Any],
+    ) -> list[Any]:
+        self.kernel_type = SpyreTritonKernel  # type: ignore[assignment]
+        return super().create_kernel_choices(
+            kernel_features, kernel_args, kernel_kwargs
+        )
 
 
 class SuperDSCScheduling(BaseScheduling):

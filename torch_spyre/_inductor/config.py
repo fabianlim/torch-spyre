@@ -65,4 +65,9 @@ unroll_loops: bool = os.environ.get("UNROLL_LOOPS", "1") == "1"
 # TODO(isuruf): Change to firstfit when deeptools PR4298 lands
 layout_solver: Literal["greedy", "bestfit", "firstfit"] = "greedy"
 
+# Kernel emission target for the Spyre Inductor backend.
+# "spyre_ir": emit Spyre IR bundles via SpyreKernel (default).
+# "triton":    emit Triton kernels via SpyreTritonKernel.
+codegen_target: Literal["spyre_ir", "triton"] = "spyre_ir"
+
 install_config_module(sys.modules[__name__])

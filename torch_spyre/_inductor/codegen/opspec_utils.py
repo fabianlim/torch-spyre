@@ -218,3 +218,72 @@ def _align_reshape_plan(
         )
     broadcast_to = out_block if reshape_to != out_block else None
     return (reshape_to, broadcast_to)
+
+
+# ---------------------------------------------------------------------------
+# Pointwise work-division helpers
+# ---------------------------------------------------------------------------
+
+
+def _device_block_shape(
+    arg: TensorArg,
+    divisor_of: dict[sympy.Symbol, int],
+) -> list[int]:
+    """Per-core ``block_shape`` for the access tile.
+
+    Divides each non-within-stick device dim by the core divisor
+    (``divisor_of``, this group's iteration-space work divisions) of the
+    single OpSpec symbol on that dim's coordinate.  Each non-within-stick
+    device dim carries exactly one iteration symbol -- a bare ``c_i`` or an
+    outer-stick ``c_i // stick`` -- so exactly one divisor applies per dim; a
+    constant (broadcast) axis carries none and is left at full size.  The last
+    device dim is the within-stick dim: always the full ``device_size[-1]``
+    (64 fp16 / 32 fp32 / 128 int8), never divided across cores.
+    """
+    device_size = [int(s) for s in arg.device_size]
+    coords = arg.device_coordinates
+    last = len(device_size) - 1
+
+    block: list[int] = []
+    for k, coord in enumerate(coords):
+        if k == last:
+            block.append(device_size[k])
+            continue
+        size = device_size[k]
+        syms = coord.free_symbols
+        if len(syms) > 1:
+            raise NotImplementedError(
+                f"OpSpec: device dim {k} coordinate {coord!r} folds multiple "
+                f"iteration symbols {syms}; work-division of a multi-symbol "
+                "axis is not supported"
+            )
+        divisor = divisor_of.get(next(iter(syms)), 1) if syms else 1
+        block.append(max(1, size // max(1, divisor)))
+    return block
+
+
+def _decompose_work_divisions(
+    iteration_space: dict[sympy.Symbol, tuple[sympy.Expr, int]],
+) -> tuple[list[tuple[sympy.Symbol, int, int]], int]:
+    """Decompose the iteration-space work divisions into per-symbol core
+    portions of the 1D core grid.
+
+    The core grid is 1D: a single flat core index in ``[0, total_cores)``.
+    Each work-divided symbol (``div > 1``) owns one slice of its iteration
+    range, and the flat index is read as a mixed-radix number over those
+    symbols, innermost (last in iteration order) first.  Returns
+    ``(work_divisions, total_cores)`` where ``work_divisions`` is a list of
+    ``(sym, div, inner_cores)`` **innermost-first** -- the core portion of
+    ``sym`` is ``(core_id // inner_cores) % div`` -- and ``total_cores`` is the
+    product of every ``div`` (``1`` when nothing is divided).
+    """
+    split = [(s, div) for s, (_rng, div) in iteration_space.items() if div > 1]
+    total_cores = 1
+    for _s, div in split:
+        total_cores *= div
+    work_divisions: list[tuple[sympy.Symbol, int, int]] = []
+    inner_cores = 1
+    for sym, div in reversed(split):  # innermost first
+        work_divisions.append((sym, div, inner_cores))
+        inner_cores *= div
+    return work_divisions, total_cores

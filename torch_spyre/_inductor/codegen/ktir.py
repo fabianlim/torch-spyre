@@ -30,17 +30,26 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from torch_spyre._C import DataFormats
-from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.codegen.opspec_utils import (
     _align_reshape_plan,
     _buf_id,
+    _decompose_work_divisions,
+    _device_block_shape,
+    _iteration_space_key,
     _row_major_strides,
 )
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
 
-# Pointwise op name -> the ``arith`` float builder that implements it.  Only
-# ``add`` is wired up so far; other ops raise before reaching here.
-_ARITH_FLOAT_OP = {"add": "AddFOp"}
+# Pointwise op name -> the ``arith`` float builder that implements it.
+_ARITH_FLOAT_OP = {"add": "AddFOp", "mul": "MulFOp"}
+
+
+def _val(x):
+    """The SSA ``Value`` of a builder result.
+
+    Return the result of x if x is not a SSA value (e.g., ``OpView``).
+    """
+    return x.result if hasattr(x, "result") else x
 
 
 def _mlir_elt_type(ir, device_dtype: DataFormats):
@@ -78,24 +87,30 @@ def generate_ktir(
     the unique operand buffers in ascending ``arg_index`` order so the emitted
     signature matches that positional binding.
     """
-    # Pure capability checks first, before the mlir_ktdp import: they need no
-    # dialect build, so an unsupported request fails fast (and is testable)
-    # whether or not mlir_ktdp is installed.
-    #
-    # Multi-core work division is future work; the grid below is hard-coded to a
-    # single core, so reject anything else rather than silently emitting a
-    # single-core grid on a multi-core request.
-    if _spyre_config.sencores != 1:
-        raise NotImplementedError(
-            "OpSpec->KTIR: multi-core work division is not supported yet "
-            f"(SENCORES={_spyre_config.sencores}, only 1 is supported)"
-        )
+    # Validate scope before the mlir_ktdp import: these checks need no dialect
+    # build, so an unsupported request fails fast (and is testable) whether or
+    # not mlir_ktdp is installed.
     op_specs = _collect_pointwise_op_specs(specs)
 
     # ``mlir_ktdp`` is imported lazily so the module stays importable (and the
     # golden test can skip) where the dialect-packaged mlir_ktdp is not built.
     from mlir_ktdp import ir
     from mlir_ktdp.dialects import arith, func, ktdp
+
+    # Fused ops must share one iteration space (same grid / work-division); the
+    # register-threaded intermediate between them has the same extents as the
+    # output.  Differing spaces (mixed work-division within one node) are not
+    # supported yet.
+    it_space = op_specs[0].iteration_space
+    it_key = _iteration_space_key(op_specs[0])
+    for spec in op_specs[1:]:
+        if _iteration_space_key(spec) != it_key:
+            raise NotImplementedError(
+                "OpSpec->KTIR: fused ops with differing iteration spaces "
+                "(mixed work-division) are not supported yet"
+            )
+    work_divisions, total_cores = _decompose_work_divisions(it_space)
+    divisor_of = {sym: div for sym, div, _inner in work_divisions}
 
     # Ordered unique operand buffers -> func parameter position.  Ascending
     # arg_index matches the positional order call_kernel passes to .run(...),
@@ -121,9 +136,10 @@ def generate_ktir(
         with ir.InsertionPoint(module.body):
             fn_type = ir.FunctionType.get([index_t] * len(param_args), [])
             fn = func.FuncOp(kernel_name, fn_type)
-            # Single-core (SENCORES=1) grid; work-division scaling is future work.
             i64 = ir.IntegerType.get_signless(64)
-            fn.attributes["grid"] = ir.ArrayAttr.get([ir.IntegerAttr.get(i64, 1)])
+            fn.attributes["grid"] = ir.ArrayAttr.get(
+                [ir.IntegerAttr.get(i64, total_cores)]
+            )
             block = fn.add_entry_block()
             block_args = list(block.arguments)
 
@@ -138,8 +154,42 @@ def generate_ktir(
                         ir, ktdp, arg, block_args[param_index[bid]]
                     )
 
+                # Per-core offset from the flat grid id for each work-divided
+                # symbol.  Nothing is emitted when total_cores == 1, so the
+                # single-core path stays byte-identical to the pointwise PR.
+                core_offset: dict[object, ir.Value] = {}
+                if total_cores > 1:
+                    tile_id = ktdp.get_compute_tile_id([index_t])
+                    for sym, div, inner_cores in work_divisions:
+                        idx = tile_id
+                        if inner_cores > 1:
+                            idx = _val(
+                                arith.DivUIOp(
+                                    idx, arith.ConstantOp(index_t, inner_cores)
+                                )
+                            )
+                        if inner_cores * div != total_cores:
+                            idx = _val(
+                                arith.RemUIOp(idx, arith.ConstantOp(index_t, div))
+                            )
+                        core_offset[sym] = idx
+
+                # SSA value threaded from each producer to its consumers; a
+                # fused-away intermediate is recorded here instead of stored.
+                produced: dict[object, ir.Value] = {}
                 for spec in op_specs:
-                    _emit_pointwise_op(ir, ktdp, arith, spec, memory_views, c0)
+                    _emit_pointwise_op(
+                        ir,
+                        ktdp,
+                        arith,
+                        spec,
+                        memory_views,
+                        produced,
+                        core_offset,
+                        divisor_of,
+                        c0,
+                        index_t,
+                    )
 
                 func.ReturnOp([])
 
@@ -171,7 +221,7 @@ def _collect_pointwise_op_specs(
         if entry.op not in _ARITH_FLOAT_OP:
             raise NotImplementedError(
                 f"OpSpec->KTIR: op {entry.op!r} is not supported yet "
-                "(only pointwise 'add')"
+                f"(only pointwise {sorted(_ARITH_FLOAT_OP)})"
             )
         op_specs.append(entry)
     if not op_specs:
@@ -202,8 +252,25 @@ def _emit_memory_view(ir, ktdp, arg: TensorArg, offset):
     )
 
 
-def _emit_pointwise_op(ir, ktdp, arith, spec: OpSpec, memory_views, c0):
-    """Emit the load / compute / store sequence for one pointwise ``OpSpec``."""
+def _emit_pointwise_op(
+    ir,
+    ktdp,
+    arith,
+    spec: OpSpec,
+    memory_views,
+    produced,
+    core_offset,
+    divisor_of,
+    c0,
+    index_t,
+):
+    """Emit the load / compute / store sequence for one pointwise ``OpSpec``.
+
+    An input whose buffer was produced earlier in this kernel is
+    register-threaded (its SSA value is reused, no load is emitted); an output
+    that is a fused-away intermediate (``arg_index < 0``, no memory view) is
+    only recorded in ``produced`` and never stored.
+    """
     inputs = [a for a in spec.args if a.is_input]
     outputs = [a for a in spec.args if not a.is_input]
     if len(outputs) != 1:
@@ -212,7 +279,7 @@ def _emit_pointwise_op(ir, ktdp, arith, spec: OpSpec, memory_views, c0):
         )
     if len(inputs) != 2:
         raise NotImplementedError(
-            f"OpSpec->KTIR: 'add' expects two inputs, got {len(inputs)}"
+            f"OpSpec->KTIR: {spec.op!r} expects two inputs, got {len(inputs)}"
         )
     out = outputs[0]
 
@@ -236,54 +303,127 @@ def _emit_pointwise_op(ir, ktdp, arith, spec: OpSpec, memory_views, c0):
                 "OpSpec->KTIR: broadcast / reshape operands not supported yet"
             )
 
-    # Every operand buffer must be a func parameter (register-threaded fused
-    # intermediates are not supported yet).
-    for arg in spec.args:
-        if _buf_id(arg) not in memory_views:
+    loaded = []
+    for arg in inputs:
+        bid = _buf_id(arg)
+        if bid in produced:
+            # Register-threaded fused intermediate: reuse the producer's value.
+            loaded.append(produced[bid])
+        elif bid in memory_views:
+            loaded.append(
+                _emit_load(
+                    ir,
+                    ktdp,
+                    arith,
+                    arg,
+                    memory_views[bid],
+                    core_offset,
+                    divisor_of,
+                    c0,
+                    index_t,
+                )
+            )
+        else:
+            # Neither a func parameter nor produced earlier: a cross-group HBM
+            # intermediate that a single KTIR kernel cannot thread.  Fail loud.
             raise NotImplementedError(
-                "OpSpec->KTIR: fused intermediates (register threading) "
-                "not supported yet"
+                "OpSpec->KTIR: operand buffer is neither a func parameter nor a "
+                "register-threaded intermediate produced earlier in this kernel "
+                "(cross-group HBM intermediates are not supported yet)"
             )
 
-    loaded = [
-        _emit_load(ir, ktdp, arg, memory_views[_buf_id(arg)], c0) for arg in inputs
-    ]
-
     builder = getattr(arith, _ARITH_FLOAT_OP[spec.op])
-    result = builder(loaded[0], loaded[1])
+    result = _val(builder(loaded[0], loaded[1]))
 
-    _emit_store(ir, ktdp, out, memory_views[_buf_id(out)], result, c0)
+    out_bid = _buf_id(out)
+    if out_bid in memory_views:
+        _emit_store(
+            ir,
+            ktdp,
+            arith,
+            out,
+            memory_views[out_bid],
+            result,
+            core_offset,
+            divisor_of,
+            c0,
+            index_t,
+        )
+    # Record for any downstream consumer (a real output may be read back too).
+    produced[out_bid] = result
 
 
-def _emit_access_tile(ir, ktdp, arg: TensorArg, memory_view, c0):
-    """Emit ``ktdp.construct_access_tile`` for ``arg``, return its SSA value."""
-    sizes = [int(s) for s in arg.device_size]
-    rank = len(sizes)
-    at_t = ktdp.AccessTileType.get(sizes, ir.IndexType.get())
+def _emit_tile_offsets(arith, arg: TensorArg, block, core_offset, c0, index_t):
+    """Per-device-axis base offset for ``arg``'s per-core access-tile slice.
+
+    A device axis divided across cores starts at
+    ``core_offset(sym) * block[k]`` (the per-core extent on that axis); an
+    undivided axis -- and the within-stick (last) axis, which is never divided
+    -- starts at 0.
+    """
+    coords = arg.device_coordinates
+    last = len(block) - 1
+    offsets = []
+    for k, coord in enumerate(coords):
+        syms = set() if k == last else coord.free_symbols
+        sym = next(iter(syms)) if len(syms) == 1 else None
+        if sym is not None and sym in core_offset:
+            extent = arith.ConstantOp(index_t, block[k])
+            offsets.append(arith.MulIOp(core_offset[sym], extent))
+        else:
+            offsets.append(c0)
+    return offsets
+
+
+def _emit_access_tile(
+    ir, ktdp, arith, arg: TensorArg, memory_view, core_offset, divisor_of, c0, index_t
+):
+    """Emit ``ktdp.construct_access_tile`` for ``arg``'s per-core slice."""
+    block = _device_block_shape(arg, divisor_of)
+    rank = len(block)
+    at_t = ktdp.AccessTileType.get(block, ir.IndexType.get())
     identity = ir.AffineMapAttr.get(ir.AffineMap.get_identity(rank))
-    tile_set = _coordinate_set_attr(ir, sizes)
+    tile_set = _coordinate_set_attr(ir, block)
+    offsets = _emit_tile_offsets(arith, arg, block, core_offset, c0, index_t)
     return ktdp.construct_access_tile(
         at_t,
         memory_view,
         identity,
-        [c0] * rank,
+        offsets,
         [],
         tile_set,
         identity,
     )
 
 
-def _emit_load(ir, ktdp, arg: TensorArg, memory_view, c0):
-    """Emit an access tile + ``ktdp.load`` for an input ``arg``."""
-    sizes = [int(s) for s in arg.device_size]
-    tensor_t = ir.RankedTensorType.get(sizes, _mlir_elt_type(ir, arg.device_dtype))
-    tile = _emit_access_tile(ir, ktdp, arg, memory_view, c0)
+def _emit_load(
+    ir, ktdp, arith, arg: TensorArg, memory_view, core_offset, divisor_of, c0, index_t
+):
+    """Emit a per-core access tile + ``ktdp.load`` for an input ``arg``."""
+    block = _device_block_shape(arg, divisor_of)
+    tensor_t = ir.RankedTensorType.get(block, _mlir_elt_type(ir, arg.device_dtype))
+    tile = _emit_access_tile(
+        ir, ktdp, arith, arg, memory_view, core_offset, divisor_of, c0, index_t
+    )
     return ktdp.load(tensor_t, tile)
 
 
-def _emit_store(ir, ktdp, arg: TensorArg, memory_view, value, c0):
-    """Emit an access tile + ``ktdp.store`` of ``value`` into output ``arg``."""
-    tile = _emit_access_tile(ir, ktdp, arg, memory_view, c0)
+def _emit_store(
+    ir,
+    ktdp,
+    arith,
+    arg: TensorArg,
+    memory_view,
+    value,
+    core_offset,
+    divisor_of,
+    c0,
+    index_t,
+):
+    """Emit a per-core access tile + ``ktdp.store`` of ``value`` into ``arg``."""
+    tile = _emit_access_tile(
+        ir, ktdp, arith, arg, memory_view, core_offset, divisor_of, c0, index_t
+    )
     ktdp.store(value, tile)
 
 

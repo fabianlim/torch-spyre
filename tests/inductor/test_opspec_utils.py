@@ -33,6 +33,8 @@ from torch_spyre._inductor.codegen.opspec_utils import (
     _DIM_WITHIN_STICK,
     _align_reshape_plan,
     _buf_id,
+    _decompose_work_divisions,
+    _device_block_shape,
     _dim_info,
     _iteration_space_key,
     _row_major_strides,
@@ -193,6 +195,93 @@ class TestAlignReshapePlan(unittest.TestCase):
                 [d, sympy.Mod(c, 64)],
                 [4, 64],
             )
+
+
+class TestDecomposeWorkDivisions(unittest.TestCase):
+    def test_no_division(self):
+        # Every symbol has div == 1: nothing splits, single-core grid.
+        d0, d1 = sympy.symbols("d0 d1")
+        work, total = _decompose_work_divisions({d0: (16, 1), d1: (512, 1)})
+        self.assertEqual(work, [])
+        self.assertEqual(total, 1)
+
+    def test_single_divided_symbol(self):
+        # One divided axis owns the whole flat grid: inner_cores == 1.
+        d0, d1 = sympy.symbols("d0 d1")
+        work, total = _decompose_work_divisions({d0: (16, 1), d1: (512, 32)})
+        self.assertEqual(work, [(d1, 32, 1)])
+        self.assertEqual(total, 32)
+
+    def test_multiple_divided_symbols_mixed_radix(self):
+        # Two divided axes: the flat index is mixed-radix, innermost (last in
+        # iteration order) first, so d1 gets inner_cores 1 and d0 gets 4.
+        d0, d1 = sympy.symbols("d0 d1")
+        work, total = _decompose_work_divisions({d0: (16, 2), d1: (512, 4)})
+        self.assertEqual(work, [(d1, 4, 1), (d0, 2, 4)])
+        self.assertEqual(total, 8)
+
+    def test_undivided_axis_between_divided_is_skipped(self):
+        # A div == 1 axis contributes no core portion even when it sits between
+        # two divided axes.
+        d0, d1, d2 = sympy.symbols("d0 d1 d2")
+        work, total = _decompose_work_divisions(
+            {d0: (16, 2), d1: (512, 1), d2: (64, 4)}
+        )
+        self.assertEqual(work, [(d2, 4, 1), (d0, 2, 4)])
+        self.assertEqual(total, 8)
+
+
+def _arg_nd(sizes, coords) -> TensorArg:
+    """TensorArg with explicit device sizes/coordinates for block-shape tests."""
+    return TensorArg(
+        is_input=True,
+        arg_index=0,
+        device_dtype=DataFormats.SEN169_FP16,
+        device_size=sizes,
+        device_coordinates=coords,
+        allocation={"hbm": None},
+        name="buf0",
+    )
+
+
+class TestDeviceBlockShape(unittest.TestCase):
+    def test_undivided_returns_full_shape(self):
+        c0, c1, c2 = sympy.symbols("c0 c1 c2")
+        arg = _arg_nd([16, 512, 64], [c0, c1, sympy.Mod(c2, 64)])
+        self.assertEqual(_device_block_shape(arg, {}), [16, 512, 64])
+
+    def test_divided_outer_dim(self):
+        # c1 divided by 32 -> that dim shrinks; the within-stick last dim and
+        # the undivided c0 dim stay full.
+        c0, c1, c2 = sympy.symbols("c0 c1 c2")
+        arg = _arg_nd([16, 512, 64], [c0, c1, sympy.Mod(c2, 64)])
+        self.assertEqual(_device_block_shape(arg, {c1: 32}), [16, 16, 64])
+
+    def test_within_stick_never_divided(self):
+        # Even if the last dim's symbol carries a divisor, the within-stick dim
+        # stays at its full device size.
+        c0, c1, c2 = sympy.symbols("c0 c1 c2")
+        arg = _arg_nd([16, 512, 64], [c0, c1, sympy.Mod(c2, 64)])
+        self.assertEqual(_device_block_shape(arg, {c2: 2}), [16, 512, 64])
+
+    def test_outer_stick_dim_divided(self):
+        # An outer-stick coordinate (c0 // 64) carries one symbol and divides.
+        c0, c2 = sympy.symbols("c0 c2")
+        arg = _arg_nd([16, 64], [FloorDiv(c0, 64), sympy.Mod(c2, 64)])
+        self.assertEqual(_device_block_shape(arg, {c0: 2}), [8, 64])
+
+    def test_constant_axis_left_full(self):
+        # A broadcast axis carries a constant coordinate (no symbols): no
+        # divisor applies, so it keeps its full size.
+        c2 = sympy.Symbol("c2")
+        arg = _arg_nd([8, 64], [sympy.Integer(1), sympy.Mod(c2, 64)])
+        self.assertEqual(_device_block_shape(arg, {}), [8, 64])
+
+    def test_multi_symbol_axis_raises(self):
+        c0, c1, c2 = sympy.symbols("c0 c1 c2")
+        arg = _arg_nd([128, 64], [c0 * 8 + c1, sympy.Mod(c2, 64)])
+        with self.assertRaises(NotImplementedError):
+            _device_block_shape(arg, {c0: 2})
 
 
 if __name__ == "__main__":

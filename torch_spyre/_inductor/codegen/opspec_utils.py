@@ -20,13 +20,19 @@ iteration-space grouping, and reshape / broadcast alignment of pointwise
 operands.  Those computations are **pure** (sympy / int over the ``op_specs``)
 -- no backend emission primitives, no MLIR builder, no live Inductor kernel
 state -- so they live here as plain functions rather than as base-class methods.
+
+They are therefore **emitter-agnostic**: they read the ``OpSpec`` contract
+without emitting any target IR, so one set can serve every OpSpec consumer.  The
+KTIR emitter is simply the first such consumer (hence the KTIR references
+below); future emitters are intended to share them, which is why the module is
+named for the ``OpSpec`` it reads rather than for KTIR.
 """
 
 from __future__ import annotations
 
 import sympy
 from torch._inductor.virtualized import V
-from torch.utils._sympy.functions import ModularIndexing
+from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 
 from torch_spyre._inductor.op_spec import OpSpec, TensorArg
 
@@ -62,6 +68,9 @@ def _buf_id(arg: TensorArg) -> str:
     falling back.
     """
     if arg.name is None:
+        # ValueError (not NotImplementedError): under TORCH_SPYRE_KTIR=1
+        # create_tensor_arg always populates the name, so a None here is a
+        # broken internal invariant, not an unsupported-capability case.
         raise ValueError(
             "_buf_id: TensorArg.name is None -- every projected op arg must "
             "carry a buffer name for register-threading identity (arg_index is "
@@ -124,7 +133,18 @@ def _dim_info(coord: sympy.Expr) -> tuple[str, sympy.Symbol | None]:
         return (_DIM_BARE, sym)
     if isinstance(coord, (sympy.Mod, ModularIndexing)):
         return (_DIM_WITHIN_STICK, sym)
-    return (_DIM_OUTER_STICK, sym)
+    if isinstance(coord, FloorDiv):
+        return (_DIM_OUTER_STICK, sym)
+    # A single-symbol coordinate that is none of the known device-axis forms
+    # (e.g. ``2*d0 + 1``) is not a plain outer-stick chunk index.  Raise loudly
+    # rather than silently classifying it as outer-stick -- same policy as the
+    # multi-symbol case above; a later increment that legitimately produces such
+    # a coordinate must extend this classifier explicitly.
+    raise NotImplementedError(
+        f"OpSpec alignment: single-symbol device coordinate {coord!r} is not a "
+        "bare symbol, within-stick (Mod/ModularIndexing), or outer-stick "
+        "(FloorDiv) form; classification is not implemented"
+    )
 
 
 def _align_reshape_plan(

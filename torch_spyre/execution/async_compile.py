@@ -103,8 +103,12 @@ class SpyreAsyncCompile(AsyncCompile):
         """Emit KTDP-dialect MLIR for ``specs`` (OpSpec->KTIR path).
 
         Mirrors ``sdsc`` but emits KTIR directly instead of an SDSC bundle.
-        Device execution is not wired yet: the emitted KTIR is persisted to
-        disk for inspection and this raises ``NotImplementedError``.
+        The emitted KTIR is always persisted to disk for inspection. When
+        ``TORCH_SPYRE_DBO=1`` it is then compiled by the ``dbo`` backend
+        (``dbo-opt``), which writes a ``spyreCodeDir`` in the same layout the
+        SDSC path produces, so the resulting kernel is loaded and run by the
+        shared ``SpyreSDSCKernelRunner``. Without that switch, device execution
+        stays deferred and this raises ``NotImplementedError``.
         """
         unimp = find_unimplemented(list(specs))
         if unimp is not None:
@@ -127,8 +131,38 @@ class SpyreAsyncCompile(AsyncCompile):
             fh.write(ktir_text)
         logger.debug("OpSpec->KTIR: wrote %s", ktir_path)
 
-        raise NotImplementedError(
-            "OpSpec->KTIR: device execution is not wired yet; the emitted KTIR "
-            f"was written to {ktir_path} for inspection. Execution lands in a "
-            "later PR."
-        )
+        if os.getenv("TORCH_SPYRE_DBO") != "1":
+            raise NotImplementedError(
+                "OpSpec->KTIR: device execution is gated behind "
+                "TORCH_SPYRE_DBO=1; the emitted KTIR was written to "
+                f"{ktir_path} for inspection. Set TORCH_SPYRE_DBO=1 to compile "
+                "and run it via the dbo backend."
+            )
+
+        # Compile the emitted KTIR with the dbo backend. `--export-dir` receives
+        # the same per-kernel output dir; dbo-opt writes
+        # `<output_dir>/spyreCodeDir/{spyrecode.json, init_binary.bin}`, which is
+        # exactly the layout SpyreSDSCKernelRunner loads via prepare_kernel.
+        with torch.profiler.record_function(f"dbo-opt:{kernel_name}"):
+            try:
+                subprocess.run(
+                    [
+                        "dbo-opt",
+                        "--from-ktir",
+                        f"--export-dir={output_dir}",
+                        "--kEmitSpyreCode",
+                        ktir_path,
+                    ],
+                    check=True,
+                )
+            except Exception as exc:
+                try_collect(
+                    exc,
+                    logger=logger,
+                    failure_category=CATEGORY_COMPILE,
+                    kernel_name=kernel_name,
+                    code_dir=output_dir,
+                )
+                raise
+
+        return SpyreSDSCKernelRunner(kernel_name, output_dir)

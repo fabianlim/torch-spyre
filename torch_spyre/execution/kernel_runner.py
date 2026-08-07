@@ -32,22 +32,12 @@ class SpyreUnimplementedRunner:
 
 
 class SpyreSDSCKernelRunner:
-    def __init__(self, name: str, code_dir: str, use_jobplan: bool | None = None):
-        """``use_jobplan`` selects the launch path.
-
-        ``None`` (default) keeps the historical SDSC behaviour exactly: the
-        jobplan path is taken only when the ``DUMP_SPYRE_CODE`` env var is a
-        nonzero integer.  ``True`` forces it, for producers such as the
-        OpSpec->KTIR path that always emit a ``spyreCodeDir`` and never an
-        ``init.txt``, and so must not depend on a dxp-oriented env var.
-        """
+    def __init__(self, name: str, code_dir: str):
         self.kernel_name = name
         self.code_dir = code_dir
         self.jobplan = None
-        if use_jobplan is None:
-            dump_spyre_code = os.environ.get("DUMP_SPYRE_CODE", "0")
-            use_jobplan = dump_spyre_code.isdigit() and int(dump_spyre_code) != 0
-        if use_jobplan:
+        dump_spyre_code = os.environ.get("DUMP_SPYRE_CODE", "0")
+        if dump_spyre_code.isdigit() and int(dump_spyre_code) != 0:
             self.jobplan = prepare_kernel(code_dir + "/spyreCodeDir")
 
     def run(self, *args, **kw_args):
@@ -58,3 +48,24 @@ class SpyreSDSCKernelRunner:
                 launch_jobplan(self.jobplan, args)
             else:
                 launch_kernel(self.code_dir, args)
+
+
+class SpyreKTIRKernelRunner:
+    """Runner for a SpyreCode directory, as produced by the OpSpec->KTIR path.
+
+    The KTIR backend compiler always writes a ``spyreCodeDir`` and never the
+    ``init.txt`` the SDSC/dxp path emits, so this always launches via the
+    jobplan -- unlike ``SpyreSDSCKernelRunner``, which picks its launch path
+    from the dxp-oriented ``DUMP_SPYRE_CODE`` env var.
+    """
+
+    def __init__(self, name: str, code_dir: str):
+        self.kernel_name = name
+        self.code_dir = code_dir
+        self.jobplan = prepare_kernel(code_dir + "/spyreCodeDir")
+
+    def run(self, *args, **kw_args):
+        logger.info("RUN: %s %s", self.kernel_name, self.code_dir)
+
+        with torch.profiler.record_function(f"launch_kernel:{self.kernel_name}"):
+            launch_jobplan(self.jobplan, args)

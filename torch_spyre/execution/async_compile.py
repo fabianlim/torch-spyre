@@ -29,7 +29,11 @@ from torch_spyre._inductor.op_spec import (
     find_unimplemented,
 )
 from torch_spyre._inductor.codegen.bundle import generate_bundle
-from .kernel_runner import SpyreSDSCKernelRunner, SpyreUnimplementedRunner
+from .kernel_runner import (
+    SpyreKTIRKernelRunner,
+    SpyreSDSCKernelRunner,
+    SpyreUnimplementedRunner,
+)
 
 logger = get_inductor_logger("sdsc_compile")
 
@@ -102,12 +106,15 @@ class SpyreAsyncCompile:
             "--from-ktir",
             f"--device={_spyre_config.ktir_device_mlir}",
             "--kEmitSpyreCode",
-            "--mlir-disable-threading",
             f"--export-dir={output_dir}",
             ktir_path,
         ]
-        # dbo-opt's vendored MLIR/LLVM shared libs, prepended so they win over
-        # anything already on the inherited path.
+        # dbo-opt needs its own vendored MLIR/LLVM libs, but they must NOT leak
+        # into this process: dbo-opt's deeptools tree also carries libdxp/libdcc
+        # that shadow the runtime torch_spyre is linked against, which silently
+        # corrupts execution.  So scope the path to the child only, and invoke
+        # dbo-opt by absolute path rather than through PATH (whose deeptools bin
+        # dir would likewise shadow dxp_standalone on the SDSC path).
         env = dict(os.environ)
         lib_paths = _spyre_config.dbo_lib_paths
         inherited = env.get("LD_LIBRARY_PATH")
@@ -128,6 +135,4 @@ class SpyreAsyncCompile:
                 f"stderr:\n{proc.stderr}"
             )
 
-        # The KTIR path always produces a spyreCodeDir and never an init.txt,
-        # so it always launches via the jobplan.
-        return SpyreSDSCKernelRunner(kernel_name, output_dir, use_jobplan=True)
+        return SpyreKTIRKernelRunner(kernel_name, output_dir)

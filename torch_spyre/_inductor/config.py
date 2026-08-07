@@ -77,24 +77,19 @@ core_id_k_fast_emission: bool = (
 # affine.apply indirection for tiled loops.
 bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "0") == "1"
 
-# When True (default), the OpSpec->KTIR emitter emits the canonical form the
-# KTIR compiler accepts: a zero-argument func.func with buffer base addresses
-# baked in as arith.constant index values, and tensor.empty() + a named linalg
-# op for the compute.  When False it emits the earlier form (one index func
-# parameter per buffer, tensor-level arith op), which does not compile but is
-# kept reachable for inspection.  Deliberately has no env var; toggle it with
-# torch_spyre._inductor.config.patch(ktir_canonical_form=False).
-ktir_canonical_form: bool = True
-
-# The KTIR compiler (dbo-opt) invoked by SpyreAsyncCompile.ktir, the directory
-# holding its vendored MLIR/LLVM shared libraries (prepended to
-# LD_LIBRARY_PATH), and the ktdf_arch device description it needs (dbo-opt
-# errors out without a --device when the KTIR module carries no device).
-dbo_opt: str = "/mnt/home/spyre-build/deeptools/bin/dbo-opt"
-dbo_lib_paths: str = (
-    "/mnt/home/spyre-build/deeptools/lib:/mnt/home/spyre-build/deeptools/lib64"
-)
-ktir_device_mlir: str = "/mnt/home/triton-dbo-demo/sample_device.mlir"
+# The KTIR backend compiler invoked by SpyreAsyncCompile.ktir: the dbo-opt
+# binary, the directory holding its vendored MLIR/LLVM shared libraries, and the
+# ktdf_arch device description it needs (dbo-opt errors out without a --device
+# when the KTIR module carries no ktdf_arch.device).
+#
+# dbo-opt is addressed by absolute path and its libraries are passed only in the
+# compiler subprocess's environment.  Neither may go on this process's PATH or
+# LD_LIBRARY_PATH: dbo-opt's deeptools tree also ships dxp_standalone and
+# libdxp/libdcc, which shadow the ones torch_spyre's SDSC path and runtime use
+# and silently corrupt both compilation and execution.
+dbo_opt: str = os.environ.get("DBO_OPT")
+dbo_lib_paths: str = os.environ.get("DBO_LIB_PATHS")
+ktir_device_mlir: str = os.environ.get("KTIR_DEVICE_MLIR")
 
 # When True (default), LoopSpec nodes are fully unrolled into flat OpSpecs
 # before generate_bundle runs.  Set to False to pass LoopSpecs through intact

@@ -72,31 +72,6 @@ module {
 }
 """
 
-# The pre-canonical form, still reachable via
-# ``config.patch(ktir_canonical_form=False)``: one ``index`` func parameter per
-# buffer and a tensor-level ``arith.addf``.
-_EXPECTED_ADD_KTIR_LEGACY = """\
-#map = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
-#set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 15 >= 0, d1 >= 0, -d1 + 511 >= 0, d2 >= 0, -d2 + 63 >= 0)>
-module {
-  func.func @ktir_fused_add_0(%arg0: index, %arg1: index, %arg2: index) attributes {grid = [1]} {
-    %c0 = arith.constant 0 : index
-    %0 = ktdp.construct_memory_view %arg0, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
-    %1 = ktdp.construct_memory_view %arg1, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
-    %2 = ktdp.construct_memory_view %arg2, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
-    %3 = ktdp.construct_access_tile %0[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
-    %4 = ktdp.load %3 : <16x512x64xindex> -> tensor<16x512x64xf16>
-    %5 = ktdp.construct_access_tile %1[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
-    %6 = ktdp.load %5 : <16x512x64xindex> -> tensor<16x512x64xf16>
-    %7 = arith.addf %4, %6 : tensor<16x512x64xf16>
-    %8 = ktdp.construct_access_tile %2[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
-    ktdp.store %7, %8 : tensor<16x512x64xf16>, <16x512x64xindex>
-    return
-  }
-}
-"""
-
-
 def _add_op_specs(allocations: list[dict] | None = None) -> list:
     """Finished OpSpec list for ``a + b`` at device shape [16, 512, 64] fp16.
 
@@ -164,15 +139,6 @@ class TestKtirEmitter(unittest.TestCase):
         specs[0].op = "mul"
         with self.assertRaises(NotImplementedError):
             generate_ktir("ktir_fused_mul_0", specs)
-
-    def test_legacy_form_golden(self):
-        """The pre-canonical form stays reachable through the config knob."""
-        from torch_spyre._inductor import config as spyre_config
-        from torch_spyre._inductor.codegen.ktir import generate_ktir
-
-        with spyre_config.patch(ktir_canonical_form=False):
-            emitted = generate_ktir("ktir_fused_add_0", _add_op_specs())
-        self.assertEqual(emitted, _EXPECTED_ADD_KTIR_LEGACY)
 
     def test_pool_allocation_zero_address(self):
         """A ``{"pool": 0}`` allocation resolves to address 0, not to a failure.

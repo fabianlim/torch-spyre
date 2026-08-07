@@ -20,6 +20,7 @@ import subprocess
 import torch
 
 from torch._inductor.runtime.runtime_utils import cache_dir
+from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import (
     LoopSpec,
@@ -70,11 +71,12 @@ class SpyreAsyncCompile:
     def ktir(
         self, kernel_name: str, specs: Sequence[OpSpec | LoopSpec | UnimplementedOp]
     ):
-        """Emit KTDP-dialect MLIR for ``specs`` (OpSpec->KTIR path).
+        """Emit KTDP-dialect MLIR for ``specs`` and compile it (OpSpec->KTIR path).
 
-        Mirrors ``sdsc`` but emits KTIR directly instead of an SDSC bundle.
-        Device execution is not wired yet: the emitted KTIR is persisted to
-        disk for inspection and this raises ``NotImplementedError``.
+        Mirrors ``sdsc`` but emits KTIR instead of an SDSC bundle and compiles
+        it with ``dbo-opt`` instead of ``dxp_standalone``.  ``dbo-opt`` writes
+        ``<output_dir>/spyreCodeDir/{init_binary.bin, spyrecode.json}``, which
+        is exactly what ``SpyreSDSCKernelRunner``'s jobplan path consumes.
         """
         unimp = find_unimplemented(list(specs))
         if unimp is not None:
@@ -93,8 +95,39 @@ class SpyreAsyncCompile:
             fh.write(generate_ktir(kernel_name, specs))
         logger.debug("OpSpec->KTIR: wrote %s", ktir_path)
 
-        raise NotImplementedError(
-            "OpSpec->KTIR: device execution is not wired yet; the emitted KTIR "
-            f"was written to {ktir_path} for inspection. Execution lands in a "
-            "later PR."
-        )
+        # Invoke the KTIR backend compiler.  --device is required: without it
+        # dbo-opt rejects a module that carries no ktdf_arch.device.
+        cmd = [
+            _spyre_config.dbo_opt,
+            "--from-ktir",
+            f"--device={_spyre_config.ktir_device_mlir}",
+            "--kEmitSpyreCode",
+            "--mlir-disable-threading",
+            f"--export-dir={output_dir}",
+            ktir_path,
+        ]
+        # dbo-opt's vendored MLIR/LLVM shared libs, prepended so they win over
+        # anything already on the inherited path.
+        env = dict(os.environ)
+        lib_paths = _spyre_config.dbo_lib_paths
+        inherited = env.get("LD_LIBRARY_PATH")
+        env["LD_LIBRARY_PATH"] = f"{lib_paths}:{inherited}" if inherited else lib_paths
+
+        with torch.profiler.record_function(f"dbo_opt:{kernel_name}"):
+            proc = subprocess.run(cmd, env=env, capture_output=True, text=True)
+
+        # dbo-opt can exit 0 having honoured neither --export-dir nor
+        # --kEmitSpyreCode, so check for the artifact explicitly.
+        spyre_code_dir = os.path.join(output_dir, "spyreCodeDir")
+        if not os.path.exists(os.path.join(spyre_code_dir, "spyrecode.json")):
+            raise RuntimeError(
+                f"OpSpec->KTIR: dbo-opt wrote no SpyreCode to {spyre_code_dir} "
+                f"(no spyrecode.json) for {ktir_path}.\n"
+                f"command: {' '.join(cmd)}\n"
+                f"returncode: {proc.returncode}\n"
+                f"stderr:\n{proc.stderr}"
+            )
+
+        # The KTIR path always produces a spyreCodeDir and never an init.txt,
+        # so it always launches via the jobplan.
+        return SpyreSDSCKernelRunner(kernel_name, output_dir, use_jobplan=True)

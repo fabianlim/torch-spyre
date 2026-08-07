@@ -30,15 +30,24 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from torch_spyre._C import DataFormats
+from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.codegen.opspec_utils import (
     _align_reshape_plan,
+    _base_address_elements,
     _buf_id,
     _row_major_strides,
 )
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
 
-# Pointwise op name -> the ``arith`` float builder that implements it.  Only
-# ``add`` is wired up so far; other ops raise before reaching here.
+# Pointwise op name -> the ``linalg`` *named* op builder that implements it.
+# A named linalg op (no region / indexing_maps / iterator_types) is what makes
+# the loaded tile's memref offset static, which the KTIR compiler requires; a
+# tensor-level ``arith`` op leaves a dynamic offset and fails to compile.
+# Only ``add`` is wired up so far; other ops raise before reaching here.
+_LINALG_FLOAT_OP = {"add": "add"}
+
+# Pointwise op name -> the tensor-level ``arith`` float builder, used only by
+# the legacy (``ktir_canonical_form=False``) emission path.
 _ARITH_FLOAT_OP = {"add": "AddFOp"}
 
 
@@ -69,30 +78,42 @@ def _mlir_elt_type(ir, device_dtype: DataFormats):
 def generate_ktir(
     kernel_name: str,
     specs: Sequence[OpSpec | LoopSpec | UnimplementedOp],
+    canonical_form: bool | None = None,
 ) -> str:
     """Build a KTDP-dialect MLIR module for ``specs`` and return ``str(module)``.
 
     ``specs`` is the finished OpSpec kernel contract (the same value
-    ``call_kernel`` passes positionally to ``.run(...)``).  Func parameters are
-    the unique operand buffers in ascending ``arg_index`` order so the emitted
-    signature matches that positional binding.
+    ``call_kernel`` passes positionally to ``.run(...)``).
+
+    ``canonical_form`` selects the emitted shape of the module.  When ``True``
+    (the default, read from ``config.ktir_canonical_form`` when ``None`` --
+    mirroring ``generate_bundle``'s option handling) the emitter produces the
+    form the KTIR compiler accepts: a zero-argument ``func.func`` whose buffer
+    base addresses are ``arith.constant`` index values taken from the OpSpec
+    allocations, and ``tensor.empty()`` + a named ``linalg`` op for the compute.
+    When ``False`` it produces the earlier form -- one ``index`` func parameter
+    per buffer and a tensor-level ``arith`` op -- which does not compile but is
+    kept reachable for inspection and tests.
     """
+    if canonical_form is None:
+        canonical_form = _spyre_config.ktir_canonical_form
+
     # ``mlir_ktdp`` is imported lazily so the module stays importable (and the
     # golden test can skip) where the dialect-packaged mlir_ktdp is not built.
     from mlir_ktdp import ir
-    from mlir_ktdp.dialects import arith, func, ktdp
+    from mlir_ktdp.dialects import arith, func, ktdp, linalg, tensor
 
     op_specs = _collect_pointwise_op_specs(specs)
 
-    # Ordered unique operand buffers -> func parameter position.  Ascending
-    # arg_index matches the positional order call_kernel passes to .run(...),
-    # so the emitted func signature lines up with that binding.
+    # Ordered unique operand buffers.  Ascending arg_index matches the
+    # positional order call_kernel passes to .run(...); _buf_id breaks the ties
+    # that the -1 sentinel (fused / lx / pool args) leaves, so the order is
+    # deterministic.
     ordered_args: dict[object, TensorArg] = {}
     for spec in op_specs:
         for arg in spec.args:
             ordered_args.setdefault(_buf_id(arg), arg)
-    param_args = sorted(ordered_args.values(), key=lambda a: a.arg_index)
-    param_index = {_buf_id(a): i for i, a in enumerate(param_args)}
+    buffer_args = sorted(ordered_args.values(), key=lambda a: (a.arg_index, _buf_id(a)))
 
     with ir.Context() as ctx, ir.Location.unknown():
         ktdp.register_dialects(ctx)
@@ -100,7 +121,8 @@ def generate_ktir(
 
         module = ir.Module.create()
         with ir.InsertionPoint(module.body):
-            fn_type = ir.FunctionType.get([index_t] * len(param_args), [])
+            n_params = 0 if canonical_form else len(buffer_args)
+            fn_type = ir.FunctionType.get([index_t] * n_params, [])
             fn = func.FuncOp(kernel_name, fn_type)
             # Single-core (SENCORES=1) grid; work-division scaling is future work.
             i64 = ir.IntegerType.get_signless(64)
@@ -111,16 +133,39 @@ def generate_ktir(
             with ir.InsertionPoint(block):
                 c0 = arith.ConstantOp(index_t, 0)
 
-                # One memory view per unique buffer, in param order.
+                # Base address per unique buffer: a constant folded from the
+                # OpSpec allocation (canonical), or the matching func parameter.
+                if canonical_form:
+                    offsets = []
+                    for arg in buffer_args:
+                        base = _base_address_elements(arg)
+                        # Reuse the single %c0 for a zero address, matching the
+                        # reference KTIR.
+                        offsets.append(
+                            c0 if base == 0 else arith.ConstantOp(index_t, base)
+                        )
+                else:
+                    offsets = block_args
+
+                # One memory view per unique buffer, in buffer order.
                 memory_views: dict[object, ir.Value] = {}
-                for arg in param_args:
-                    bid = _buf_id(arg)
-                    memory_views[bid] = _emit_memory_view(
-                        ir, ktdp, arg, block_args[param_index[bid]]
+                for arg, offset in zip(buffer_args, offsets):
+                    memory_views[_buf_id(arg)] = _emit_memory_view(
+                        ir, ktdp, arg, offset
                     )
 
                 for spec in op_specs:
-                    _emit_pointwise_op(ir, ktdp, arith, spec, memory_views, c0)
+                    _emit_pointwise_op(
+                        ir,
+                        ktdp,
+                        arith,
+                        linalg,
+                        tensor,
+                        spec,
+                        memory_views,
+                        c0,
+                        canonical_form,
+                    )
 
                 func.ReturnOp([])
 
@@ -149,10 +194,26 @@ def _collect_pointwise_op_specs(
             )
         if entry.is_reduction:
             raise NotImplementedError("OpSpec->KTIR: reductions are not supported yet")
-        if entry.op not in _ARITH_FLOAT_OP:
+        if entry.op not in _LINALG_FLOAT_OP:
             raise NotImplementedError(
                 f"OpSpec->KTIR: op {entry.op!r} is not supported yet "
                 "(only pointwise 'add')"
+            )
+        # ``grid`` is hardcoded to [1] and the emitted views cover the whole
+        # tensor, so a work-divided / tiled spec would silently emit
+        # single-core IR that computes the wrong thing.
+        divided = [
+            str(sym) for sym, (_, div) in entry.iteration_space.items() if int(div) > 1
+        ]
+        if divided:
+            raise NotImplementedError(
+                "OpSpec->KTIR: work division is not supported yet (iteration "
+                f"space symbols {divided} have a work division > 1)"
+            )
+        if entry.tiled_symbols:
+            raise NotImplementedError(
+                "OpSpec->KTIR: work division is not supported yet (spec has "
+                f"tiled symbols {list(entry.tiled_symbols)})"
             )
         op_specs.append(entry)
     if not op_specs:
@@ -183,7 +244,17 @@ def _emit_memory_view(ir, ktdp, arg: TensorArg, offset):
     )
 
 
-def _emit_pointwise_op(ir, ktdp, arith, spec: OpSpec, memory_views, c0):
+def _emit_pointwise_op(
+    ir,
+    ktdp,
+    arith,
+    linalg,
+    tensor,
+    spec: OpSpec,
+    memory_views,
+    c0,
+    canonical_form: bool,
+):
     """Emit the load / compute / store sequence for one pointwise ``OpSpec``."""
     inputs = [a for a in spec.args if a.is_input]
     outputs = [a for a in spec.args if not a.is_input]
@@ -230,8 +301,15 @@ def _emit_pointwise_op(ir, ktdp, arith, spec: OpSpec, memory_views, c0):
         _emit_load(ir, ktdp, arg, memory_views[_buf_id(arg)], c0) for arg in inputs
     ]
 
-    builder = getattr(arith, _ARITH_FLOAT_OP[spec.op])
-    result = builder(loaded[0], loaded[1])
+    if canonical_form:
+        # A named linalg op on a freshly-allocated destination tensor: this is
+        # what makes the loaded tiles' memref offsets static.
+        init = tensor.EmptyOp(out_extents, _mlir_elt_type(ir, out.device_dtype))
+        builder = getattr(linalg, _LINALG_FLOAT_OP[spec.op])
+        result = builder(loaded[0], loaded[1], outs=[init.result])
+    else:
+        builder = getattr(arith, _ARITH_FLOAT_OP[spec.op])
+        result = builder(loaded[0], loaded[1])
 
     _emit_store(ir, ktdp, out, memory_views[_buf_id(out)], result, c0)
 

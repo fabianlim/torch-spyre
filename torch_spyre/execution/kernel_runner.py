@@ -48,3 +48,24 @@ class SpyreSDSCKernelRunner:
                 launch_jobplan(self.jobplan, args)
             else:
                 launch_kernel(self.code_dir, args)
+
+
+class SpyreKTIRKernelRunner:
+    """Runner for a SpyreCode directory, as produced by the OpSpec->KTIR path.
+
+    The KTIR backend compiler always writes a ``spyreCodeDir`` and never the
+    ``init.txt`` the SDSC/dxp path emits, so this always launches via the
+    jobplan -- unlike ``SpyreSDSCKernelRunner``, which picks its launch path
+    from the dxp-oriented ``DUMP_SPYRE_CODE`` env var.
+    """
+
+    def __init__(self, name: str, code_dir: str):
+        self.kernel_name = name
+        self.code_dir = code_dir
+        self.jobplan = prepare_kernel(code_dir + "/spyreCodeDir")
+
+    def run(self, *args, **kw_args):
+        logger.info("RUN: %s %s", self.kernel_name, self.code_dir)
+
+        with torch.profiler.record_function(f"launch_kernel:{self.kernel_name}"):
+            launch_jobplan(self.jobplan, args)

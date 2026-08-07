@@ -24,53 +24,68 @@ import unittest
 import sympy
 
 from torch_spyre._C import DataFormats
+from torch_spyre._inductor.constants import SEGMENT_OFFSETS
 from torch_spyre._inductor.op_spec import OpSpec, TensorArg
 
 
 def _mlir_ktdp_available() -> bool:
-    """True when mlir_ktdp is built with the func/arith dialect Python bindings."""
+    """True when mlir_ktdp is built with the dialect Python bindings we emit."""
     try:
         from mlir_ktdp import ir  # noqa: F401
-        from mlir_ktdp.dialects import arith, func, ktdp  # noqa: F401
+        from mlir_ktdp.dialects import (  # noqa: F401
+            arith,
+            func,
+            ktdp,
+            linalg,
+            tensor,
+        )
     except ImportError:
         return False
     return True
 
 
 # The canonical KTIR text ``generate_ktir`` emits for a single pointwise ``add``
-# over a [512, 1024] fp16 tensor stickified to device shape [16, 512, 64].
+# over a [512, 1024] fp16 tensor stickified to device shape [16, 512, 64]:
+# a zero-argument func with the buffer base addresses (in elements) baked in as
+# ``arith.constant``s, and ``tensor.empty()`` + ``linalg.add`` for the compute.
 _EXPECTED_ADD_KTIR = """\
 #map = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
 #set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 15 >= 0, d1 >= 0, -d1 + 511 >= 0, d2 >= 0, -d2 + 63 >= 0)>
 module {
-  func.func @ktir_fused_add_0(%arg0: index, %arg1: index, %arg2: index) attributes {grid = [1]} {
+  func.func @ktir_fused_add_0() attributes {grid = [1]} {
     %c0 = arith.constant 0 : index
-    %0 = ktdp.construct_memory_view %arg0, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
-    %1 = ktdp.construct_memory_view %arg1, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
-    %2 = ktdp.construct_memory_view %arg2, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
+    %c8589934592 = arith.constant 8589934592 : index
+    %c17179869184 = arith.constant 17179869184 : index
+    %0 = ktdp.construct_memory_view %c0, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
+    %1 = ktdp.construct_memory_view %c8589934592, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
+    %2 = ktdp.construct_memory_view %c17179869184, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
     %3 = ktdp.construct_access_tile %0[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
     %4 = ktdp.load %3 : <16x512x64xindex> -> tensor<16x512x64xf16>
     %5 = ktdp.construct_access_tile %1[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
     %6 = ktdp.load %5 : <16x512x64xindex> -> tensor<16x512x64xf16>
-    %7 = arith.addf %4, %6 : tensor<16x512x64xf16>
-    %8 = ktdp.construct_access_tile %2[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
-    ktdp.store %7, %8 : tensor<16x512x64xf16>, <16x512x64xindex>
+    %7 = tensor.empty() : tensor<16x512x64xf16>
+    %8 = linalg.add ins(%4, %6 : tensor<16x512x64xf16>, tensor<16x512x64xf16>) outs(%7 : tensor<16x512x64xf16>) -> tensor<16x512x64xf16>
+    %9 = ktdp.construct_access_tile %2[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
+    ktdp.store %8, %9 : tensor<16x512x64xf16>, <16x512x64xindex>
     return
   }
 }
 """
 
-
-def _add_op_specs() -> list:
+def _add_op_specs(allocations: list[dict] | None = None) -> list:
     """Finished OpSpec list for ``a + b`` at device shape [16, 512, 64] fp16.
 
     This mirrors what the SuperDSC frontend produces for a pointwise ``a + b``:
     two HBM inputs and one HBM output, each addressed at the identity
-    coordinates ``(d0, d1, d2)`` over the stickified device shape.
+    coordinates ``(d0, d1, d2)`` over the stickified device shape.  The default
+    allocations are the first three HBM segment bases, i.e. what memory
+    planning assigns to three distinct graph-boundary buffers.
     """
     d0, d1, d2 = sympy.symbols("d0 d1 d2")
     coords = [d0, d1, d2]
     size = [16, 512, 64]
+    if allocations is None:
+        allocations = [{"hbm": SEGMENT_OFFSETS[i]} for i in range(3)]
 
     def arg(is_input: bool, index: int, name: str) -> TensorArg:
         return TensorArg(
@@ -79,7 +94,7 @@ def _add_op_specs() -> list:
             device_dtype=DataFormats.SEN169_FP16,
             device_size=list(size),
             device_coordinates=list(coords),
-            allocation={"hbm": None},
+            allocation=dict(allocations[index]),
             name=name,
         )
 
@@ -124,6 +139,70 @@ class TestKtirEmitter(unittest.TestCase):
         specs[0].op = "mul"
         with self.assertRaises(NotImplementedError):
             generate_ktir("ktir_fused_mul_0", specs)
+
+    def test_pool_allocation_zero_address(self):
+        """A ``{"pool": 0}`` allocation resolves to address 0, not to a failure.
+
+        ``INTERMEDIATES_SEGMENT`` is ``0x0``, so the first pool buffer's
+        allocation value is falsy; resolving allocations with an ``or``-chain
+        would fall through to a missing ``"hbm"`` key and raise.
+        """
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        specs = _add_op_specs(
+            [{"hbm": SEGMENT_OFFSETS[0]}, {"hbm": SEGMENT_OFFSETS[1]}, {"pool": 0}]
+        )
+        emitted = generate_ktir("ktir_fused_add_0", specs)
+        # Both the arg0 (hbm 0x0) and buf0 (pool 0) views reuse the single %c0,
+        # leaving just %c0 and arg1's base as the emitted constants.
+        self.assertEqual(emitted.count("ktdp.construct_memory_view %c0,"), 2)
+        self.assertEqual(emitted.count("arith.constant"), 2)
+
+    def test_work_division_unsupported(self):
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        specs = _add_op_specs()
+        sym = next(iter(specs[0].iteration_space))
+        rng, _ = specs[0].iteration_space[sym]
+        specs[0].iteration_space[sym] = (rng, 2)
+        with self.assertRaisesRegex(NotImplementedError, "work division"):
+            generate_ktir("ktir_fused_add_0", specs)
+
+    def test_tiled_symbols_unsupported(self):
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        specs = _add_op_specs()
+        specs[0].tiled_symbols = [next(iter(specs[0].iteration_space))]
+        with self.assertRaisesRegex(NotImplementedError, "work division"):
+            generate_ktir("ktir_fused_add_0", specs)
+
+    def test_lx_allocation_unsupported(self):
+        """An LX address inside an HBM-hardcoded memory view must not be emitted."""
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        specs = _add_op_specs(
+            [{"hbm": SEGMENT_OFFSETS[0]}, {"hbm": SEGMENT_OFFSETS[1]}, {"lx": 4096}]
+        )
+        with self.assertRaisesRegex(NotImplementedError, "LX-allocated"):
+            generate_ktir("ktir_fused_add_0", specs)
+
+    def test_missing_allocation_unsupported(self):
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        specs = _add_op_specs(
+            [{"hbm": SEGMENT_OFFSETS[0]}, {"hbm": SEGMENT_OFFSETS[1]}, {}]
+        )
+        with self.assertRaisesRegex(NotImplementedError, "no resolvable allocation"):
+            generate_ktir("ktir_fused_add_0", specs)
+
+    def test_none_allocation_unsupported(self):
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        specs = _add_op_specs(
+            [{"hbm": SEGMENT_OFFSETS[0]}, {"hbm": SEGMENT_OFFSETS[1]}, {"hbm": None}]
+        )
+        with self.assertRaisesRegex(NotImplementedError, "unassigned"):
+            generate_ktir("ktir_fused_add_0", specs)
 
 
 if __name__ == "__main__":

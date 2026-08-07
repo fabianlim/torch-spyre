@@ -70,6 +70,58 @@ def _buf_id(arg: TensorArg) -> str:
     return arg.name
 
 
+def _base_address_elements(arg: TensorArg) -> int:
+    """Base address of ``arg``'s buffer in ELEMENTS, for ``ktdp.construct_memory_view``.
+
+    Resolves the allocation with the same precedence the SDSC path uses
+    (``pool`` -> ``lx`` -> ``hbm``), testing **key presence** rather than
+    truthiness: ``INTERMEDIATES_SEGMENT`` is ``0x0``, so the first pool buffer's
+    allocation is ``{"pool": 0}`` and an ``or``-chain would fall through to a
+    missing ``"hbm"`` and silently yield ``None``.
+
+    Allocation values are **byte** offsets; KTIR memory views address in
+    elements, so the byte offset is divided by the device dtype's element size.
+
+    ``lx`` allocations are rejected: the KTIR emitter hardcodes
+    ``memory_space = HBM`` on every view, so an LX address would produce
+    silently-wrong IR.  ``pool`` is fine (pool memory is HBM).
+    """
+    # Local import: compute_ops pulls in torch_spyre._C, and this module is
+    # imported by emitter-agnostic callers.
+    from torch_spyre._inductor.codegen.compute_ops import num_bytes
+
+    allocation = arg.allocation or {}
+    if "pool" in allocation:
+        space, byte_addr = "pool", allocation["pool"]
+    elif "lx" in allocation:
+        raise NotImplementedError(
+            f"OpSpec->KTIR: buffer {arg.name!r} is LX-allocated; the KTIR "
+            "emitter only emits HBM memory views"
+        )
+    elif "hbm" in allocation:
+        space, byte_addr = "hbm", allocation["hbm"]
+    else:
+        raise NotImplementedError(
+            f"OpSpec->KTIR: buffer {arg.name!r} has no resolvable allocation "
+            f"(got {allocation!r}); expected one of 'pool' / 'hbm'"
+        )
+
+    if byte_addr is None:
+        raise NotImplementedError(
+            f"OpSpec->KTIR: buffer {arg.name!r} has an unassigned {space!r} "
+            "address (None); memory planning must run before KTIR emission"
+        )
+
+    elt_bytes = num_bytes(arg.device_dtype)
+    if int(byte_addr) % elt_bytes:
+        raise NotImplementedError(
+            f"OpSpec->KTIR: buffer {arg.name!r} {space!r} address "
+            f"{int(byte_addr)} is not a multiple of the {elt_bytes}-byte "
+            "element size"
+        )
+    return int(byte_addr) // elt_bytes
+
+
 def _iteration_space_key(spec: OpSpec) -> tuple:
     """Hashable canonical form of ``spec.iteration_space`` for grouping.
 

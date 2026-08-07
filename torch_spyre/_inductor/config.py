@@ -77,6 +77,23 @@ core_id_k_fast_emission: bool = (
 # affine.apply indirection for tiled loops.
 bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "0") == "1"
 
+# Settings for the KTIR backend compiler invoked by SpyreAsyncCompile.ktir.
+# dbo-opt itself is found on PATH, like dxp_standalone on the SDSC path -- append
+# its bin dir, never prepend it, since that tree also ships a dxp_standalone that
+# would shadow the one the SDSC path needs.
+#
+# dbo_lib_paths cannot be handled the same way and cannot be dropped: dbo-opt has
+# no RPATH and needs its own libdcc/libdxp resolved *first* (with /opt/ibm first
+# it dies in symbol lookup), while torch_spyre's runtime -- also RPATH-less --
+# needs /opt/ibm first (with dbo-opt's first, execution silently returns garbage).
+# The two orderings are incompatible, so this is prepended only in the compiler
+# subprocess's environment.
+dbo_lib_paths: str = os.environ.get("DBO_LIB_PATHS")
+
+# The ktdf_arch device description: dbo-opt errors out without a --device when
+# the KTIR module carries no ktdf_arch.device of its own.
+ktir_device_mlir: str = os.environ.get("KTIR_DEVICE_MLIR")
+
 # When True (default), LoopSpec nodes are fully unrolled into flat OpSpecs
 # before generate_bundle runs.  Set to False to pass LoopSpecs through intact
 # for the scf.for / affine.apply path.

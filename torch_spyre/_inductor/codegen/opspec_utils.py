@@ -31,17 +31,9 @@ named for the ``OpSpec`` it reads rather than for KTIR.
 from __future__ import annotations
 
 import sympy
-from torch._inductor.virtualized import V
 from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 
 from torch_spyre._inductor.op_spec import OpSpec, TensorArg
-
-
-def _size_hint(expr) -> int:
-    """Concrete size hint for an iteration-space range expression."""
-    if isinstance(expr, (int, sympy.Integer)):
-        return int(expr)
-    return int(V.graph.sizevars.size_hint(expr))
 
 
 def _row_major_strides(device_size: list[int]) -> list[int]:

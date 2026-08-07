@@ -115,12 +115,16 @@ class SpyreAsyncCompile(AsyncCompile):
 
         from torch_spyre._inductor.codegen.ktir import generate_ktir
 
+        # Emit before opening the file: if generate_ktir raises we must not
+        # leave a truncated/empty .ktir behind.
+        ktir_text = generate_ktir(kernel_name, specs)
+
         # Persist the emitted KTIR as a text file in the same per-kernel output
         # dir as sdsc's bundle.
         output_dir = get_output_dir(kernel_name)
         ktir_path = os.path.join(output_dir, f"{kernel_name}.ktir")
         with open(ktir_path, "w") as fh:
-            fh.write(generate_ktir(kernel_name, specs))
+            fh.write(ktir_text)
         logger.debug("OpSpec->KTIR: wrote %s", ktir_path)
 
         raise NotImplementedError(

@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from typing import Sequence, Union
 
 import sympy
@@ -713,7 +712,7 @@ class SuperDSCScheduling(BaseScheduling):
             kernel_name = wrapper.src_to_kernel[src_code]
         else:
             fused_name = get_fused_kernel_name(node_schedule, "original_aten")
-            method = "ktir" if os.getenv("TORCH_SPYRE_KTIR") == "1" else "sdsc"
+            method = "ktir" if _spyre_config.ktir_emitter else "sdsc"
             kernel_name = "_".join([method, fused_name, wrapper.next_kernel_suffix()])
             wrapper.src_to_kernel[src_code] = kernel_name
             buf = IndentedBuffer()

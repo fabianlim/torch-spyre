@@ -20,6 +20,7 @@ Skipped only where ``mlir_ktdp`` is not installed.
 """
 
 import unittest
+from unittest import mock
 
 import sympy
 
@@ -98,6 +99,10 @@ def _add_op_specs() -> list:
     ]
 
 
+# The emitter only supports the single-core (SENCORES=1) grid so far; pin it so
+# these tests exercise their intended guards rather than the multi-core guard,
+# which would otherwise fire first on the default SENCORES=32.
+@mock.patch("torch_spyre._inductor.config.sencores", 1)
 @unittest.skipUnless(
     _mlir_ktdp_available(),
     "mlir_ktdp with func/arith dialect bindings is not installed",
@@ -124,6 +129,17 @@ class TestKtirEmitter(unittest.TestCase):
         specs[0].op = "mul"
         with self.assertRaises(NotImplementedError):
             generate_ktir("ktir_fused_mul_0", specs)
+
+
+class TestKtirCapabilityGuards(unittest.TestCase):
+    """Guards that fire before the mlir_ktdp import, so they need no dialect."""
+
+    @mock.patch("torch_spyre._inductor.config.sencores", 2)
+    def test_multicore_unsupported(self):
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        with self.assertRaises(NotImplementedError):
+            generate_ktir("ktir_fused_add_0", _add_op_specs())
 
 
 if __name__ == "__main__":

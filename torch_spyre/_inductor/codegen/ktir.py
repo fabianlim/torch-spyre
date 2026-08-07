@@ -30,6 +30,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from torch_spyre._C import DataFormats
+from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.codegen.opspec_utils import (
     _align_reshape_plan,
     _buf_id,
@@ -77,21 +78,39 @@ def generate_ktir(
     the unique operand buffers in ascending ``arg_index`` order so the emitted
     signature matches that positional binding.
     """
+    # Pure capability checks first, before the mlir_ktdp import: they need no
+    # dialect build, so an unsupported request fails fast (and is testable)
+    # whether or not mlir_ktdp is installed.
+    #
+    # Multi-core work division is future work; the grid below is hard-coded to a
+    # single core, so reject anything else rather than silently emitting a
+    # single-core grid on a multi-core request.
+    if _spyre_config.sencores != 1:
+        raise NotImplementedError(
+            "OpSpec->KTIR: multi-core work division is not supported yet "
+            f"(SENCORES={_spyre_config.sencores}, only 1 is supported)"
+        )
+    op_specs = _collect_pointwise_op_specs(specs)
+
     # ``mlir_ktdp`` is imported lazily so the module stays importable (and the
     # golden test can skip) where the dialect-packaged mlir_ktdp is not built.
     from mlir_ktdp import ir
     from mlir_ktdp.dialects import arith, func, ktdp
 
-    op_specs = _collect_pointwise_op_specs(specs)
-
     # Ordered unique operand buffers -> func parameter position.  Ascending
     # arg_index matches the positional order call_kernel passes to .run(...),
-    # so the emitted func signature lines up with that binding.
+    # so the emitted func signature lines up with that binding.  Only real
+    # external buffers (arg_index >= 0) become func parameters; register-threaded
+    # fused intermediates carry the -1 sentinel and are threaded as SSA values,
+    # never bound positionally.
     ordered_args: dict[object, TensorArg] = {}
     for spec in op_specs:
         for arg in spec.args:
             ordered_args.setdefault(_buf_id(arg), arg)
-    param_args = sorted(ordered_args.values(), key=lambda a: a.arg_index)
+    param_args = sorted(
+        (a for a in ordered_args.values() if a.arg_index >= 0),
+        key=lambda a: a.arg_index,
+    )
     param_index = {_buf_id(a): i for i, a in enumerate(param_args)}
 
     with ir.Context() as ctx, ir.Location.unknown():

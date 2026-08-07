@@ -38,10 +38,16 @@ from torch_spyre._inductor.codegen.opspec_utils import (
     _iteration_space_key,
     _row_major_strides,
 )
+from torch_spyre._inductor.constants import SEGMENT_OFFSETS
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
 
-# Pointwise op name -> the ``arith`` float builder that implements it.
-_ARITH_FLOAT_OP = {"add": "AddFOp", "mul": "MulFOp"}
+# Pointwise op name -> the ``linalg`` named op that implements it.
+# TENTATIVE (dbo workaround): dbo-opt's construct-three-stage-pipeline
+# requires linalg named ops (linalg.add / linalg.mul) rather than
+# arith scalar-on-tensor ops (arith.addf / arith.mulf).  The test
+# fixtures under dataflow-scheduler/test/.../ConstructThreeStagePipeline/
+# all use linalg ops; arith.addf on tensors is not handled.
+_LINALG_OP = {"add": "add", "mul": "mul"}
 
 
 def _val(x):
@@ -95,7 +101,7 @@ def generate_ktir(
     # ``mlir_ktdp`` is imported lazily so the module stays importable (and the
     # golden test can skip) where the dialect-packaged mlir_ktdp is not built.
     from mlir_ktdp import ir
-    from mlir_ktdp.dialects import arith, func, ktdp
+    from mlir_ktdp.dialects import arith, func, ktdp, linalg, tensor
 
     # Fused ops must share one iteration space (same grid / work-division); the
     # register-threaded intermediate between them has the same extents as the
@@ -126,7 +132,6 @@ def generate_ktir(
         (a for a in ordered_args.values() if a.arg_index >= 0),
         key=lambda a: a.arg_index,
     )
-    param_index = {_buf_id(a): i for i, a in enumerate(param_args)}
 
     with ir.Context() as ctx, ir.Location.unknown():
         ktdp.register_dialects(ctx)
@@ -134,25 +139,32 @@ def generate_ktir(
 
         module = ir.Module.create()
         with ir.InsertionPoint(module.body):
-            fn_type = ir.FunctionType.get([index_t] * len(param_args), [])
+            # TENTATIVE (dbo workaround for dataflow-scheduler#65):
+            # dbo-opt rejects symbolic base addresses (func index args) because
+            # construct_memory_view produces memref<..., offset: ?> which
+            # ktdp.load's verifier rejects.  Until the scheduler is fixed,
+            # emit a zero-arg func and materialise each buffer's HBM address
+            # as an arith.constant using SEGMENT_OFFSETS[arg_index].
+            fn_type = ir.FunctionType.get([], [])
             fn = func.FuncOp(kernel_name, fn_type)
             i64 = ir.IntegerType.get_signless(64)
             fn.attributes["grid"] = ir.ArrayAttr.get(
                 [ir.IntegerAttr.get(i64, total_cores)]
             )
             block = fn.add_entry_block()
-            block_args = list(block.arguments)
 
             with ir.InsertionPoint(block):
                 c0 = arith.ConstantOp(index_t, 0)
 
                 # One memory view per unique buffer, in param order.
+                # Each base address is a compile-time constant (SEGMENT_OFFSETS).
                 memory_views: dict[object, ir.Value] = {}
                 for arg in param_args:
                     bid = _buf_id(arg)
-                    memory_views[bid] = _emit_memory_view(
-                        ir, ktdp, arg, block_args[param_index[bid]]
+                    base = arith.ConstantOp(
+                        index_t, int(SEGMENT_OFFSETS[arg.arg_index])
                     )
+                    memory_views[bid] = _emit_memory_view(ir, ktdp, arg, _val(base))
 
                 # Per-core offset from the flat grid id for each work-divided
                 # symbol.  Nothing is emitted when total_cores == 1, so the
@@ -182,6 +194,8 @@ def generate_ktir(
                         ir,
                         ktdp,
                         arith,
+                        linalg,
+                        tensor,
                         spec,
                         memory_views,
                         produced,
@@ -218,10 +232,10 @@ def _collect_pointwise_op_specs(
             )
         if entry.is_reduction:
             raise NotImplementedError("OpSpec->KTIR: reductions are not supported yet")
-        if entry.op not in _ARITH_FLOAT_OP:
+        if entry.op not in _LINALG_OP:
             raise NotImplementedError(
                 f"OpSpec->KTIR: op {entry.op!r} is not supported yet "
-                f"(only pointwise {sorted(_ARITH_FLOAT_OP)})"
+                f"(only pointwise {sorted(_LINALG_OP)})"
             )
         op_specs.append(entry)
     if not op_specs:
@@ -256,6 +270,8 @@ def _emit_pointwise_op(
     ir,
     ktdp,
     arith,
+    linalg,
+    tensor,
     spec: OpSpec,
     memory_views,
     produced,
@@ -332,8 +348,15 @@ def _emit_pointwise_op(
                 "(cross-group HBM intermediates are not supported yet)"
             )
 
-    builder = getattr(arith, _ARITH_FLOAT_OP[spec.op])
-    result = _val(builder(loaded[0], loaded[1]))
+    # TENTATIVE: emit linalg named op + tensor.empty() outs, matching the
+    # pattern the dataflow-scheduler test fixtures use.
+    block = _device_block_shape(out, divisor_of)
+    elt_t = _mlir_elt_type(ir, out.device_dtype)
+    tensor_t = ir.RankedTensorType.get(block, elt_t)
+    empty = _val(tensor.EmptyOp(block, elt_t))
+    linalg_op_name = _LINALG_OP[spec.op]
+    linalg_builder = getattr(linalg, linalg_op_name)
+    result = _val(linalg_builder(*loaded, outs=[empty], result_tensors=[tensor_t]))
 
     out_bid = _buf_id(out)
     if out_bid in memory_views:

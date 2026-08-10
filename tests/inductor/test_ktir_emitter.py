@@ -26,6 +26,7 @@ import unittest
 import sympy
 
 from torch_spyre._C import DataFormats
+from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg
 
 
@@ -44,12 +45,23 @@ _D0, _D1, _D2 = sympy.symbols("d0 d1 d2")
 _COORDS = [_D0, _D1, _D2]
 _SIZE = [16, 512, 64]
 
+# Per-arg_index HBM byte addresses handed to the emitter.  Arbitrary and opaque:
+# the emitter only scales them to elements, so all that matters is that they are
+# distinct and agree with the goldens below (which pin these // 2 for fp16).
+_HBM_BYTES = [0x0, 0x400000000, 0x800000000, 0xC00000000]
+
 
 def _arg(is_input: bool, index: int, name: str) -> TensorArg:
     """A TensorArg at the identity coordinates over the [16, 512, 64] shape.
 
     ``index < 0`` marks a fused-away intermediate (no assigned arg slot); such a
-    buffer is register-threaded rather than materialized to a func parameter.
+    buffer is register-threaded rather than materialized to a func parameter, so
+    its allocation is never read and stays unassigned.
+
+    Assigned slots get an arbitrary distinct **byte** address from
+    ``_HBM_BYTES``.  The emitter treats it as opaque -- it reads
+    ``allocation["hbm"]`` and scales it to elements -- so these values only have
+    to be distinct and to match the goldens, not to be plausible addresses.
     """
     return TensorArg(
         is_input=is_input,
@@ -57,7 +69,7 @@ def _arg(is_input: bool, index: int, name: str) -> TensorArg:
         device_dtype=DataFormats.SEN169_FP16,
         device_size=list(_SIZE),
         device_coordinates=list(_COORDS),
-        allocation={"hbm": None},
+        allocation={"hbm": _HBM_BYTES[index] if index >= 0 else None},
         name=name,
     )
 
@@ -290,6 +302,16 @@ module {
     "mlir_ktdp with func/arith dialect bindings is not installed",
 )
 class TestKtirEmitter(unittest.TestCase):
+    def setUp(self):
+        # The emitter bakes literal addresses, so it only accepts the
+        # non-symbolic path; on the symbolic path allocation["hbm"] is a
+        # sentinel arg_index rather than an address.  The default is symbolic,
+        # so every emitting test has to opt out (see
+        # test_symbolic_args_unsupported for the guard itself).
+        patcher = _spyre_config.patch(bundle_symbolic_args=False)
+        patcher.__enter__()
+        self.addCleanup(patcher.__exit__, None, None, None)
+
     def test_pointwise_add_golden(self):
         """Single pointwise add, single core -- the pointwise-PR baseline."""
         from torch_spyre._inductor.codegen.ktir import generate_ktir
@@ -325,6 +347,42 @@ class TestKtirEmitter(unittest.TestCase):
         specs[0].is_reduction = True
         with self.assertRaises(NotImplementedError):
             generate_ktir("ktir_fused_add_0", specs)
+
+    def test_symbolic_args_unsupported(self):
+        """The symbolic path must be refused, not silently miscompiled.
+
+        There ``allocation["hbm"]`` holds a sentinel ``arg_index`` (the real
+        address is substituted at launch), so baking it would emit addresses of
+        0/0/1.  Nothing downstream would catch that -- the compute path
+        validates neither the slot index nor the offset -- so the kernel would
+        run and return wrong data.
+        """
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        with _spyre_config.patch(bundle_symbolic_args=True):
+            with self.assertRaises(NotImplementedError) as cm:
+                generate_ktir("ktir_fused_add_0", _add_op_specs())
+        self.assertIn("literal address path", str(cm.exception))
+
+    def test_unassigned_address_rejected(self):
+        """An unplanned buffer must raise rather than bake ``None``."""
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        specs = _add_op_specs()
+        specs[0].args[1].allocation = {"hbm": None}
+        with self.assertRaises(NotImplementedError):
+            generate_ktir("ktir_fused_add_0", specs)
+
+    def test_non_hbm_allocation_rejected(self):
+        """LX / pool buffers must raise: every emitted view hardcodes HBM."""
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        for allocation in ({"lx": 0x1000}, {"hbm_pool": 0x2000}):
+            with self.subTest(allocation=allocation):
+                specs = _add_op_specs()
+                specs[0].args[1].allocation = dict(allocation)
+                with self.assertRaises(NotImplementedError):
+                    generate_ktir("ktir_fused_add_0", specs)
 
     def test_unsupported_op(self):
         """A pointwise op outside the wired-up set (e.g. ``sub``) must raise."""

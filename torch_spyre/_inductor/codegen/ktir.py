@@ -30,6 +30,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from torch_spyre._C import DataFormats
+from torch_spyre._inductor import config as _spyre_config
+from torch_spyre._inductor.codegen.compute_ops import num_bytes
 from torch_spyre._inductor.codegen.opspec_utils import (
     _align_reshape_plan,
     _buf_id,
@@ -38,8 +40,69 @@ from torch_spyre._inductor.codegen.opspec_utils import (
     _iteration_space_key,
     _row_major_strides,
 )
-from torch_spyre._inductor.constants import SEGMENT_OFFSETS
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
+
+
+def _base_address_elements(arg: TensorArg) -> int:
+    """``arg``'s buffer base address in ELEMENTS, for ``ktdp.construct_memory_view``.
+
+    Reads ``allocation["hbm"]`` -- the same field the SDSC path resolves into
+    ``SDSCArgs.start_address`` (``superdsc.py:774``) and emits as
+    ``startAddressCoreCorelet_`` (``compute_ops.py:1306``).  Its **units follow
+    ``config.bundle_symbolic_args``**, which is why that flag is rejected here
+    rather than anywhere else -- this is its only semantic consumer.  For a
+    3-buffer add the two paths give::
+
+        literal   {'hbm': 0}  {'hbm': 17179869184}  {'hbm': 34359738368}
+        symbolic  {'hbm': 0}  {'hbm': 1}            {'hbm': 2}
+
+    The literal values are byte offsets in the device virtual space, one segment
+    slot per argument encoded as ``slot << 34`` (0x0 / 0x400000000 /
+    0x800000000).  The symbolic ones are a bare sentinel ``arg_index`` that is
+    rebound at launch -- baking those would silently address 0/0/1.
+
+    Do NOT recompute this as ``SEGMENT_OFFSETS[arg.arg_index]``: an HBM pool
+    takes slot 0 and shifts every tensor arg up one (``spyre_kernel.py:1235``),
+    so ``arg_index`` addresses one slot low.  ``allocation`` is a tagged union,
+    so ``lx`` / ``hbm_pool`` buffers are rejected outright.  Byte offsets are
+    scaled down by the element size, which is what a memref base offset indexes.
+    """
+    # Units, hence correctness, depend on the flag -- see above.
+    if _spyre_config.bundle_symbolic_args:
+        raise NotImplementedError(
+            "OpSpec->KTIR: requires the literal address path, but "
+            "bundle_symbolic_args is set, so allocation['hbm'] holds a "
+            "sentinel arg_index rather than an address. Set "
+            "BUNDLE_SYMBOLIC_ARGS=0 (it is also read directly by "
+            "prepare_kernel, so the env var itself must be 0, not just the "
+            "config flag)."
+        )
+
+    allocation = arg.allocation or {}
+    if "hbm" not in allocation:
+        space = next(iter(allocation), None)
+        raise NotImplementedError(
+            f"OpSpec->KTIR: buffer {arg.name!r} is not HBM-allocated "
+            f"(allocation={allocation!r}); the emitter only emits HBM memory "
+            f"views, so {space!r} allocations are out of scope"
+        )
+    byte_offset = allocation["hbm"]
+    if byte_offset is None:
+        raise NotImplementedError(
+            f"OpSpec->KTIR: buffer {arg.name!r} has an unassigned 'hbm' "
+            "address (None); memory planning must run before KTIR emission"
+        )
+
+    # The base offset indexes the memref's element type, so a byte offset must
+    # be scaled down.  Emitting the raw byte offset compiles and runs but
+    # addresses the wrong memory (2x off for f16) with no diagnostic anywhere.
+    elem_bytes = num_bytes(arg.device_dtype)
+    if int(byte_offset) % elem_bytes:
+        raise NotImplementedError(
+            f"OpSpec->KTIR: HBM offset {int(byte_offset):#x} for buffer "
+            f"{arg.name!r} is not a multiple of the {elem_bytes}-byte element size"
+        )
+    return int(byte_offset) // elem_bytes
 
 # Pointwise op name -> the ``linalg`` named op that implements it.
 # TENTATIVE (dbo workaround): dbo-opt's construct-three-stage-pipeline
@@ -144,7 +207,7 @@ def generate_ktir(
             # construct_memory_view produces memref<..., offset: ?> which
             # ktdp.load's verifier rejects.  Until the scheduler is fixed,
             # emit a zero-arg func and materialise each buffer's HBM address
-            # as an arith.constant using SEGMENT_OFFSETS[arg_index].
+            # as an arith.constant read from its allocation.
             fn_type = ir.FunctionType.get([], [])
             fn = func.FuncOp(kernel_name, fn_type)
             i64 = ir.IntegerType.get_signless(64)
@@ -156,14 +219,13 @@ def generate_ktir(
             with ir.InsertionPoint(block):
                 c0 = arith.ConstantOp(index_t, 0)
 
-                # One memory view per unique buffer, in param order.
-                # Each base address is a compile-time constant (SEGMENT_OFFSETS).
+                # One memory view per unique buffer, in param order.  Each base
+                # address is a compile-time constant resolved from the buffer's
+                # own allocation (see _base_address_elements).
                 memory_views: dict[object, ir.Value] = {}
                 for arg in param_args:
                     bid = _buf_id(arg)
-                    base = arith.ConstantOp(
-                        index_t, int(SEGMENT_OFFSETS[arg.arg_index])
-                    )
+                    base = arith.ConstantOp(index_t, _base_address_elements(arg))
                     memory_views[bid] = _emit_memory_view(ir, ktdp, arg, _val(base))
 
                 # Per-core offset from the flat grid id for each work-divided

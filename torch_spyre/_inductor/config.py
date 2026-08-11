@@ -117,16 +117,21 @@ core_id_k_fast_emission: bool = (
 # into the SDSC JSON and bundle.mlir emits sdsc_execute with no operands.
 bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "1") == "1"
 
-# The KTIR path requires literal addresses, so it forces the symbolic path off.
+# PATH SELECTION for the KTIR emitter, not a correctness guard.
 #
-# Why here, and why both the flag and the env var:
+# The emitter supports both address forms (``codegen/ktir.py``:
+# ``SymbolicAddresses`` / ``BakedConstants``) and reads this flag to choose
+# between them. The device path is not free to choose: ``dbo-opt``'s
+# address-assignment pass requires compile-time-constant HBM addresses
+# (dataflow-scheduler#65) and rejects the symbolic module, so leaving the flag at
+# its default (True) would emit IR the backend refuses. Hence the force.
 #
-#   * The emitter bakes each buffer's HBM base address into the module as a
-#     constant (address assignment in the backend requires constant addresses,
-#     dataflow-scheduler#65). It reads that address from ``allocation["hbm"]``,
-#     whose *units* depend on this flag: with symbolic args that field holds a
-#     sentinel ``arg_index`` (0, 1, 2) rather than an address, so the emitter
-#     cannot function on the symbolic path at all.
+# Why the env var as well as the flag:
+#
+#   * The flag decides the *units* of ``allocation["hbm"]``, which is the value
+#     ``BakedConstants`` bakes: with symbolic args that field holds a sentinel
+#     ``arg_index`` (0, 1, 2) rather than an address. Selecting the baked form
+#     and leaving the units symbolic would bake nonsense.
 #   * The C++ side does not consult this module. ``prepare_kernel.cpp`` reads the
 #     raw environment variable, with an inverted sense:
 #     ``bind_io_addresses_ = (env == nullptr || std::string(env) != "1")`` --
@@ -139,8 +144,8 @@ bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "1") == "1"
 # it also affects anything else in it that reads BUNDLE_SYMBOLIC_ARGS. That is
 # acceptable only because TORCH_SPYRE_KTIR=1 is an experimental, explicit opt-in
 # that replaces the SDSC emission path outright; nothing sets it incidentally.
-# The emitter keeps its own guard on ``bundle_symbolic_args`` as the safety net
-# for any route that reaches it without passing through here.
+#
+# When #65 is fixed, this force and ``BakedConstants`` are deleted together.
 #
 # An assignment, not ``setdefault``: ``torch_spyre/__init__.py`` seeds the var to
 # "1" for the SDSC default, and that must lose to an explicit KTIR opt-in

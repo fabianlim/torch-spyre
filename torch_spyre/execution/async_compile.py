@@ -103,13 +103,11 @@ class SpyreAsyncCompile(AsyncCompile):
     ):
         """Emit KTDP-dialect MLIR for ``specs`` (OpSpec->KTIR path).
 
-        Mirrors ``sdsc`` but emits KTIR directly instead of an SDSC bundle.
-        The emitted KTIR is always persisted to disk for inspection. With
-        ``TORCH_SPYRE_DBO=1`` it is then compiled by ``dbo-opt``, which writes a
-        ``spyreCodeDir`` in the same layout ``dxp_standalone`` produces, so the
-        result is loaded and launched by the same ``SpyreSDSCKernelRunner``.
-        Without that switch device execution stays deferred and this raises
-        ``NotImplementedError``.
+        Mirrors ``sdsc`` but emits KTIR directly instead of an SDSC bundle: the
+        emitted KTIR is persisted to disk for inspection and then compiled by
+        ``dbo-opt``, which writes a ``spyreCodeDir`` in the same layout
+        ``dxp_standalone`` produces, so the result is loaded and launched by the
+        same ``SpyreSDSCKernelRunner``.
         """
         unimp = find_unimplemented(list(specs))
         if unimp is not None:
@@ -131,14 +129,6 @@ class SpyreAsyncCompile(AsyncCompile):
         with open(ktir_path, "w") as fh:
             fh.write(ktir_text)
         logger.debug("OpSpec->KTIR: wrote %s", ktir_path)
-
-        if os.getenv("TORCH_SPYRE_DBO") != "1":
-            raise NotImplementedError(
-                "OpSpec->KTIR: device execution is gated behind "
-                "TORCH_SPYRE_DBO=1; the emitted KTIR was written to "
-                f"{ktir_path} for inspection. Set TORCH_SPYRE_DBO=1 to compile "
-                "and run it with the dbo backend."
-            )
 
         return self._compile_ktir_with_dbo(kernel_name, ktir_path, output_dir)
 

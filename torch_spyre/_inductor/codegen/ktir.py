@@ -23,6 +23,25 @@ test consumes without drift.
 
 It uses the OpSpec-reading helpers from ``opspec_utils`` to adapt the OpSpec
 information to generate_ktir.
+
+Two emission forms
+------------------
+
+A buffer's base address reaches the module one of two ways, selected by
+``config.bundle_symbolic_args`` and each implemented by one cohesive strategy
+class (see ``_address_source``):
+
+* ``SymbolicAddresses`` -- one ``index`` func argument per buffer, rebound by
+  the runtime at every launch.  The portable form, and the only one that works
+  when addresses are not known at compile time.
+* ``BakedConstants`` -- an ``arith.constant`` per buffer, read out of that
+  buffer's own ``allocation["hbm"]``.  What the ``dbo`` backend requires today
+  (dataflow-scheduler#65).
+
+Everything the ``dbo`` backend requires lives on ``BakedConstants``, so retiring
+that workaround is a deletion plus one line in ``_address_source``, not an
+unpicking of branches spread through the emitter.  That includes the *compute*
+form -- see ``_emit_linalg_pointwise`` for why the two travel together.
 """
 
 from __future__ import annotations
@@ -39,94 +58,21 @@ from torch_spyre._inductor.codegen.opspec_utils import (
 )
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
 
-# Pointwise op name -> the ``linalg`` named-op builder that implements it.  Only
-# ``add`` is wired up so far; other ops raise before reaching here.
-#
-# These must be ``linalg`` *named ops*, not ``arith`` scalar-on-tensor ops:
-# the backend's ``construct-three-stage-pipeline`` only rewrites a ``ktdp.load``
-# into a ``ktdf.read_from_fifo`` when the load's consumer is a linalg op.  With
-# ``arith.addf`` on tensors the load survives that rewrite, and its
-# ``memref<..., offset: ?>`` operand then fails the verifier.
+# Pointwise op name -> the ``arith`` float builder that implements it, and ->
+# the equivalent ``linalg`` named-op builder.  Only ``add`` is wired up so far;
+# other ops raise before reaching here.  Which of the two an emission uses is the
+# address strategy's ``emit_compute`` (see ``_emit_linalg_pointwise``).
+_ARITH_FLOAT_OP = {"add": "AddFOp"}
 _LINALG_FLOAT_OP = {"add": "add"}
+
+# Derived, so the supported op set stays stated once per form and a form that
+# forgets an op narrows the scope rather than failing at emission time.
+_POINTWISE_OPS = _ARITH_FLOAT_OP.keys() & _LINALG_FLOAT_OP.keys()
 
 
 def _val(x):
     """The SSA ``Value`` of a builder result (builders return ``OpView`` or ``Value``)."""
     return x.result if hasattr(x, "result") else x
-
-
-def _base_address_elements(arg: TensorArg) -> int:
-    """``arg``'s buffer base address in ELEMENTS, for ``ktdp.construct_memory_view``.
-
-    The emitter bakes base addresses as ``arith.constant`` rather than taking
-    them as func arguments because the backend's address-assignment pass
-    requires compile-time-constant HBM addresses (dataflow-scheduler#65): a
-    symbolic base makes ``construct_memory_view`` produce
-    ``memref<..., offset: ?>``, which ``ktdp.load``'s verifier rejects.
-
-    The address is read from ``allocation["hbm"]`` -- the same field the SDSC
-    path resolves into the bundle's start address (``superdsc.py:774`` ->
-    ``startAddressCoreCorelet_`` at ``compute_ops.py:1306``).  It is NOT
-    recomputed as ``SEGMENT_OFFSETS[arg.arg_index]``: an HBM pool takes slot 0
-    and shifts every tensor arg up by one (``spyre_kernel.py:1235``), so
-    ``arg_index`` would address one slot low whenever a pool exists.
-
-    Three things this must get right, each of them silent if it does not:
-
-    * ``allocation`` is a tagged union (see ``TensorArg.allocation``), so an
-      ``lx`` / ``hbm_pool`` buffer is rejected outright -- every view this
-      emitter builds hardcodes ``memory_space = HBM``.
-    * ``config.bundle_symbolic_args`` decides the *units* of the field, so it is
-      rejected here; this is the flag's only semantic consumer in the emitter.
-      For a 3-buffer add the two paths give (measured)::
-
-          literal   {'hbm': 0}  {'hbm': 17179869184}  {'hbm': 34359738368}
-          symbolic  {'hbm': 0}  {'hbm': 1}            {'hbm': 2}
-
-      The literal values are byte offsets in the device virtual address space,
-      one segment slot per argument (``slot << 34``).  The symbolic ones are a
-      bare sentinel ``arg_index`` rebound at launch; baking those would emit
-      base addresses 0/0/1 and read garbage.
-    * a memref base offset indexes the *element* type, so a byte offset must be
-      scaled down by the element size.  Emitting the raw byte offset compiles
-      and runs, but addresses 2x too high for fp16, with no diagnostic anywhere.
-    """
-    # Units, hence correctness, depend on the flag -- see above.  config.py
-    # forces the flag (and the BUNDLE_SYMBOLIC_ARGS env var) off whenever the
-    # KTIR emitter is selected; this is the safety net for any other route in.
-    if _spyre_config.bundle_symbolic_args:
-        raise NotImplementedError(
-            "OpSpec->KTIR: requires the literal address path, but "
-            "bundle_symbolic_args is set, so allocation['hbm'] holds a "
-            "sentinel arg_index rather than an address. Set "
-            "BUNDLE_SYMBOLIC_ARGS=0 (prepare_kernel.cpp reads that env var "
-            "directly, so the env var itself must be 0, not just the config "
-            "flag)."
-        )
-
-    allocation = arg.allocation or {}
-    # Key presence, not truthiness: a legitimate 'hbm' address of 0 exists.
-    if "hbm" not in allocation:
-        space = next(iter(allocation), None)
-        raise NotImplementedError(
-            f"OpSpec->KTIR: buffer {arg.name!r} is not HBM-allocated "
-            f"(allocation={allocation!r}); the emitter only emits HBM memory "
-            f"views, so {space!r} allocations are out of scope"
-        )
-    byte_offset = allocation["hbm"]
-    if byte_offset is None:
-        raise NotImplementedError(
-            f"OpSpec->KTIR: buffer {arg.name!r} has an unassigned 'hbm' "
-            "address (None); memory planning must run before KTIR emission"
-        )
-
-    elem_bytes = num_bytes(arg.device_dtype)
-    if int(byte_offset) % elem_bytes:
-        raise NotImplementedError(
-            f"OpSpec->KTIR: HBM offset {int(byte_offset):#x} for buffer "
-            f"{arg.name!r} is not a multiple of the {elem_bytes}-byte element size"
-        )
-    return int(byte_offset) // elem_bytes
 
 
 def _mlir_elt_type(ir, device_dtype: DataFormats):
@@ -153,6 +99,184 @@ def _mlir_elt_type(ir, device_dtype: DataFormats):
     return builder.get()
 
 
+# ---------------------------------------------------------------------------
+# Compute forms
+# ---------------------------------------------------------------------------
+#
+# Both take the loaded input tensors and the output ``TensorArg`` and return the
+# result tensor.  Each imports only the dialects it needs, so requiring the
+# ``linalg``/``tensor`` bindings stays a property of the linalg form alone.
+
+
+def _emit_arith_pointwise(ir, spec: OpSpec, loaded, out: TensorArg):
+    """``arith`` float op applied to the whole tensor."""
+    from mlir_ktdp.dialects import arith
+
+    builder = getattr(arith, _ARITH_FLOAT_OP[spec.op])
+    return _val(builder(loaded[0], loaded[1]))
+
+
+def _emit_linalg_pointwise(ir, spec: OpSpec, loaded, out: TensorArg):
+    """``linalg`` named op over an uninitialised ``tensor.empty`` out.
+
+    The ``dbo`` backend needs this form rather than ``arith``:
+    ``construct-three-stage-pipeline`` only rewrites a ``ktdp.load`` into a
+    ``ktdf.read_from_fifo`` when the load's consumer is a linalg op.  With
+    ``arith.addf`` on tensors the load survives that rewrite and then fails
+    ``ktdp.load``'s verifier on its ``memref<..., offset: ?>`` operand
+    (measured -- and independently of whether the base address is a constant, so
+    this is a second backend requirement rather than a consequence of
+    dataflow-scheduler#65).
+
+    That is why the compute form is chosen by the address strategy: the two are
+    requirements of the same backend, arrived together and will be retired
+    together.  When #65 is fixed, ``BakedConstants`` goes away and
+    ``SymbolicAddresses.emit_compute`` becomes this function.
+    """
+    from mlir_ktdp.dialects import linalg, tensor
+
+    out_extents = [int(s) for s in out.device_size]
+    elt_t = _mlir_elt_type(ir, out.device_dtype)
+    tensor_t = ir.RankedTensorType.get(out_extents, elt_t)
+    empty = _val(tensor.EmptyOp(out_extents, elt_t))
+    builder = getattr(linalg, _LINALG_FLOAT_OP[spec.op])
+    return _val(builder(*loaded, outs=[empty], result_tensors=[tensor_t]))
+
+
+# ---------------------------------------------------------------------------
+# Address strategies
+# ---------------------------------------------------------------------------
+
+
+class SymbolicAddresses:
+    """Base addresses as ``index`` func arguments, bound by the runtime.
+
+    Buffers are walked in ascending ``arg_index`` order, which is the positional
+    order ``call_kernel`` passes to ``.run(...)``, so the emitted signature lines
+    up with that binding.
+
+    ``allocation["hbm"]`` is deliberately not consulted: on this path it holds a
+    bare sentinel ``arg_index`` rather than an address, and the address is not a
+    compile-time value at all.  Hence none of ``BakedConstants``' guards apply
+    here -- there is nothing to validate.
+    """
+
+    emit_compute = staticmethod(_emit_arith_pointwise)
+
+    def __init__(self, buffer_args: Sequence[TensorArg]):
+        self._buffer_args = list(buffer_args)
+
+    def func_param_types(self, ir) -> list:
+        return [ir.IndexType.get()] * len(self._buffer_args)
+
+    def bind_views(self, ir, ktdp, block_args) -> dict:
+        return {
+            _buf_id(arg): _emit_memory_view(ir, ktdp, arg, block_args[i])
+            for i, arg in enumerate(self._buffer_args)
+        }
+
+
+class BakedConstants:
+    """TENTATIVE: dataflow-scheduler#65.  Delete this class to revert.
+
+    A zero-arg func whose every memory view is rooted at an ``arith.constant``,
+    because the backend's address-assignment pass requires compile-time-constant
+    HBM addresses: a symbolic base makes ``construct_memory_view`` produce
+    ``memref<..., offset: ?>``, which ``ktdp.load``'s verifier rejects.
+    """
+
+    emit_compute = staticmethod(_emit_linalg_pointwise)
+
+    def __init__(self, buffer_args: Sequence[TensorArg]):
+        self._buffer_args = list(buffer_args)
+
+    def func_param_types(self, ir) -> list:
+        return []
+
+    def bind_views(self, ir, ktdp, block_args) -> dict:
+        from mlir_ktdp.dialects import arith
+
+        index_t = ir.IndexType.get()
+        views = {}
+        for arg in self._buffer_args:
+            base = arith.ConstantOp(index_t, _base_address_elements(arg))
+            views[_buf_id(arg)] = _emit_memory_view(ir, ktdp, arg, _val(base))
+        return views
+
+
+def _address_source(buffer_args: Sequence[TensorArg]):
+    """The address strategy for this emission.  The ONE seam for #65.
+
+    Path *selection*, not a correctness check: both paths are supported, and the
+    flag says which one the surrounding compilation is set up for.  It is the
+    same flag that decides the units of ``allocation["hbm"]``
+    (``spyre_kernel.py``), which is exactly the value ``BakedConstants`` needs,
+    so the two agree by construction:
+
+        literal   {'hbm': 0}  {'hbm': 17179869184}  {'hbm': 34359738368}
+        symbolic  {'hbm': 0}  {'hbm': 1}            {'hbm': 2}
+
+    The literal values are byte offsets in the device virtual address space, one
+    segment slot per argument (``slot << 34``); the symbolic ones are a bare
+    sentinel ``arg_index`` rebound at launch.
+
+    ``config.py`` forces the flag off whenever the KTIR emitter is selected,
+    because the device path runs the output through ``dbo-opt``, which only
+    accepts the baked form.
+    """
+    if _spyre_config.bundle_symbolic_args:
+        return SymbolicAddresses(buffer_args)
+    return BakedConstants(buffer_args)
+
+
+def _base_address_elements(arg: TensorArg) -> int:
+    """``arg``'s buffer base address in ELEMENTS, for ``ktdp.construct_memory_view``.
+
+    Only meaningful on the ``BakedConstants`` path; ``SymbolicAddresses`` never
+    calls it, and every guard below would be nonsense there (the field is a
+    sentinel, not an address).
+
+    The address is read from ``allocation["hbm"]`` -- the same field the SDSC
+    path resolves into the bundle's start address (``superdsc.py:774`` ->
+    ``startAddressCoreCorelet_`` at ``compute_ops.py:1306``).  It is NOT
+    recomputed as ``SEGMENT_OFFSETS[arg.arg_index]``: an HBM pool takes slot 0
+    and shifts every tensor arg up by one (``spyre_kernel.py:1235``), so
+    ``arg_index`` would address one slot low whenever a pool exists.
+
+    Two things this must get right, each of them silent if it does not:
+
+    * ``allocation`` is a tagged union (see ``TensorArg.allocation``), so an
+      ``lx`` / ``hbm_pool`` buffer is rejected outright -- every view this
+      emitter builds hardcodes ``memory_space = HBM``.
+    * a memref base offset indexes the *element* type, so a byte offset must be
+      scaled down by the element size.  Emitting the raw byte offset compiles
+      and runs, but addresses 2x too high for fp16, with no diagnostic anywhere.
+    """
+    allocation = arg.allocation or {}
+    # Key presence, not truthiness: a legitimate 'hbm' address of 0 exists.
+    if "hbm" not in allocation:
+        space = next(iter(allocation), None)
+        raise NotImplementedError(
+            f"OpSpec->KTIR: buffer {arg.name!r} is not HBM-allocated "
+            f"(allocation={allocation!r}); the emitter only emits HBM memory "
+            f"views, so {space!r} allocations are out of scope"
+        )
+    byte_offset = allocation["hbm"]
+    if byte_offset is None:
+        raise NotImplementedError(
+            f"OpSpec->KTIR: buffer {arg.name!r} has an unassigned 'hbm' "
+            "address (None); memory planning must run before KTIR emission"
+        )
+
+    elem_bytes = num_bytes(arg.device_dtype)
+    if int(byte_offset) % elem_bytes:
+        raise NotImplementedError(
+            f"OpSpec->KTIR: HBM offset {int(byte_offset):#x} for buffer "
+            f"{arg.name!r} is not a multiple of the {elem_bytes}-byte element size"
+        )
+    return int(byte_offset) // elem_bytes
+
+
 def generate_ktir(
     kernel_name: str,
     specs: Sequence[OpSpec | LoopSpec | UnimplementedOp],
@@ -160,11 +284,11 @@ def generate_ktir(
     """Build a KTDP-dialect MLIR module for ``specs`` and return ``str(module)``.
 
     ``specs`` is the finished OpSpec kernel contract (the same value
-    ``call_kernel`` passes positionally to ``.run(...)``).  The emitted
-    ``func.func`` takes no arguments: every buffer base address is materialised
-    as a constant from its own allocation (see ``_base_address_elements``).
-    Buffers are still walked in ascending ``arg_index`` order, so the emitted
-    memory views appear in the same order the runtime binds arguments.
+    ``call_kernel`` passes positionally to ``.run(...)``).  How each buffer's
+    base address enters the module -- as a func parameter or as a baked constant
+    -- is the address strategy's business (see ``_address_source``); either way
+    buffers are walked in ascending ``arg_index`` order, so the emitted memory
+    views appear in the order the runtime binds arguments.
     """
     # Pure capability checks first, before the mlir_ktdp import: they need no
     # dialect build, so an unsupported request fails fast (and is testable)
@@ -183,13 +307,11 @@ def generate_ktir(
     # ``mlir_ktdp`` is imported lazily so the module stays importable (and the
     # golden test can skip) where the dialect-packaged mlir_ktdp is not built.
     from mlir_ktdp import ir
-    from mlir_ktdp.dialects import arith, func, ktdp, linalg, tensor
+    from mlir_ktdp.dialects import arith, func, ktdp
 
-    # Ordered unique operand buffers.  Ascending arg_index matches the
-    # positional order call_kernel passes to .run(...), which keeps the emitted
-    # memory views in argument order.  Only real external buffers
-    # (arg_index >= 0) get a view; register-threaded fused intermediates carry
-    # the -1 sentinel and are rejected below as unsupported.
+    # Ordered unique operand buffers.  Only real external buffers
+    # (arg_index >= 0) get a memory view; register-threaded fused intermediates
+    # carry the -1 sentinel and are rejected below as unsupported.
     ordered_args: dict[object, TensorArg] = {}
     for spec in op_specs:
         for arg in spec.args:
@@ -198,6 +320,7 @@ def generate_ktir(
         (a for a in ordered_args.values() if a.arg_index >= 0),
         key=lambda a: a.arg_index,
     )
+    addrs = _address_source(buffer_args)
 
     with ir.Context() as ctx, ir.Location.unknown():
         ktdp.register_dialects(ctx)
@@ -205,31 +328,24 @@ def generate_ktir(
 
         module = ir.Module.create()
         with ir.InsertionPoint(module.body):
-            # Zero-arg func: base addresses are baked constants, not parameters,
-            # because the backend requires constant HBM addresses
-            # (dataflow-scheduler#65).  See _base_address_elements.
-            fn_type = ir.FunctionType.get([], [])
+            fn_type = ir.FunctionType.get(addrs.func_param_types(ir), [])
             fn = func.FuncOp(kernel_name, fn_type)
             # Single-core (SENCORES=1) grid; work-division scaling is future work.
             i64 = ir.IntegerType.get_signless(64)
             fn.attributes["grid"] = ir.ArrayAttr.get([ir.IntegerAttr.get(i64, 1)])
             block = fn.add_entry_block()
+            block_args = list(block.arguments)
 
             with ir.InsertionPoint(block):
                 c0 = arith.ConstantOp(index_t, 0)
 
-                # One memory view per unique buffer, in argument order, each
-                # rooted at a constant base address resolved from that buffer's
-                # own allocation.
-                memory_views: dict[object, ir.Value] = {}
-                for arg in buffer_args:
-                    base = arith.ConstantOp(index_t, _base_address_elements(arg))
-                    memory_views[_buf_id(arg)] = _emit_memory_view(
-                        ir, ktdp, arg, _val(base)
-                    )
+                # One memory view per unique buffer, in argument order.
+                memory_views: dict[object, ir.Value] = addrs.bind_views(
+                    ir, ktdp, block_args
+                )
 
                 for spec in op_specs:
-                    _emit_pointwise_op(ir, ktdp, linalg, tensor, spec, memory_views, c0)
+                    _emit_pointwise_op(ir, ktdp, addrs, spec, memory_views, c0)
 
                 func.ReturnOp([])
 
@@ -258,7 +374,7 @@ def _collect_pointwise_op_specs(
             )
         if entry.is_reduction:
             raise NotImplementedError("OpSpec->KTIR: reductions are not supported yet")
-        if entry.op not in _LINALG_FLOAT_OP:
+        if entry.op not in _POINTWISE_OPS:
             raise NotImplementedError(
                 f"OpSpec->KTIR: op {entry.op!r} is not supported yet "
                 "(only pointwise 'add')"
@@ -292,7 +408,7 @@ def _emit_memory_view(ir, ktdp, arg: TensorArg, offset):
     )
 
 
-def _emit_pointwise_op(ir, ktdp, linalg, tensor, spec: OpSpec, memory_views, c0):
+def _emit_pointwise_op(ir, ktdp, addrs, spec: OpSpec, memory_views, c0):
     """Emit the load / compute / store sequence for one pointwise ``OpSpec``."""
     inputs = [a for a in spec.args if a.is_input]
     outputs = [a for a in spec.args if not a.is_input]
@@ -326,7 +442,7 @@ def _emit_pointwise_op(ir, ktdp, linalg, tensor, spec: OpSpec, memory_views, c0)
                 "OpSpec->KTIR: broadcast / reshape operands not supported yet"
             )
 
-    # Every operand buffer must be a func parameter (register-threaded fused
+    # Every operand buffer must have a memory view (register-threaded fused
     # intermediates are not supported yet).
     for arg in spec.args:
         if _buf_id(arg) not in memory_views:
@@ -339,14 +455,7 @@ def _emit_pointwise_op(ir, ktdp, linalg, tensor, spec: OpSpec, memory_views, c0)
         _emit_load(ir, ktdp, arg, memory_views[_buf_id(arg)], c0) for arg in inputs
     ]
 
-    # linalg named op over an (uninitialised) tensor.empty out; a scalar arith
-    # op on tensors would leave the ktdp.load unlowered downstream (see
-    # _LINALG_FLOAT_OP).
-    elt_t = _mlir_elt_type(ir, out.device_dtype)
-    tensor_t = ir.RankedTensorType.get(out_extents, elt_t)
-    empty = _val(tensor.EmptyOp(out_extents, elt_t))
-    builder = getattr(linalg, _LINALG_FLOAT_OP[spec.op])
-    result = _val(builder(*loaded, outs=[empty], result_tensors=[tensor_t]))
+    result = addrs.emit_compute(ir, spec, loaded, out)
 
     _emit_store(ir, ktdp, out, memory_views[_buf_id(out)], result, c0)
 

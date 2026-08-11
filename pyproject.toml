@@ -46,10 +46,24 @@ ktir = [ # OpSpec->KTIR emitter (ktir_emitter=1 / TORCH_SPYRE_KTIR=1)
     # emitter targets. Not on any index, so it is a direct git reference at an
     # exact commit rather than a floating version range.
     #
-    # NOTE: this is a scikit-build-core/CMake project that needs a matching
-    # LLVM/MLIR build available to configure against, so installing this extra is
-    # not self-contained the way a wheel dependency is; environments that cannot
-    # build it should simply not request the extra.
+    # NOTE: `pip install .[ktir]` alone does NOT work, and cannot be made to.
+    # Checked against ktir-mlir-frontend@main (05e7a0f): it is a
+    # scikit-build-core project whose CMakeLists.txt does
+    # `find_package(MLIR REQUIRED CONFIG)` against an externally supplied
+    # MLIR_DIR -- there is no FetchContent/ExternalProject, no `mlir` /
+    # `mlir-python-bindings` in either [build-system] requires or [project]
+    # dependencies, no cibuildwheel, and no published wheel or sdist (its one
+    # release, tag llvm-e9846648, ships prebuilt LLVM tarballs as a build-input
+    # cache, not the package). So it needs, out of band:
+    #
+    #   1. an LLVM/MLIR build at the pin in its cmake/llvm-hash.txt
+    #      (e9846648...); its scripts/setup_mlir.py fetches or builds one, but
+    #      nothing in its packaging invokes that script;
+    #   2. CMAKE_ARGS="-DMLIR_DIR=<prefix>/lib/cmake/mlir" on the install.
+    #
+    # Kept as an extra anyway: it documents and pins what mlir_ktdp must be, and
+    # `pip install .` (no extra) is unaffected -- ktir.py stays importable and
+    # its goldens skip. Environments without an MLIR build should not request it.
     "ktir-mlir-frontend @ git+https://github.com/torch-spyre/ktir-mlir-frontend.git@05e7a0ff814ebefb6e78450b1ec0e871c488c8bc",
 ]
 build = [ # no-isolation build

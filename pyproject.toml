@@ -39,31 +39,10 @@ cpsat = [ # OR-Tools CP-SAT LX layout solver (layout_solver='cpsat' / LAYOUT_SOL
 ktir = [ # OpSpec->KTIR emitter (ktir_emitter=1 / TORCH_SPYRE_KTIR=1)
     # Supplies the mlir_ktdp Python bindings codegen/ktir.py imports lazily. An
     # extra, not a runtime dependency: ktir.py stays importable (and its golden
-    # tests skip) without the dialect build.
-    #
-    # Pinned to the merge of ktir-mlir-frontend#46 ("Source structure
-    # refactoring", issue #37), the first commit whose package layout this
-    # emitter targets. Not on any index, so it is a direct git reference at an
-    # exact commit rather than a floating version range.
-    #
-    # NOTE: `pip install .[ktir]` alone does NOT work, and cannot be made to.
-    # Checked against ktir-mlir-frontend@main (05e7a0f): it is a
-    # scikit-build-core project whose CMakeLists.txt does
-    # `find_package(MLIR REQUIRED CONFIG)` against an externally supplied
-    # MLIR_DIR -- there is no FetchContent/ExternalProject, no `mlir` /
-    # `mlir-python-bindings` in either [build-system] requires or [project]
-    # dependencies, no cibuildwheel, and no published wheel or sdist (its one
-    # release, tag llvm-e9846648, ships prebuilt LLVM tarballs as a build-input
-    # cache, not the package). So it needs, out of band:
-    #
-    #   1. an LLVM/MLIR build at the pin in its cmake/llvm-hash.txt
-    #      (e9846648...); its scripts/setup_mlir.py fetches or builds one, but
-    #      nothing in its packaging invokes that script;
-    #   2. CMAKE_ARGS="-DMLIR_DIR=<prefix>/lib/cmake/mlir" on the install.
-    #
-    # Kept as an extra anyway: it documents and pins what mlir_ktdp must be, and
-    # `pip install .` (no extra) is unaffected -- ktir.py stays importable and
-    # its goldens skip. Environments without an MLIR build should not request it.
+    # tests skip) without the dialect build. Pinned to ktir-mlir-frontend#46, the
+    # first commit whose package layout this emitter targets. Not on any index,
+    # and `pip install .[ktir]` alone cannot work: it is a scikit-build-core
+    # project needing an out-of-band MLIR build and CMAKE_ARGS=-DMLIR_DIR=...
     "ktir-mlir-frontend @ git+https://github.com/torch-spyre/ktir-mlir-frontend.git@05e7a0ff814ebefb6e78450b1ec0e871c488c8bc",
 ]
 build = [ # no-isolation build

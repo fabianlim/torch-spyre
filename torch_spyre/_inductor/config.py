@@ -33,17 +33,14 @@ global_stick_optimizer: bool = os.environ.get("GLOBAL_STICK_OPTIMIZER", "1") == 
 # stable per-buffer identity. Inert by default: the SDSC/flex path is unchanged.
 ktir_emitter: bool = os.environ.get("TORCH_SPYRE_KTIR", "0") == "1"
 
-# Device description passed to the KTIR backend compiler as ``--device=<file>``.
-# It has no default of its own and rejects a module that carries no
-# ``ktdf_arch.device`` op, which the emitter does not produce, so this must name
-# a .mlir declaring the target device. Only read on the KTIR/dbo path.
+# A .mlir declaring the target device, passed to the KTIR backend compiler as
+# ``--device=<file>``. No default: the compiler rejects a module with no
+# ``ktdf_arch.device`` op, which the emitter does not produce.
 ktir_device_mlir: str = os.environ.get("KTIR_DEVICE_MLIR", "")
 
-# Colon-separated library directories prepended to LD_LIBRARY_PATH *for the
-# backend-compiler subprocess only*. The backend binary ships without an RPATH,
-# so it cannot resolve its own deeptools libraries unaided. This must never be
-# applied to this process: the runtime needs the installed libraries resolved
-# first, and shadowing them makes a byte-correct program return garbage.
+# Colon-separated library dirs prepended to LD_LIBRARY_PATH for the backend
+# compiler subprocess only (it ships without an RPATH). Never apply to this
+# process: shadowing the runtime's own libraries silently corrupts results.
 dbo_lib_paths: str = os.environ.get("DBO_LIB_PATHS", "")
 
 allow_all_ops_in_lx_planning: bool = False
@@ -116,43 +113,6 @@ core_id_k_fast_emission: bool = (
 # When False, HBM tensor addresses are baked as concrete integers
 # into the SDSC JSON and bundle.mlir emits sdsc_execute with no operands.
 bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "1") == "1"
-
-# PATH SELECTION for the KTIR emitter, not a correctness guard.
-#
-# The emitter supports both address forms (``codegen/ktir.py``:
-# ``SymbolicAddresses`` / ``BakedConstants``) and reads this flag to choose
-# between them. The device path is not free to choose: ``dbo-opt``'s
-# address-assignment pass requires compile-time-constant HBM addresses
-# (dataflow-scheduler#65) and rejects the symbolic module, so leaving the flag at
-# its default (True) would emit IR the backend refuses. Hence the force.
-#
-# Why the env var as well as the flag:
-#
-#   * The flag decides the *units* of ``allocation["hbm"]``, which is the value
-#     ``BakedConstants`` bakes: with symbolic args that field holds a sentinel
-#     ``arg_index`` (0, 1, 2) rather than an address. Selecting the baked form
-#     and leaving the units symbolic would bake nonsense.
-#   * The C++ side does not consult this module. ``prepare_kernel.cpp`` reads the
-#     raw environment variable, with an inverted sense:
-#     ``bind_io_addresses_ = (env == nullptr || std::string(env) != "1")`` --
-#     only the literal string "1" disables address binding, and *unset* is not
-#     equivalent to "0". So the env var must be exported explicitly; flipping
-#     only the Python flag leaves the runtime binding addresses over the ones
-#     baked into the module.
-#
-# SIDE EFFECT, deliberate: this mutates the environment of the whole process, so
-# it also affects anything else in it that reads BUNDLE_SYMBOLIC_ARGS. That is
-# acceptable only because TORCH_SPYRE_KTIR=1 is an experimental, explicit opt-in
-# that replaces the SDSC emission path outright; nothing sets it incidentally.
-#
-# When #65 is fixed, this force and ``BakedConstants`` are deleted together.
-#
-# An assignment, not ``setdefault``: ``torch_spyre/__init__.py`` seeds the var to
-# "1" for the SDSC default, and that must lose to an explicit KTIR opt-in
-# regardless of which of the two runs first.
-if ktir_emitter:
-    bundle_symbolic_args = False
-    os.environ["BUNDLE_SYMBOLIC_ARGS"] = "0"
 
 # Layout solver class used by default in scratchpad.allocator.ScratchpadAllocator.
 # Options:

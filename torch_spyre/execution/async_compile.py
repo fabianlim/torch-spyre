@@ -141,9 +141,8 @@ class SpyreAsyncCompile(AsyncCompile):
         """
         if not _spyre_config.ktir_device_mlir:
             raise RuntimeError(
-                "OpSpec->KTIR: dbo-opt needs a device description and has no "
-                "default; set KTIR_DEVICE_MLIR (config.ktir_device_mlir) to a "
-                ".mlir declaring the target device. The emitted KTIR carries no "
+                "OpSpec->KTIR: set KTIR_DEVICE_MLIR (config.ktir_device_mlir) to "
+                "a .mlir declaring the target device; the emitted KTIR carries no "
                 "ktdf_arch.device op, so dbo-opt rejects the module without it."
             )
 
@@ -157,10 +156,8 @@ class SpyreAsyncCompile(AsyncCompile):
         ]
 
         # dbo-opt ships without an RPATH, so its deeptools libraries have to be
-        # named explicitly -- but only in the CHILD environment. Putting them on
-        # this process's LD_LIBRARY_PATH would shadow the runtime's own libraries
-        # and silently corrupt results, so the parent env is copied, never
-        # mutated.
+        # named explicitly -- but only in the CHILD environment: shadowing the
+        # runtime's own libraries here would silently corrupt results.
         env = dict(os.environ)
         if _spyre_config.dbo_lib_paths:
             existing = env.get("LD_LIBRARY_PATH")

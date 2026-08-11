@@ -214,8 +214,8 @@ class BaseLayoutSolverTests:
         return LifetimeBoundBuffer(name, size, uses, **kwargs)
 
     def solve(self, buffers, size=LARGE_SIZE, alignment=1):
-        self.last_solver = self.solver_class(size, alignment)
-        result = self.last_solver.plan_layout(buffers)
+        self.last_solver = self.solver_class(buffers, size, alignment)
+        result = self.last_solver.plan_layout()
         # Checked here, not in check_result: several tests call solve() directly
         # and assert addresses themselves, and legality holds for those too.
         _assert_legal_layout(self, result, size, alignment)
@@ -699,7 +699,7 @@ def b(n, s, st, en, ipp=None):
 # c has two in-place parents at distinct addresses, both in-place candidates for
 # its gap -> _build_gaps' iteration order decides in_place_parents[0].
 bufs = [b("pA", 100, 0, 3), b("pB", 80, 1, 3), b("c", 50, 2, 5, ["pA", "pB"])]
-{solver_class}(10_000, 1).plan_layout(bufs)
+{solver_class}(bufs, 10_000, 1).plan_layout()
 print("RESULT " + json.dumps({{x.name: x.address for x in bufs}}))
 """
 
@@ -836,7 +836,7 @@ class TestFirstFitLayoutSolver(ScoreOrderingTests, BaseLayoutSolverTests, TestCa
     solver_class = FirstFitLayoutSolver
 
     def test_picks_first_gap_not_tightest(self):
-        result = self.solver_class(120, 1).plan_layout(_two_gap_buffers())
+        result = self.solver_class(_two_gap_buffers(), 120, 1).plan_layout()
         x_addr = next(b.address for b in result if b.name == "x")
         self.assertEqual(x_addr, 0)
 
@@ -845,7 +845,7 @@ class TestBestFitLayoutSolver(ScoreOrderingTests, BaseLayoutSolverTests, TestCas
     solver_class = BestFitLayoutSolver
 
     def test_picks_tightest_gap(self):
-        result = self.solver_class(120, 1).plan_layout(_two_gap_buffers())
+        result = self.solver_class(_two_gap_buffers(), 120, 1).plan_layout()
         x_addr = next(b.address for b in result if b.name == "x")
         self.assertEqual(x_addr, 100)
 
@@ -940,8 +940,8 @@ class JointDivisionSolverTests(BaseLayoutSolverTests):
             parents=names,
             cd_parent_matches={n: [(0, 0)] for n in names},
         )
-        self.last_solver = self.solver_class(size, alignment)
-        result = self.last_solver.plan_layout_and_core_divisions(buffers + [sink])
+        self.last_solver = self.solver_class(buffers + [sink], size, alignment)
+        result = self.last_solver.plan_layout_and_core_divisions()
         result = [b for b in result if b.name != "__sink__"]
         _assert_legal_layout(self, result, size, alignment)
         return result
@@ -1003,8 +1003,8 @@ class JointDivisionSolverTests(BaseLayoutSolverTests):
         buffers_by_name["P"].cd_parent_matches.update({"G": [(0, 0)], "N": [(0, 0)]})
 
         results = self.solver_class(
-            size=120, alignment=1
-        ).plan_layout_and_core_divisions(buffers)
+            buffers, size=120, alignment=1
+        ).plan_layout_and_core_divisions()
         results_by_name = {b.name: b for b in results}
         # Every buffer is placed except the consumer-less chain tail TERMINAL.
         self.assertTrue(all(b.address is not None for b in results[:-1]))
@@ -1022,9 +1022,9 @@ class JointDivisionSolverTests(BaseLayoutSolverTests):
             CoreDivisionBuffer("y", 60, [1, 2]),
         ]
         with self.assertRaises(AssertionError):
-            self.solver_class(size=120, alignment=1).plan_layout_and_core_divisions(
-                plain
-            )
+            self.solver_class(
+                plain, size=120, alignment=1
+            ).plan_layout_and_core_divisions()
 
     def test_picks_matching_division_to_fit(self):
         # Producer P (total 400) feeds consumer C (total 400); both overlap in
@@ -1052,8 +1052,8 @@ class JointDivisionSolverTests(BaseLayoutSolverTests):
         result = {
             b.name: b
             for b in self.solver_class(
-                size=256, alignment=1
-            ).plan_layout_and_core_divisions([P, C, D])
+                [P, C, D], size=256, alignment=1
+            ).plan_layout_and_core_divisions()
         }
 
         self.assertIsNotNone(result["P"].address)
@@ -1077,8 +1077,8 @@ class JointDivisionSolverTests(BaseLayoutSolverTests):
             core_divisions=_divs(),
             residency_reason="no consumer reads it from LX",
         )
-        solver = self.solver_class(size=256, alignment=1)
-        result = solver.plan_layout_and_core_divisions([leaf])
+        solver = self.solver_class([leaf], size=256, alignment=1)
+        result = solver.plan_layout_and_core_divisions()
         self.assertIsNone(result[0].address)
         self.assertEqual(solver.spill_reasons["leaf"], "no consumer reads it from LX")
 
@@ -1096,8 +1096,8 @@ class JointDivisionSolverTests(BaseLayoutSolverTests):
         result = {
             b.name: b
             for b in self.solver_class(
-                size=200, alignment=1
-            ).plan_layout_and_core_divisions([P, C])
+                [P, C], size=200, alignment=1
+            ).plan_layout_and_core_divisions()
         }
         self.assertIsNone(result["P"].address)
 
@@ -1138,8 +1138,8 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
         res = {
             b.name: b
             for b in self.solver_class(
-                size=150, alignment=1
-            ).plan_layout_and_core_divisions(chain)
+                chain, size=150, alignment=1
+            ).plan_layout_and_core_divisions()
         }
         # The whole chain resides, sharing one address (the sink spills: no
         # consumer of its own).
@@ -1188,8 +1188,8 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
         res = {
             b.name: b
             for b in self.solver_class(
-                size=150, alignment=1
-            ).plan_layout_and_core_divisions([gp, c, sink])
+                [gp, c, sink], size=150, alignment=1
+            ).plan_layout_and_core_divisions()
         }
         self.assertIsNotNone(res["gp"].address, "single-use parent should reside")
         self.assertIsNotNone(res["c"].address, "child should reside")
@@ -1220,10 +1220,8 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
             parents=["big"],
             residency_reason="no consumer reads it from LX",
         )
-        solver = self.solver_class(size=200, alignment=1)
-        result = {
-            b.name: b for b in solver.plan_layout_and_core_divisions([leaf, big, C])
-        }
+        solver = self.solver_class([leaf, big, C], size=200, alignment=1)
+        result = {b.name: b for b in solver.plan_layout_and_core_divisions()}
 
         # All three spill; each carries a reason keyed by buffer name.
         self.assertIsNone(result["big"].address)
@@ -1260,8 +1258,8 @@ class TestCpSatPlacementOnly(BaseLayoutSolverTests, TestCase):
             # Below one alignment unit the unit-scaled capacity rounds to zero
             # and the solver cannot represent any placement.
             return buffers
-        self.last_solver = self.solver_class(size, alignment)
-        result = self.last_solver.plan_layout(buffers)
+        self.last_solver = self.solver_class(buffers, size, alignment)
+        result = self.last_solver.plan_layout()
         _assert_legal_layout(self, result, size, alignment)
         return result
 
@@ -1273,8 +1271,8 @@ class TestCpSatPlacementOnly(BaseLayoutSolverTests, TestCase):
         # gate needs a consumer to match against). Placement-only has no such
         # gate, so the same buffer resides. This is the behavioural difference
         # between the two entry points.
-        solver = self.solver_class(256, 1)
-        (buf,) = solver.plan_layout([LifetimeBoundBuffer("solo", 40, [0, 1])])
+        solver = self.solver_class([LifetimeBoundBuffer("solo", 40, [0, 1])], 256, 1)
+        (buf,) = solver.plan_layout()
         self.assertIsNotNone(buf.address)
         self.assertNotIn("solo", solver.spill_reasons)
 
@@ -1283,8 +1281,8 @@ class TestCpSatPlacementOnly(BaseLayoutSolverTests, TestCase):
         # capacity cause; the one that fits resides with no reason.
         small = LifetimeBoundBuffer("small", 40, [0, 1])
         huge = LifetimeBoundBuffer("huge", 4000, [0, 1])
-        solver = self.solver_class(256, 1)
-        result = {b.name: b for b in solver.plan_layout([small, huge])}
+        solver = self.solver_class([small, huge], 256, 1)
+        result = {b.name: b for b in solver.plan_layout()}
         self.assertIsNone(result["huge"].address)
         self.assertIn("capacity", solver.spill_reasons["huge"])
         self.assertIsNotNone(result["small"].address)
@@ -1302,8 +1300,8 @@ class TestCpSatPlacementOnly(BaseLayoutSolverTests, TestCase):
             residency_reason="read by restickify (cross-frame barrier)",
         )
         free = LifetimeBoundBuffer("free", 40, [0, 1])
-        solver = self.solver_class(256, 1)
-        result = {b.name: b for b in solver.plan_layout([barred, free])}
+        solver = self.solver_class([barred, free], 256, 1)
+        result = {b.name: b for b in solver.plan_layout()}
         self.assertIsNone(result["barred"].address)
         self.assertEqual(
             solver.spill_reasons["barred"], "read by restickify (cross-frame barrier)"
@@ -1366,7 +1364,7 @@ class TestCpSatUnallocatedReads(TestCase):
         )
 
     def _pinned(self, bufs):
-        out = CpSatLayoutSolver(1 << 20).plan_layout_and_core_divisions(bufs)
+        out = CpSatLayoutSolver(bufs, 1 << 20).plan_layout_and_core_divisions()
         return {b.name for b in out if b.address is not None}
 
     def test_only_non_candidate_reads_is_pinned(self):

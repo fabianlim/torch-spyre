@@ -351,7 +351,15 @@ def spyre_gelu(
 def spyre_softplus(
     input: torch.Tensor, beta: float = 1.0, threshold: float = 20.0
 ) -> torch.Tensor:
-    return torch.ops.spyre.softplus(input, beta, threshold)
+    if beta == 1.0:
+        return torch.ops.spyre.softplus(input, beta, threshold)
+    # The runtime primitive drops the outer 1/beta factor, so beta == 1 is its
+    # only exact path. Scale into it and back out; the threshold branch stays
+    # exact because 1 * (beta * x) > threshold is PyTorch's beta * x > threshold.
+    # aten accepts beta == 0 and saturates every element to +-inf, so take the
+    # reciprocal under IEEE rules rather than letting Python raise here.
+    inv_beta = math.copysign(math.inf, beta) if beta == 0.0 else 1.0 / beta
+    return torch.ops.spyre.softplus(input * beta, 1.0, threshold) * inv_beta
 
 
 @register_spyre_decompositions([torch.ops.aten.linear.default])
@@ -699,6 +707,7 @@ def conv2d_via_bmm_decomp(
     Decompose 2D convolution into batch matrix multiplication using torch.nn.unfold.
     torch.nn.unfold directly returns (N, C_in * K_h * K_w, H_out * W_out), avoiding
     intermediate reshape/view/unsqueeze operations.
+    For depthwise convolutions (C_in = groups = C_out), invoke torch.spyre.conv2d directly.
     """
     if transposed:
         raise Unsupported("conv2d_via_bmm: transposed convolution not supported")
@@ -711,6 +720,12 @@ def conv2d_via_bmm_decomp(
 
     N, C_in, H_in, W_in = input.shape
     C_out, C_in_per_group, K_h, K_w = weight.shape
+
+    # For depthwise convolutions (C_in = groups = C_out), use torch.spyre.conv2d_with_bias
+    if C_in == groups == C_out:
+        return torch.ops.spyre.conv2d_with_bias(
+            input, weight, bias, stride, padding, dilation, groups
+        )
 
     stride_h, stride_w = stride[0], stride[1]
     pad_h, pad_w = padding[0], padding[1]
@@ -765,6 +780,39 @@ def conv2d_via_bmm_decomp(
         # The resulting tensor has a layout compatible with broadcasting to (N, C_out, H_out, W_out).
         bias_shaped = torch.ops.spyre.reshape_via_cpu(bias, (1, C_out, 1, 1))
         output = output + bias_shaped
+
+    return output
+
+
+@register_spyre_decompositions([torch.ops.spyre.conv2d_with_bias.default])
+def spyre_conv2d_with_bias_decomp(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+    groups: int,
+) -> torch.Tensor:
+    """
+    Decompose torch.ops.spyre.conv2d_with_bias into:
+      1. torch.ops.spyre.conv2d without bias
+      2. Expand bias to (N, C_out, H_out, W_out) for broadcasting
+      3. Add the bias to the output
+
+    This keeps the spyre.conv2d lowering simple while supporting conv2d with bias.
+    """
+    # Call spyre.conv2d without bias
+    output = torch.ops.spyre.conv2d(input, weight, stride, padding, dilation, groups)
+
+    # If bias is present, add it
+    if bias is not None:
+        # Get output shape
+        N, C_out, H_out, W_out = output.shape
+        # Reshape bias to (1, C_out, 1, 1) then expand to (N, C_out, H_out, W_out)
+        # This avoids stick layout issues by expanding before adding
+        bias_expanded = bias.reshape(1, C_out, 1, 1).expand(N, C_out, H_out, W_out)
+        output = output + bias_expanded
 
     return output
 

@@ -271,10 +271,21 @@ class MemoryPlanSolver(ABC):
     solvers that can also choose the division.
     """
 
-    def __init__(self, size: int, alignment: int = 128):
-        """Initialize the solver with a fixed scratchpad capacity and alignment.
+    def __init__(
+        self, buffers: Sequence["LifetimeBoundBuffer"], size: int, alignment: int = 128
+    ):
+        """Initialize the solver with its buffers, a fixed scratchpad capacity,
+        and alignment.
+
+        ``buffers`` is a :class:`Sequence` (not ``list``) because ``Sequence`` is
+        covariant in its element type: that lets a caller hand over a
+        ``list[CoreDivisionBuffer]`` -- a subtype of ``LifetimeBoundBuffer`` -- and
+        still type-check.
 
         Args:
+            buffers (Sequence[LifetimeBoundBuffer]): The set of candidate buffers
+                for memory planning. A solver instance is single-use: construct a
+                fresh one for each buffer set to plan.
             size (int): Total scratchpad size in bytes. Buffers whose aligned
                 placement would exceed this limit are evicted (address=None).
             alignment (int): Byte alignment boundary. Every buffer is placed at
@@ -282,6 +293,7 @@ class MemoryPlanSolver(ABC):
                 128 (one Spyre stick), which is also what every concrete solver
                 defaults to.
         """
+        self.buffers: list["LifetimeBoundBuffer"] = list(buffers)
         self.limit = size
         self.alignment = alignment
         self.spill_reasons: dict[str, str] = {}
@@ -296,11 +308,9 @@ class MemoryPlanSolver(ABC):
             )
         return None
 
-    def record_exclusions(
-        self, buffers: Sequence["LifetimeBoundBuffer"]
-    ) -> dict[str, str]:
+    def record_exclusions(self) -> dict[str, str]:
         """Compute, store, and return the ``name -> reason`` map of every buffer
-        barred from LX residency.
+        in :attr:`buffers` barred from LX residency.
 
         This is the piece a solver that keeps barred buffers in its model (e.g.
         CP-SAT, which pins them non-resident rather than dropping them) needs on
@@ -309,39 +319,30 @@ class MemoryPlanSolver(ABC):
         """
         self.spill_reasons = {
             buffer.name: reason
-            for buffer in buffers
+            for buffer in self.buffers
             if (reason := self.excluded(buffer)) is not None
         }
         return self.spill_reasons
 
     def partition(
-        self, buffers: Sequence["LifetimeBoundBuffer"]
+        self,
     ) -> tuple[list["LifetimeBoundBuffer"], list["LifetimeBoundBuffer"]]:
-        """Split ``buffers`` into ``(placeable, excluded)``, recording every
+        """Split :attr:`buffers` into ``(placeable, excluded)``, recording every
         exclusion in :attr:`spill_reasons` via :meth:`record_exclusions`.
         """
-        excluded_reasons = self.record_exclusions(buffers)
-        placeable = [b for b in buffers if b.name not in excluded_reasons]
-        excluded = [b for b in buffers if b.name in excluded_reasons]
+        excluded_reasons = self.record_exclusions()
+        placeable = [b for b in self.buffers if b.name not in excluded_reasons]
+        excluded = [b for b in self.buffers if b.name in excluded_reasons]
         return placeable, excluded
 
     @abstractmethod
-    def plan_layout(
-        self, buffers: Sequence[LifetimeBoundBuffer], log_lx_usage: bool = False
-    ) -> list[LifetimeBoundBuffer]:
+    def plan_layout(self, log_lx_usage: bool = False) -> list[LifetimeBoundBuffer]:
         """
         Utilizes an implementation defined algorithm to determine
-        if and where buffers should be placed in scratchpad memory based
+        if and where :attr:`buffers` should be placed in scratchpad memory based
         on their attributes.
 
-        ``buffers`` is a :class:`Sequence` (not ``list``) because ``Sequence`` is
-        covariant in its element type: that lets a caller hand over a
-        ``list[CoreDivisionBuffer]`` -- a subtype of ``LifetimeBoundBuffer`` -- and
-        still type-check.
-
         Args:
-            buffers (Sequence[LifetimeBoundBuffer]): The set of candidate buffers
-                for memory planning
             log_lx_usage (bool): If True, emit per-timestep scratchpad usage at DEBUG level.
 
         Returns:
@@ -363,18 +364,13 @@ class CoreDivisionLayoutSolver(MemoryPlanSolver):
     """
 
     @abstractmethod
-    def plan_layout_and_core_divisions(
-        self, buffers: Sequence[CoreDivisionBuffer]
-    ) -> list[CoreDivisionBuffer]:
+    def plan_layout_and_core_divisions(self) -> list[CoreDivisionBuffer]:
         """Choose each buffer's core division and its LX placement together.
 
         On top of the :meth:`plan_layout` contract, implementations write the
         index of the chosen division back to ``chosen_division`` for the
-        allocator to commit.
-
-        Args:
-            buffers: Candidate buffers, each carrying its enumerated candidate
-                core divisions.
+        allocator to commit. Operates on :attr:`buffers`, each of which must
+        carry its enumerated candidate core divisions.
 
         Returns:
             The same buffers, with placements and chosen divisions defined.

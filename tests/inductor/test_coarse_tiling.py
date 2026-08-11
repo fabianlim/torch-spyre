@@ -76,6 +76,7 @@ from torch_spyre._inductor.wsr.coarse_tile import (
     _REDUCTION_FREE_SYMS_KEY,
     _RetiledBufferInfo,
     _apply_plan,
+    _compute_fill_loop_info_planned,
     _divide_ranges,
     _full_buffer_read_deps,
     _insert_read_copy_ops,
@@ -104,6 +105,11 @@ from torch_spyre._inductor.spyre_kernel import (
 from torch_spyre._inductor.temp_passes import (
     _mark_static_unit_batch_bmm,
     mark_direct_unit_bmm_pass,
+)
+from torch_spyre._inductor.wsr.tile import (
+    compute_tile_offset,
+    compute_tile_index,
+    compute_tile_stride,
 )
 
 _FP16 = DataFormats.SEN169_FP16
@@ -564,6 +570,7 @@ def _make_sdsc_spec(
         },
         args=[tensor],
         constants={},
+        conv_params={},
         coordinate_masking={},
     )
 
@@ -712,6 +719,55 @@ class TestCoarseTileInfo(unittest.TestCase):
             info.output_tiled_dims,
             [[(0, Integer(512))], [(1, Integer(1024))]],
         )
+
+
+class TestComputeFillLoopInfoPlannedTopology(unittest.TestCase):
+    """_compute_fill_loop_info_planned classifies output/reduction topologies.
+
+    Levels are ordered outermost-first. A level is "output" if
+    loop_tiled_dims[i] is non-empty, "reduction" if
+    loop_tiled_reduction_dims[i] is non-empty. Flat and nested topologies
+    are supported (see the function's docstring); any topology where an
+    output level is interleaved with the reduction levels -- straddling a
+    single reduction level from both sides, or sandwiched between two
+    separate reduction levels -- must raise Unsupported.
+    """
+
+    def _info(self, loop_tiled_dims, loop_tiled_reduction_dims):
+        n = len(loop_tiled_dims)
+        return CoarseTileInfo(
+            loop_group_id=tuple([0] * n),
+            loop_count=[Integer(4)] * n,
+            loop_tiled_dims=loop_tiled_dims,
+            loop_tiled_reduction_dims=loop_tiled_reduction_dims,
+        )
+
+    def test_flat_reduction_outer_output_inner(self):
+        # softmax(dim=0) tiled A/4, B/4: A-reduction outer, B-output inner.
+        info = self._info([[], [0]], [[0], []])
+        self.assertIsNone(_compute_fill_loop_info_planned(info))
+
+    def test_nested_output_outer_reduction_inner(self):
+        # mm outer M, inner K.
+        info = self._info([[0], []], [[], [0]])
+        result = _compute_fill_loop_info_planned(info)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.loop_tiled_dims, [[0]])
+
+    def test_output_straddling_single_reduction_level_unsupported(self):
+        # output, reduction, output: output on both sides of one reduction
+        # level.
+        info = self._info([[0], [], [1]], [[], [0], []])
+        with self.assertRaises(Unsupported):
+            _compute_fill_loop_info_planned(info)
+
+    def test_output_sandwiched_between_two_reduction_levels_unsupported(self):
+        # reduction, output, reduction: no single reduction level has
+        # output on both sides of it, but the output level is still
+        # interleaved with the reduction as a whole.
+        info = self._info([[], [0], []], [[0], [], [1]])
+        with self.assertRaises(Unsupported):
+            _compute_fill_loop_info_planned(info)
 
 
 class TestConfigFlags(unittest.TestCase):
@@ -1132,20 +1188,20 @@ class TestDivideRanges(unittest.TestCase):
     def test_cache_invalidated_after_divide_pointwise(self):
         from torch._inductor.ir import ComputedBuffer, FixedLayout, Pointwise
 
-        N = sympy.Symbol("N", positive=True)
+        N = sympy.Symbol("N", positive=True, integer=True)
         pw = Pointwise(
             device=torch.device("cpu"),
             dtype=torch.float16,
             inner_fn=lambda index: sympy.Integer(1),
-            ranges=[N, Integer(32)],
+            ranges=[4 * N, Integer(32)],
         )
-        layout = FixedLayout(torch.device("cpu"), torch.float16, [N, Integer(32)])
+        layout = FixedLayout(torch.device("cpu"), torch.float16, [4 * N, Integer(32)])
         op = ComputedBuffer(name="buf0", layout=layout, data=pw)
 
         pw.get_free_symbol_uses()  # prime the cache
         self.assertTrue(hasattr(pw, _LOOPS_FREE_SYMS_KEY))
 
-        _divide_ranges(op, Integer(4), tiled_dims=[0])
+        _divide_ranges(op, N, tiled_dims=[0])
 
         self.assertFalse(hasattr(pw, _LOOPS_FREE_SYMS_KEY))
 
@@ -1157,25 +1213,25 @@ class TestDivideRanges(unittest.TestCase):
             ReductionHint,
         )
 
-        N = sympy.Symbol("N", positive=True)
+        N = sympy.Symbol("N", positive=True, integer=True)
         red = Reduction(
             device=torch.device("cpu"),
             dtype=torch.float16,
             inner_fn=lambda index, rindex: sympy.Integer(1),
-            ranges=[N],
+            ranges=[4 * N],
             reduction_ranges=[Integer(128)],
             reduction_type="sum",
             src_dtype=torch.float16,
             reduction_hint=ReductionHint.DEFAULT,
         )
-        layout = FixedLayout(torch.device("cpu"), torch.float16, [N])
+        layout = FixedLayout(torch.device("cpu"), torch.float16, [4 * N])
         op = ComputedBuffer(name="buf0", layout=layout, data=red)
 
         red.get_free_symbol_uses()  # prime both Loops and Reduction cache entries
         self.assertTrue(hasattr(red, _LOOPS_FREE_SYMS_KEY))
         self.assertTrue(hasattr(red, _REDUCTION_FREE_SYMS_KEY))
 
-        _divide_ranges(op, Integer(4), tiled_dims=[0])
+        _divide_ranges(op, N, tiled_dims=[0])
 
         self.assertFalse(hasattr(red, _LOOPS_FREE_SYMS_KEY))
         self.assertFalse(hasattr(red, _REDUCTION_FREE_SYMS_KEY))
@@ -1974,104 +2030,6 @@ class TestCoarseTileTiledDimsPerRead(unittest.TestCase):
             ):
                 plan_coarse_tile_groups(group_ops, [(group_ops, levels)])
 
-    def test_plan_raises_unsupported_for_carry(self):
-        """Planning raises Unsupported for an op requiring carry propagation.
-
-        Models the flash-attention online-softmax shape
-        (tests/inductor/test_coarse_tile_e2e.py::test_hint_flash_attention's
-        running_max/QK^T pattern): a Reduction op ("red0", e.g. the QK^T
-        matmul) tiles its reduction dim at the group's only level, and a
-        sibling Pointwise op ("carry0", e.g. the running-max update) is
-        loop-invariant at that level (no output-dim tiling there) and reads
-        a pre-loop constant-fill seed buffer directly -- the exact shape
-        _seed_buffer_for_carry's docstring describes.
-
-        The seed itself must be a ComputedBuffer(Pointwise) wrapping a
-        SpyreConstantFallback scalar (matching lowering.py's real
-        full.default lowering and coarse_tile.py's own fill-insertion code
-        at ~line 2023) -- _seed_buffer_for_carry only accepts ComputedBuffer
-        reads as seed candidates (see coarse_tile.py's
-        `isinstance(buf, ComputedBuffer)` check), so carry0 must read this
-        wrapper buffer ("seed0"), not the raw SpyreConstantFallback scalar
-        directly.
-
-        _seed_buffer_for_carry uses _seed_closure_pre_stamp, which scans
-        group_ops directly rather than requiring a stamped loop_info --
-        planning is zero-mutation and runs before _apply_plan, so no op
-        has loop_info yet. No fixture pre-stamping is needed or performed
-        here; this exercises the real, never-stamped-during-planning path.
-        """
-        from torch._inductor.ir import (
-            ComputedBuffer,
-            FixedLayout,
-            Pointwise,
-            StorageBox,
-            TensorBox,
-        )
-        from torch_spyre._inductor.ir import SpyreConstantFallback
-
-        red_op = _make_real_reduction_op(
-            ranges=[Integer(8)],
-            reduction_ranges=[Integer(16)],
-            input_shape_stride=([8, 16], [16, 1]),
-            name="red0",
-            hints=((1, 1),),
-        )
-
-        # Seed buffer: a constant-fill wrapper -- ComputedBuffer(Pointwise)
-        # whose only read resolves to a SpyreConstantFallback scalar (see
-        # _is_constant_fill). Mirrors torch.full's real lowering shape.
-        scalar_op = SpyreConstantFallback(
-            torch.ops.spyre.constant.default, 0.0, torch.float32, torch.device("cpu")
-        )
-        scalar_loader = TensorBox(StorageBox(scalar_op)).make_loader()
-
-        def seed_inner_fn(index, _loader=scalar_loader):
-            return _loader([])
-
-        seed_pw = Pointwise(
-            device=torch.device("cpu"),
-            dtype=torch.float32,
-            inner_fn=seed_inner_fn,
-            ranges=[Integer(8)],
-        )
-        seed_buf = ComputedBuffer(
-            name="seed0",
-            layout=FixedLayout(torch.device("cpu"), torch.float32, [Integer(8)], None),
-            data=seed_pw,
-        )
-        seed_buf.operation_name = "seed0"
-        V.graph.name_to_buffer["seed0"] = seed_buf
-
-        # carry0 reads the seed buffer directly -- the running-max-style
-        # carry step, loop-invariant at the reduction-tiled level.
-        seed_loader = TensorBox(StorageBox(seed_buf)).make_loader()
-
-        def carry_inner_fn(index, _loader=seed_loader):
-            return _loader(index)
-
-        carry_pw = Pointwise(
-            device=torch.device("cpu"),
-            dtype=torch.float32,
-            inner_fn=carry_inner_fn,
-            ranges=[Integer(8)],
-        )
-        carry_op = ComputedBuffer(
-            name="carry0",
-            layout=FixedLayout(torch.device("cpu"), torch.float32, [Integer(8)], None),
-            data=carry_pw,
-        )
-        carry_op.operation_name = "carry0"
-        V.graph.name_to_buffer["carry0"] = carry_op
-        carry_op._test_out_coords = [sympy.Symbol("c0")]
-        carry_op.dim_hints = []  # loop-invariant: no dim_hints tile any level
-
-        group_ops = [red_op, carry_op]
-        levels = [(1, Integer(4))]
-
-        with self.assertRaisesRegex(Unsupported, "requiring carry propagation"):
-            plan_coarse_tile_groups(group_ops, [(group_ops, levels)])
-
 
 # ===========================================================================
 # 3. CountedLoopSchedulerNode and build_loop_scheduler_nodes
@@ -2475,6 +2433,7 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             },
             args=[tensor],
             constants={},
+            conv_params={},
             coordinate_masking={},
         )
         symbols: list[int] = []
@@ -4324,30 +4283,22 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
         self.assertEqual(consumers, [other_group])
 
     def test_carry_propagation_functions_removed(self):
-        """_carry_terminal_op/_propagate_carry_op are deleted.
-
-        _seed_buffer_for_carry is deliberately NOT checked here: it remains
-        live, called from plan_coarse_tile_groups (Task 3) as the
-        carry-detection predicate behind its Unsupported raise — only the
-        transformation-time carry mechanism (_carry_terminal_op,
-        _propagate_carry_op, and _propagate_tiled_op's carry-trigger branch
-        that called all three) is dead code and removed by this task.
-        """
+        """_carry_terminal_op/_propagate_carry_op and the seed-detection helpers
+        are deleted."""
         import torch_spyre._inductor.wsr.coarse_tile as coarse_tile_module
 
         for name in (
             "_carry_terminal_op",
             "_propagate_carry_op",
+            "_seed_buffer_for_carry",
+            "_seed_closure_pre_stamp",
+            "_is_constant_fill",
+            "_closure_member_has_external_operands_only",
         ):
             self.assertFalse(
                 hasattr(coarse_tile_module, name),
                 f"{name} should have been deleted",
             )
-        self.assertTrue(
-            hasattr(coarse_tile_module, "_seed_buffer_for_carry"),
-            "_seed_buffer_for_carry must stay defined -- plan_coarse_tile_groups "
-            "still calls it as its carry-detection predicate",
-        )
 
     def test_has_loop_internal_real_input_removed(self):
         """_has_loop_internal_real_input is deleted along with the direct-
@@ -6651,6 +6602,7 @@ class TestSymbolKind(unittest.TestCase):
             },
             args=[tensor],
             constants={},
+            conv_params={},
             coordinate_masking={},
         )
         symbols: list[int] = []
@@ -7446,6 +7398,165 @@ class TestCoeffThroughFloor(unittest.TestCase):
         s = Symbol("s")
         expr = floor(128 * s / 2)
         self.assertEqual(coeff_through_floor(expr, s), 64)
+
+
+class TestTileHelpers(unittest.TestCase):
+    """Tests for tile.py."""
+
+    def test_compute_tile_stride_1d(self):
+        self.assertEqual(compute_tile_stride([1024], [1], [256]), [1])
+
+    def test_compute_tile_stride_2d(self):
+        self.assertEqual(
+            compute_tile_stride([1024, 4096], [4096, 1], [512, 1024]), [1024, 1]
+        )
+
+    def test_compute_tile_stride_2d_padding(self):
+        self.assertEqual(
+            compute_tile_stride([1024, 4096], [4104, 1], [512, 1024]), [1026, 1]
+        )
+
+    def test_compute_tile_stride_3d_row_major(self):
+        self.assertEqual(
+            compute_tile_stride([8, 16, 32], [512, 32, 1], [2, 4, 8]), [32, 8, 1]
+        )
+
+    def test_compute_tile_stride_3d_col_major(self):
+        self.assertEqual(
+            compute_tile_stride([8, 16, 32], [1, 8, 128], [2, 4, 8]), [1, 2, 8]
+        )
+
+    def test_compute_tile_stride_3d_min_stride_64(self):
+        self.assertEqual(
+            compute_tile_stride([4, 8, 16], [8192, 1024, 64], [2, 4, 8]),
+            [2048, 512, 64],
+        )
+
+    def test_compute_tile_stride_3d_unit_tile_middle_dim(self):
+        self.assertEqual(
+            compute_tile_stride([8, 16, 32], [512, 32, 1], [2, 1, 8]), [8, 0, 1]
+        )
+
+    def test_compute_tile_stride_3d_size1_outermost(self):
+        self.assertEqual(
+            compute_tile_stride([1, 16, 32], [512, 32, 1], [1, 4, 8]), [0, 8, 1]
+        )
+
+    def test_compute_tile_stride_3d_size1_middle(self):
+        self.assertEqual(
+            compute_tile_stride([8, 1, 32], [32, 32, 1], [2, 1, 8]), [8, 0, 1]
+        )
+
+    def test_compute_tile_stride_3d_size1_innermost(self):
+        self.assertEqual(
+            compute_tile_stride([8, 16, 1], [16, 1, 1], [2, 4, 1]), [4, 1, 0]
+        )
+
+    def test_compute_tile_stride_3d_expanded_outermost(self):
+        self.assertEqual(
+            compute_tile_stride([8, 16, 32], [0, 32, 1], [2, 4, 8]), [0, 8, 1]
+        )
+
+    def test_compute_tile_stride_3d_expanded_middle(self):
+        self.assertEqual(
+            compute_tile_stride([8, 16, 32], [32, 0, 1], [2, 4, 8]), [8, 0, 1]
+        )
+
+    def test_compute_tile_stride_3d_expanded_innermost(self):
+        self.assertEqual(
+            compute_tile_stride([8, 16, 32], [16, 1, 0], [2, 4, 8]), [4, 1, 0]
+        )
+
+    def test_compute_tile_stride_3d_padding(self):
+        self.assertEqual(
+            compute_tile_stride([8, 16, 32], [544, 32, 1], [2, 4, 8]), [34, 8, 1]
+        )
+
+    def test_compute_tile_offset_1d(self):
+        self.assertEqual(compute_tile_offset(0, [(1, 1)]), 0)
+        self.assertEqual(compute_tile_offset(1, [(1, 1)]), 1)
+        self.assertEqual(compute_tile_offset(256, [(1, 1)]), 256)
+
+    def test_compute_tile_offset_2d(self):
+        self.assertEqual(compute_tile_offset(0, [(4096, 1024), (1, 1)]), 0)
+        self.assertEqual(compute_tile_offset(1, [(4096, 1024), (1, 1)]), 1)
+        self.assertEqual(compute_tile_offset(4096, [(4096, 1024), (1, 1)]), 1024)
+        self.assertEqual(compute_tile_offset(4097, [(4096, 1024), (1, 1)]), 1025)
+        self.assertEqual(compute_tile_offset(8192, [(4096, 1024), (1, 1)]), 2048)
+        self.assertEqual(compute_tile_offset(4104, [(4104, 1026), (1, 1)]), 1026)
+
+    def test_compute_tile_offset_3d(self):
+        self.assertEqual(compute_tile_offset(512, [(512, 32), (32, 8), (1, 1)]), 32)
+        self.assertEqual(compute_tile_offset(32, [(512, 32), (32, 8), (1, 1)]), 8)
+        self.assertEqual(compute_tile_offset(545, [(512, 32), (32, 8), (1, 1)]), 41)
+
+    def test_compute_tile_offset_3d_min_stride_64(self):
+        self.assertEqual(
+            compute_tile_offset(0, [(8192, 2048), (1024, 512), (64, 64)]), 0
+        )
+        self.assertEqual(
+            compute_tile_offset(64, [(8192, 2048), (1024, 512), (64, 64)]), 64
+        )
+        self.assertEqual(
+            compute_tile_offset(1024, [(8192, 2048), (1024, 512), (64, 64)]), 512
+        )
+        self.assertEqual(
+            compute_tile_offset(8192, [(8192, 2048), (1024, 512), (64, 64)]), 2048
+        )
+        self.assertEqual(
+            compute_tile_offset(9280, [(8192, 2048), (1024, 512), (64, 64)]), 2624
+        )
+
+    def test_compute_tile_index_2d(self):
+        p0, p1 = sympy.symbols("p0 p1", integer=True)
+        self.assertEqual(
+            compute_tile_index(
+                4096 * p0 + p1, {p0: 1024, p1: 4096}, [1024, 4096], [4096, 1], [1024, 1]
+            ),
+            1024 * p0 + p1,
+        )
+        self.assertEqual(
+            compute_tile_index(
+                p0 + 1024 * p1, {p0: 4096, p1: 1024}, [4096, 1024], [1024, 1], [512, 1]
+            ),
+            p0 + 512 * p1,
+        )
+
+    def test_compute_tile_index_2d_diagonal(self):
+        p0 = sympy.Symbol("p0", integer=True)
+        self.assertEqual(
+            compute_tile_index(
+                1025 * p0, {p0: 1024}, [1024, 1024], [1024, 1], [512, 1]
+            ),
+            513 * p0,
+        )
+
+    def test_compute_tile_index_2d_col_major(self):
+        p0, p1 = sympy.symbols("p0 p1", integer=True)
+        self.assertEqual(
+            compute_tile_index(
+                p0 + 1024 * p1, {p0: 4096, p1: 1024}, [1024, 4096], [1, 1024], [1, 512]
+            ),
+            p0 + 512 * p1,
+        )
+
+    def test_compute_tile_index_2d_constant_offset(self):
+        p0 = sympy.Symbol("p0", integer=True)
+        self.assertEqual(
+            compute_tile_index(
+                4096 + p0, {p0: 1024}, [1024, 4096], [4096, 1], [1024, 1]
+            ),
+            1024 + p0,
+        )
+
+    def test_compute_tile_index_2d_no_tiling(self):
+        p0 = sympy.Symbol("p0", integer=True)
+        self.assertEqual(
+            compute_tile_index(
+                4096 * p0 + 2048, {p0: 1024}, [1024, 4096], [4096, 1], [4096, 1]
+            ),
+            4096 * p0 + 2048,
+        )
 
 
 if __name__ == "__main__":

@@ -36,7 +36,6 @@ from torch_spyre._inductor.scratchpad.cooling_schedules import (
 )
 from torch_spyre._inductor.scratchpad.simulated_annealing import (
     SimulatedAnnealingLayoutSolver,
-    SimulatedAnnealingSolverWithBuffers,
 )
 
 # Heavy randomized anneals over many seeds, larger problems and longer
@@ -252,8 +251,9 @@ class CoolingScheduleTests(TestCase):
             buffers = _random_buffers(rng, n)
             cap = max(b.size for b in buffers) * rng.randint(2, 4)
             b1, b2 = copy.deepcopy(buffers), copy.deepcopy(buffers)
-            SimulatedAnnealingLayoutSolver(cap, 128).plan_layout(b1)  # default schedule
-            SimulatedAnnealingLayoutSolver(cap, 128).plan_layout(b2)
+            # default schedule
+            SimulatedAnnealingLayoutSolver(b1, cap, 128).plan_layout()
+            SimulatedAnnealingLayoutSolver(b2, cap, 128).plan_layout()
             self.assertEqual(
                 [b.address for b in b1], [b.address for b in b2], f"seed={seed}"
             )
@@ -273,13 +273,14 @@ class CoolingScheduleTests(TestCase):
 class SimulatedAnnealingTests(TestCase):
     def _run(self, buffers, capacity, *, initial, seed, alignment=128):
         solver = SimulatedAnnealingLayoutSolver(
+            buffers,
             capacity,
             alignment,
             initial=initial,
             schedule=_short_schedule(),
             random=rnd.Random(seed),
         )
-        return solver.plan_layout(buffers)
+        return solver.plan_layout()
 
     def test_solve_skips_annealing_when_initial_already_complete(self):
         # The capacity fits all three buffers in any order, so the initial
@@ -291,7 +292,7 @@ class SimulatedAnnealingTests(TestCase):
             LifetimeBoundBuffer("c", 64, [0, 1]),
         ]
         cap = 10_000
-        solver = SimulatedAnnealingSolverWithBuffers(
+        solver = SimulatedAnnealingLayoutSolver(
             buffers,
             cap,
             128,
@@ -324,7 +325,7 @@ class SimulatedAnnealingTests(TestCase):
         schedule = ExponentialCoolingSchedule(
             t_initial=8.0, t_final=1.0, steps_per_epoch=2, epochs=4
         )  # 8 cooling steps if never interrupted
-        solver = SimulatedAnnealingSolverWithBuffers(
+        solver = SimulatedAnnealingLayoutSolver(
             buffers,
             cap,
             1,
@@ -350,7 +351,7 @@ class SimulatedAnnealingTests(TestCase):
             LifetimeBoundBuffer("b", 90, [0, 1]),  # [0, 2), stacks on a -> evicted
             LifetimeBoundBuffer("c", 10, [5, 6]),  # [5, 7), disjoint
         ]
-        solver = SimulatedAnnealingSolverWithBuffers(
+        solver = SimulatedAnnealingLayoutSolver(
             buffers,
             100,
             1,
@@ -419,9 +420,14 @@ class SimulatedAnnealingTests(TestCase):
             # peak-load seed, and reheating cycles.
             schedule = SelfCalibratingReheatingSchedule(total_steps=200, cycles=3)
             solver = SimulatedAnnealingLayoutSolver(
-                cap, 128, initial=initial, schedule=schedule, random=rnd.Random(seed)
+                buffers,
+                cap,
+                128,
+                initial=initial,
+                schedule=schedule,
+                random=rnd.Random(seed),
             )
-            solver.plan_layout(buffers)
+            solver.plan_layout()
 
             _assert_feasible(buffers, cap)
             self.assertGreaterEqual(_committed_total(buffers), initial_quality, seed)
@@ -450,13 +456,14 @@ class SimulatedAnnealingStressTests(TestCase):
                 t_initial=200.0, t_final=0.5, steps_per_epoch=8, epochs=6
             )
             solver = SimulatedAnnealingLayoutSolver(
+                buffers,
                 cap,
                 128,
                 initial=initial,
                 schedule=schedule,
                 random=rnd.Random(seed * 7 + 1),
             )
-            solver.plan_layout(buffers)
+            solver.plan_layout()
 
             _assert_feasible(buffers, cap)
             self.assertGreaterEqual(_committed_total(buffers), initial_quality, seed)

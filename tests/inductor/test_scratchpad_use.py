@@ -1354,14 +1354,14 @@ class TestSelectAllocator(unittest.TestCase):
         ):
             a = select_allocator()
             self.assertIs(type(a), ScratchpadAllocator)
-            self.assertIsInstance(a.layout_planning, GreedyLayoutSolver)
+            self.assertEqual(a.layout_planning, GreedyLayoutSolver)
 
         with ts_inductor_config.patch(
             layout_solver="bestfit", co_optimizing_lx_planning=False
         ):
             a = select_allocator()
             self.assertIs(type(a), ScratchpadAllocator)
-            self.assertIsInstance(a.layout_planning, BestFitLayoutSolver)
+            self.assertEqual(a.layout_planning, BestFitLayoutSolver)
 
         with ts_inductor_config.patch(
             layout_solver="greedy", co_optimizing_lx_planning=True
@@ -1379,7 +1379,7 @@ class TestSelectAllocator(unittest.TestCase):
                 self.assertIsInstance(a, CoOptimizingAllocator)
             else:
                 self.assertIs(type(a), ScratchpadAllocator)
-                self.assertIsInstance(a.layout_planning, GreedyLayoutSolver)
+                self.assertEqual(a.layout_planning, GreedyLayoutSolver)
 
         # cpsat without co-optimization is placement-only: a ScratchpadAllocator
         # driven by the CP-SAT solver on the pre-determined core divisions.
@@ -1393,10 +1393,10 @@ class TestSelectAllocator(unittest.TestCase):
                     CpSatLayoutSolver,
                 )
 
-                self.assertIsInstance(a.layout_planning, CpSatLayoutSolver)
+                self.assertEqual(a.layout_planning, CpSatLayoutSolver)
             else:
                 # ortools absent: falls back to greedy placement.
-                self.assertIsInstance(a.layout_planning, GreedyLayoutSolver)
+                self.assertEqual(a.layout_planning, GreedyLayoutSolver)
 
         with ts_inductor_config.patch(
             layout_solver="bogus", co_optimizing_lx_planning=False

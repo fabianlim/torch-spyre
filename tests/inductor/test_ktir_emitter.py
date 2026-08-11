@@ -29,10 +29,16 @@ from torch_spyre._inductor.op_spec import OpSpec, TensorArg
 
 
 def _mlir_ktdp_available() -> bool:
-    """True when mlir_ktdp is built with the func/arith dialect Python bindings."""
+    """True when mlir_ktdp is built with every dialect binding the emitter uses."""
     try:
         from mlir_ktdp import ir  # noqa: F401
-        from mlir_ktdp.dialects import arith, func, ktdp  # noqa: F401
+        from mlir_ktdp.dialects import (  # noqa: F401
+            arith,
+            func,
+            ktdp,
+            linalg,
+            tensor,
+        )
     except ImportError:
         return False
     return True
@@ -40,26 +46,50 @@ def _mlir_ktdp_available() -> bool:
 
 # The canonical KTIR text ``generate_ktir`` emits for a single pointwise ``add``
 # over a [512, 1024] fp16 tensor stickified to device shape [16, 512, 64].
+#
+# Two properties of this text are load-bearing for the backend, not cosmetic:
+#
+#   * the func takes NO arguments and each memory view is rooted at an
+#     ``arith.constant`` base address, because address assignment requires
+#     compile-time-constant HBM addresses (dataflow-scheduler#65);
+#   * the compute op is a ``linalg`` named op over a ``tensor.empty`` out, not
+#     ``arith.addf`` on tensors, because only a linalg consumer makes the
+#     three-stage-pipeline pass rewrite ``ktdp.load`` into a FIFO read.
+#
+# The constants are the _HBM_BYTE_ADDRESS slots in ELEMENTS (byte offset / 2 for
+# fp16): 0x0 -> 0, 0x400000000 -> 8589934592, 0x800000000 -> 17179869184.
 _EXPECTED_ADD_KTIR = """\
 #map = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
 #set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 15 >= 0, d1 >= 0, -d1 + 511 >= 0, d2 >= 0, -d2 + 63 >= 0)>
 module {
-  func.func @ktir_fused_add_0(%arg0: index, %arg1: index, %arg2: index) attributes {grid = [1]} {
+  func.func @ktir_fused_add_0() attributes {grid = [1]} {
     %c0 = arith.constant 0 : index
-    %0 = ktdp.construct_memory_view %arg0, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
-    %1 = ktdp.construct_memory_view %arg1, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
-    %2 = ktdp.construct_memory_view %arg2, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
+    %c0_0 = arith.constant 0 : index
+    %0 = ktdp.construct_memory_view %c0_0, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
+    %c8589934592 = arith.constant 8589934592 : index
+    %1 = ktdp.construct_memory_view %c8589934592, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
+    %c17179869184 = arith.constant 17179869184 : index
+    %2 = ktdp.construct_memory_view %c17179869184, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
     %3 = ktdp.construct_access_tile %0[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
     %4 = ktdp.load %3 : <16x512x64xindex> -> tensor<16x512x64xf16>
     %5 = ktdp.construct_access_tile %1[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
     %6 = ktdp.load %5 : <16x512x64xindex> -> tensor<16x512x64xf16>
-    %7 = arith.addf %4, %6 : tensor<16x512x64xf16>
-    %8 = ktdp.construct_access_tile %2[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
-    ktdp.store %7, %8 : tensor<16x512x64xf16>, <16x512x64xindex>
+    %7 = tensor.empty() : tensor<16x512x64xf16>
+    %8 = linalg.add ins(%4, %6 : tensor<16x512x64xf16>, tensor<16x512x64xf16>) outs(%7 : tensor<16x512x64xf16>) -> tensor<16x512x64xf16>
+    %9 = ktdp.construct_access_tile %2[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
+    ktdp.store %8, %9 : tensor<16x512x64xf16>, <16x512x64xindex>
     return
   }
 }
 """
+
+
+# One HBM segment slot per argument, as the literal BYTE offsets memory planning
+# resolves into ``allocation["hbm"]``.  Written out here rather than imported
+# from the table the emitter used to index, so the expected element addresses in
+# the golden text (byte offset / 2 for fp16) are an independent statement of what
+# the emitter must produce rather than a restatement of its own inputs.
+_HBM_BYTE_ADDRESS = [0x0, 0x400000000, 0x800000000]
 
 
 def _add_op_specs() -> list:
@@ -67,7 +97,8 @@ def _add_op_specs() -> list:
 
     This mirrors what the SuperDSC frontend produces for a pointwise ``a + b``:
     two HBM inputs and one HBM output, each addressed at the identity
-    coordinates ``(d0, d1, d2)`` over the stickified device shape.
+    coordinates ``(d0, d1, d2)`` over the stickified device shape, and each with
+    its HBM base address already resolved by memory planning.
     """
     d0, d1, d2 = sympy.symbols("d0 d1 d2")
     coords = [d0, d1, d2]
@@ -80,7 +111,7 @@ def _add_op_specs() -> list:
             device_dtype=DataFormats.SEN169_FP16,
             device_size=list(size),
             device_coordinates=list(coords),
-            allocation={"hbm": None},
+            allocation={"hbm": _HBM_BYTE_ADDRESS[index]},
             name=name,
         )
 
@@ -101,11 +132,15 @@ def _add_op_specs() -> list:
 
 # The emitter only supports the single-core (SENCORES=1) grid so far; pin it so
 # these tests exercise their intended guards rather than the multi-core guard,
-# which would otherwise fire first on the default SENCORES=32.
+# which would otherwise fire first on the default SENCORES=32.  Baked addresses
+# additionally require the literal (non-symbolic) allocation path; config.py
+# forces that whenever the KTIR emitter is selected, but these tests build
+# OpSpecs directly, so pin it here too.
+@mock.patch("torch_spyre._inductor.config.bundle_symbolic_args", False)
 @mock.patch("torch_spyre._inductor.config.sencores", 1)
 @unittest.skipUnless(
     _mlir_ktdp_available(),
-    "mlir_ktdp with func/arith dialect bindings is not installed",
+    "mlir_ktdp with the func/arith/linalg/tensor dialect bindings is not installed",
 )
 class TestKtirEmitter(unittest.TestCase):
     def test_pointwise_add_golden(self):
@@ -140,6 +175,56 @@ class TestKtirCapabilityGuards(unittest.TestCase):
 
         with self.assertRaises(NotImplementedError):
             generate_ktir("ktir_fused_add_0", _add_op_specs())
+
+
+@mock.patch("torch_spyre._inductor.config.bundle_symbolic_args", False)
+class TestKtirBaseAddress(unittest.TestCase):
+    """``_base_address_elements``: the one place an HBM address is resolved.
+
+    Exercised directly (not through ``generate_ktir``) so these run without the
+    dialect build -- the whole point of resolving addresses in a pure helper.
+    """
+
+    @staticmethod
+    def _arg(allocation):
+        arg = _add_op_specs()[0].args[1]
+        arg.allocation = allocation
+        return arg
+
+    def test_byte_offset_is_scaled_to_elements(self):
+        from torch_spyre._inductor.codegen.ktir import _base_address_elements
+
+        # fp16: 2 bytes per element, so the element address is half the byte one.
+        self.assertEqual(
+            _base_address_elements(self._arg({"hbm": 0x400000000})), 0x200000000
+        )
+        # A zero address is a real address, not "unset".
+        self.assertEqual(_base_address_elements(self._arg({"hbm": 0})), 0)
+
+    @mock.patch("torch_spyre._inductor.config.bundle_symbolic_args", True)
+    def test_symbolic_args_path_refused(self):
+        from torch_spyre._inductor.codegen.ktir import _base_address_elements
+
+        # On the symbolic path allocation["hbm"] is a sentinel arg_index, not an
+        # address, so baking it would silently emit a bogus base address.
+        with self.assertRaises(NotImplementedError):
+            _base_address_elements(self._arg({"hbm": 1}))
+
+    def test_unassigned_address_refused(self):
+        from torch_spyre._inductor.codegen.ktir import _base_address_elements
+
+        with self.assertRaises(NotImplementedError):
+            _base_address_elements(self._arg({"hbm": None}))
+
+    def test_non_hbm_allocations_refused(self):
+        from torch_spyre._inductor.codegen.ktir import _base_address_elements
+
+        # Every emitted memory view hardcodes memory_space = HBM, so a buffer
+        # living anywhere else must be rejected rather than mislabelled.
+        for allocation in ({"lx": 0x1000}, {"hbm_pool": 0x1000}, {}):
+            with self.subTest(allocation=allocation):
+                with self.assertRaises(NotImplementedError):
+                    _base_address_elements(self._arg(allocation))
 
 
 if __name__ == "__main__":

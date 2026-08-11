@@ -21,6 +21,7 @@ import uuid
 
 from torch._inductor.async_compile import AsyncCompile
 from torch._inductor.runtime.runtime_utils import cache_dir
+from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import (
     LoopSpec,
@@ -103,8 +104,12 @@ class SpyreAsyncCompile(AsyncCompile):
         """Emit KTDP-dialect MLIR for ``specs`` (OpSpec->KTIR path).
 
         Mirrors ``sdsc`` but emits KTIR directly instead of an SDSC bundle.
-        Device execution is not wired yet: the emitted KTIR is persisted to
-        disk for inspection and this raises ``NotImplementedError``.
+        The emitted KTIR is always persisted to disk for inspection. With
+        ``TORCH_SPYRE_DBO=1`` it is then compiled by ``dbo-opt``, which writes a
+        ``spyreCodeDir`` in the same layout ``dxp_standalone`` produces, so the
+        result is loaded and launched by the same ``SpyreSDSCKernelRunner``.
+        Without that switch device execution stays deferred and this raises
+        ``NotImplementedError``.
         """
         unimp = find_unimplemented(list(specs))
         if unimp is not None:
@@ -127,8 +132,89 @@ class SpyreAsyncCompile(AsyncCompile):
             fh.write(ktir_text)
         logger.debug("OpSpec->KTIR: wrote %s", ktir_path)
 
-        raise NotImplementedError(
-            "OpSpec->KTIR: device execution is not wired yet; the emitted KTIR "
-            f"was written to {ktir_path} for inspection. Execution lands in a "
-            "later PR."
-        )
+        if os.getenv("TORCH_SPYRE_DBO") != "1":
+            raise NotImplementedError(
+                "OpSpec->KTIR: device execution is gated behind "
+                "TORCH_SPYRE_DBO=1; the emitted KTIR was written to "
+                f"{ktir_path} for inspection. Set TORCH_SPYRE_DBO=1 to compile "
+                "and run it with the dbo backend."
+            )
+
+        return self._compile_ktir_with_dbo(kernel_name, ktir_path, output_dir)
+
+    def _compile_ktir_with_dbo(self, kernel_name: str, ktir_path: str, output_dir: str):
+        """Compile ``ktir_path`` with ``dbo-opt`` and return a runner for it.
+
+        ``--export-dir`` receives the per-kernel output dir, under which dbo-opt
+        writes ``spyreCodeDir/{spyrecode.json, init_binary.bin}`` -- exactly the
+        layout ``prepare_kernel`` loads, so no new runner is needed.
+        """
+        if not _spyre_config.ktir_device_mlir:
+            raise RuntimeError(
+                "OpSpec->KTIR: dbo-opt needs a device description and has no "
+                "default; set KTIR_DEVICE_MLIR (config.ktir_device_mlir) to a "
+                ".mlir declaring the target device. The emitted KTIR carries no "
+                "ktdf_arch.device op, so dbo-opt rejects the module without it."
+            )
+
+        cmd = [
+            "dbo-opt",
+            "--from-ktir",
+            f"--device={_spyre_config.ktir_device_mlir}",
+            f"--export-dir={output_dir}",
+            "--kEmitSpyreCode",
+            ktir_path,
+        ]
+
+        # dbo-opt ships without an RPATH, so its deeptools libraries have to be
+        # named explicitly -- but only in the CHILD environment. Putting them on
+        # this process's LD_LIBRARY_PATH would shadow the runtime's own libraries
+        # and silently corrupt results, so the parent env is copied, never
+        # mutated.
+        env = dict(os.environ)
+        if _spyre_config.dbo_lib_paths:
+            existing = env.get("LD_LIBRARY_PATH")
+            env["LD_LIBRARY_PATH"] = (
+                f"{_spyre_config.dbo_lib_paths}:{existing}"
+                if existing
+                else _spyre_config.dbo_lib_paths
+            )
+
+        with torch.profiler.record_function(f"dbo-opt:{kernel_name}"):
+            try:
+                proc = subprocess.run(
+                    cmd, env=env, capture_output=True, text=True, check=True
+                )
+                # dbo-opt can exit 0 having written nothing, so the artifact
+                # itself -- not the return code -- is the success condition.
+                spyrecode = os.path.join(output_dir, "spyreCodeDir", "spyrecode.json")
+                if not os.path.exists(spyrecode):
+                    raise RuntimeError(
+                        "OpSpec->KTIR: dbo-opt exited 0 but wrote no "
+                        f"{spyrecode}.\ncommand: {' '.join(cmd)}\n"
+                        f"stderr:\n{proc.stderr}"
+                    )
+            except subprocess.CalledProcessError as exc:
+                try_collect(
+                    exc,
+                    logger=logger,
+                    failure_category=CATEGORY_COMPILE,
+                    kernel_name=kernel_name,
+                    code_dir=output_dir,
+                )
+                raise RuntimeError(
+                    f"OpSpec->KTIR: dbo-opt failed with exit code "
+                    f"{exc.returncode}.\ncommand: {' '.join(cmd)}\n"
+                    f"stderr:\n{exc.stderr}"
+                ) from exc
+            except Exception as exc:
+                try_collect(
+                    exc,
+                    logger=logger,
+                    failure_category=CATEGORY_COMPILE,
+                    kernel_name=kernel_name,
+                    code_dir=output_dir,
+                )
+                raise
+
+        return SpyreSDSCKernelRunner(kernel_name, output_dir)

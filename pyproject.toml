@@ -36,6 +36,22 @@ dynamic = ["version"]
 cpsat = [ # OR-Tools CP-SAT LX layout solver (layout_solver='cpsat' / LAYOUT_SOLVER=cpsat)
     "ortools>=9.0",
 ]
+ktir = [ # OpSpec->KTIR emitter (ktir_emitter=1 / TORCH_SPYRE_KTIR=1)
+    # Supplies the mlir_ktdp Python bindings codegen/ktir.py imports lazily. An
+    # extra, not a runtime dependency: ktir.py stays importable (and its golden
+    # tests skip) without the dialect build.
+    #
+    # Pinned to the merge of ktir-mlir-frontend#46 ("Source structure
+    # refactoring", issue #37), the first commit whose package layout this
+    # emitter targets. Not on any index, so it is a direct git reference at an
+    # exact commit rather than a floating version range.
+    #
+    # NOTE: this is a scikit-build-core/CMake project that needs a matching
+    # LLVM/MLIR build available to configure against, so installing this extra is
+    # not self-contained the way a wheel dependency is; environments that cannot
+    # build it should simply not request the extra.
+    "ktir-mlir-frontend @ git+https://github.com/torch-spyre/ktir-mlir-frontend.git@05e7a0ff814ebefb6e78450b1ec0e871c488c8bc",
+]
 build = [ # no-isolation build
     # any change here should be reflected in the build system above
     "build",  # only required to build torch_sendnn

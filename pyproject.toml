@@ -33,17 +33,23 @@ requires-python = ">=3.11"
 dynamic = ["version"]
 
 [project.optional-dependencies]
+# The OpSpec->KTIR emitter (TORCH_SPYRE_KTIR=1) needs the mlir_ktdp Python
+# bindings, which codegen/ktir.py imports lazily so the module stays importable
+# without them. They are deliberately NOT declared as an extra here:
+#   * requirements/dev.txt is generated with --all-extras and CONTRIBUTING.md
+#     tells contributors to install it, but ktir-mlir-frontend is a
+#     scikit-build-core project that must configure against an out-of-band MLIR
+#     build, so an extra would break the documented dev setup;
+#   * it declares requires-python >=3.12 while this project allows >=3.11, so
+#     `uv lock` cannot resolve it without a python_version marker.
+# Install out of band instead, pinned to ktir-mlir-frontend@05e7a0ff (PR #46, the
+# first commit whose package layout this emitter targets):
+#   git clone https://github.com/torch-spyre/ktir-mlir-frontend && cd ktir-mlir-frontend
+#   git checkout 05e7a0ff814ebefb6e78450b1ec0e871c488c8bc
+#   MLIR_DIR=$(python scripts/setup_mlir.py)
+#   CMAKE_ARGS="-DMLIR_DIR=$MLIR_DIR" pip install .
 cpsat = [ # OR-Tools CP-SAT LX layout solver (layout_solver='cpsat' / LAYOUT_SOLVER=cpsat)
     "ortools>=9.0",
-]
-ktir = [ # OpSpec->KTIR emitter (ktir_emitter=1 / TORCH_SPYRE_KTIR=1)
-    # Supplies the mlir_ktdp Python bindings codegen/ktir.py imports lazily. An
-    # extra, not a runtime dependency: ktir.py stays importable (and its golden
-    # tests skip) without the dialect build. Pinned to ktir-mlir-frontend#46, the
-    # first commit whose package layout this emitter targets. Not on any index,
-    # and `pip install .[ktir]` alone cannot work: it is a scikit-build-core
-    # project needing an out-of-band MLIR build and CMAKE_ARGS=-DMLIR_DIR=...
-    "ktir-mlir-frontend @ git+https://github.com/torch-spyre/ktir-mlir-frontend.git@05e7a0ff814ebefb6e78450b1ec0e871c488c8bc",
 ]
 build = [ # no-isolation build
     # any change here should be reflected in the build system above

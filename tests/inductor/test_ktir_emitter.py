@@ -102,6 +102,12 @@ def _add_op_specs() -> list:
 # The emitter only supports the single-core (SENCORES=1) grid so far; pin it so
 # these tests exercise their intended guards rather than the multi-core guard,
 # which would otherwise fire first on the default SENCORES=32.
+#
+# ``bundle_symbolic_args`` is pinned True for the same reason
+# ``TestKtirBakedAddresses`` pins it False: _EXPECTED_ADD_KTIR is the symbolic
+# form, so leaving it to ambient BUNDLE_SYMBOLIC_ARGS makes the golden fail under
+# BUNDLE_SYMBOLIC_ARGS=0 -- which is exactly how the device path is run.
+@mock.patch("torch_spyre._inductor.config.bundle_symbolic_args", True)
 @mock.patch("torch_spyre._inductor.config.sencores", 1)
 @unittest.skipUnless(
     _mlir_ktdp_available(),

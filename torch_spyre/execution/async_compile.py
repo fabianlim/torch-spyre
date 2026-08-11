@@ -36,56 +36,46 @@ from .kernel_runner import SpyreSDSCKernelRunner, SpyreUnimplementedRunner
 
 logger = get_inductor_logger("sdsc_compile")
 
-DBO_OPT = "dbo-opt"
+# Wall-clock ceiling on ONE backend-compiler invocation, shared by both of them
+# (dxp_standalone on the SDSC path, dbo-opt on the KTIR path) so the two behave
+# alike. It bounds a wedged compiler -- which would otherwise block
+# torch.compile forever with no diagnostic -- rather than policing slowness:
+# both finish in well under a second on a small kernel.
+_COMPILE_TIMEOUT_S = 60.0
 
 
 def _check_ktir_device_prerequisites() -> None:
     """Raise unless the environment can compile emitted KTIR for the device.
 
-    Reports *every* unmet prerequisite at once: they are typically all missing
-    together on a first run, and surfacing them one per attempt turns a single
+    Names everything missing at once, so a first run does not turn one
     misconfiguration into a sequence of unrelated-looking failures.
-
-    ``RuntimeError``, not ``NotImplementedError``: nothing here is an
-    unimplemented capability -- each item is a setting the caller can fix.
     """
-    problems = []
+    missing = []
 
     if _spyre_config.bundle_symbolic_args:
-        problems.append(
-            "BUNDLE_SYMBOLIC_ARGS=0 is required (config.bundle_symbolic_args is "
-            "True). The device path needs literal baked addresses; the symbolic "
-            "form -- runtime address arguments -- is emit-only, and the backend "
-            "compiler cannot compile it. Set the environment variable, not just "
-            "the Python config: prepare_kernel.cpp reads the raw env var "
-            'independently, and treats unset as != "0".'
-        )
+        # The env var, not just config: prepare_kernel.cpp reads it directly.
+        missing.append("set BUNDLE_SYMBOLIC_ARGS=0 (baked addresses are required)")
 
     if not _spyre_config.ktir_device_mlir:
-        problems.append(
-            "KTIR_DEVICE_MLIR (config.ktir_device_mlir) must name a .mlir "
-            "declaring the target device; the emitted KTIR carries no "
-            "ktdf_arch.device op, so dbo-opt rejects the module without it."
+        missing.append("set KTIR_DEVICE_MLIR to a .mlir declaring the target device")
+
+    if shutil.which("dbo-opt") is None:
+        missing.append("put dbo-opt on PATH")
+
+    if missing:
+        raise RuntimeError(
+            "OpSpec->KTIR: cannot compile for the device:\n"
+            + "\n".join(f"  - {m}" for m in missing)
         )
 
-    if shutil.which(DBO_OPT) is None:
-        problems.append(
-            f"{DBO_OPT} was not found on PATH; append the deeptools bin dir to "
-            "PATH (append, so the installed dxp_standalone is not shadowed)."
+    if not _spyre_config.dbo_lib_paths:
+        # Not required -- an install whose libraries are already on the search
+        # path needs nothing here -- so warn rather than refuse.
+        logger.warning(
+            "DBO_LIB_PATHS is not set; %s will run with the inherited "
+            "library path. Set it if it fails to load its libraries.",
+            "dbo-opt",
         )
-
-    if not problems:
-        return
-
-    raise RuntimeError(
-        "OpSpec->KTIR: the KTIR path cannot compile for the device in this "
-        f"environment ({len(problems)} unmet prerequisite(s)):\n"
-        + "\n".join(f"  {n}. {p}" for n, p in enumerate(problems, 1))
-        + "\n\nDBO_LIB_PATHS (config.dbo_lib_paths) is commonly required too -- "
-        "dbo-opt ships without an RPATH, so its deeptools libraries have to be "
-        "named explicitly -- but it is not enforced here: it is unnecessary "
-        "where those libraries are already on the default search path."
-    )
 
 
 def get_output_dir(kernel_name: str):
@@ -137,7 +127,11 @@ class SpyreAsyncCompile(AsyncCompile):
         # Invoke backend compiler of SDSC Bundle
         with torch.profiler.record_function(f"dxp_standalone:{kernel_name}"):
             try:
-                subprocess.run(["dxp_standalone", "-d", output_dir], check=True)
+                subprocess.run(
+                    ["dxp_standalone", "-d", output_dir],
+                    check=True,
+                    timeout=_COMPILE_TIMEOUT_S,
+                )
             except Exception as exc:
                 try_collect(
                     exc,
@@ -160,19 +154,9 @@ class SpyreAsyncCompile(AsyncCompile):
         ``dbo-opt``, which writes a ``spyreCodeDir`` in the same layout
         ``dxp_standalone`` produces, so the result is loaded and launched by the
         same ``SpyreSDSCKernelRunner``.
-
-        Required for device execution (all enforced upfront, before anything is
-        emitted -- see ``_check_ktir_device_prerequisites``):
-
-        * ``BUNDLE_SYMBOLIC_ARGS=0`` -- baked literal addresses; the symbolic
-          form is emit-only and the backend compiler cannot compile it.
-        * ``KTIR_DEVICE_MLIR=<file>`` -- a .mlir declaring the target device.
-        * ``dbo-opt`` on ``PATH`` -- the backend compiler.
-        * ``DBO_LIB_PATHS=<dirs>`` -- usually needed (dbo-opt has no RPATH), but
-          not required where its libraries are already findable.
         """
-        # Upfront: an unmet prerequisite is a misconfiguration, not something the
-        # emitted KTIR can tell us, so there is no reason to emit first.
+        # Upfront, before anything is emitted: what device execution needs is a
+        # matter of configuration, so there is no reason to emit first.
         _check_ktir_device_prerequisites()
 
         unimp = find_unimplemented(list(specs))
@@ -211,7 +195,7 @@ class SpyreAsyncCompile(AsyncCompile):
         _check_ktir_device_prerequisites()
 
         cmd = [
-            DBO_OPT,
+            "dbo-opt",
             "--from-ktir",
             f"--device={_spyre_config.ktir_device_mlir}",
             f"--export-dir={output_dir}",
@@ -231,9 +215,6 @@ class SpyreAsyncCompile(AsyncCompile):
                 else _spyre_config.dbo_lib_paths
             )
 
-        # 0 disables the ceiling; subprocess.run treats timeout=None as "wait".
-        timeout = _spyre_config.dbo_timeout or None
-
         with torch.profiler.record_function(f"dbo-opt:{kernel_name}"):
             try:
                 proc = subprocess.run(
@@ -242,7 +223,7 @@ class SpyreAsyncCompile(AsyncCompile):
                     capture_output=True,
                     text=True,
                     check=True,
-                    timeout=timeout,
+                    timeout=_COMPILE_TIMEOUT_S,
                 )
                 # dbo-opt can exit 0 having written nothing, so the artifact
                 # itself -- not the return code -- is the success condition.
@@ -265,9 +246,9 @@ class SpyreAsyncCompile(AsyncCompile):
                     code_dir=output_dir,
                 )
                 raise RuntimeError(
-                    f"OpSpec->KTIR: dbo-opt timed out after {timeout}s "
-                    "(config.dbo_timeout / DBO_TIMEOUT; 0 disables the "
-                    f"ceiling).\ncommand: {' '.join(cmd)}"
+                    f"OpSpec->KTIR: dbo-opt timed out after "
+                    f"{_COMPILE_TIMEOUT_S}s (_COMPILE_TIMEOUT_S).\n"
+                    f"command: {' '.join(cmd)}"
                 ) from exc
             except subprocess.CalledProcessError as exc:
                 try_collect(

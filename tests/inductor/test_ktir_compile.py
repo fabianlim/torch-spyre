@@ -34,9 +34,6 @@ from torch_spyre.execution import async_compile as ac
 _MODULE = "torch_spyre.execution.async_compile"
 _CONFIG = "torch_spyre._inductor.config"
 
-# Obviously not a real library dir, so a pass cannot depend on the local install.
-_LIBS = "/nonexistent/libs"
-
 
 def _compiler():
     """A ``SpyreAsyncCompile`` that has not started AsyncCompile's worker pool.
@@ -173,23 +170,22 @@ class TestKtirDboSuccess(_PrereqCase):
             args=["dbo-opt"], returncode=0, stdout="", stderr=""
         )
 
-    def test_dbo_lib_paths_do_not_leak_into_this_process(self):
-        """The subprocess gets the libraries; ``os.environ`` is left alone.
+    def test_dbo_opt_inherits_this_process_environment(self):
+        """dbo-opt is spawned with no ``env`` override, so it inherits ours.
 
-        Setting them on this process instead would still compile, but would put
-        the compiler's libraries ahead of the runtime's for the kernel we then
-        launch -- wrong results, no diagnostic.
+        Library paths are the user's to export before the run. Passing an
+        explicit ``env`` here -- even one built from ``os.environ`` -- is how
+        that silently regresses into a stripped or reordered search path, so
+        pin the absence of the argument rather than its contents.
         """
         with (
-            mock.patch(f"{_CONFIG}.dbo_lib_paths", _LIBS),
             mock.patch(f"{_MODULE}.SpyreSDSCKernelRunner"),
             mock.patch(
                 f"{_MODULE}.subprocess.run", side_effect=lambda *a, **k: self._run_ok()
             ) as run,
         ):
             self.compile()
-        self.assertTrue(run.call_args[1]["env"]["LD_LIBRARY_PATH"].startswith(_LIBS))
-        self.assertNotIn(_LIBS, os.environ.get("LD_LIBRARY_PATH", ""))
+        self.assertIsNone(run.call_args[1].get("env"))
 
 
 if __name__ == "__main__":

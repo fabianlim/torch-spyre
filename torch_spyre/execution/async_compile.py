@@ -72,15 +72,6 @@ def _check_ktir_device_prerequisites() -> None:
             + "\n".join(f"  - {m}" for m in missing)
         )
 
-    if not _spyre_config.dbo_lib_paths:
-        # Not required -- an install whose libraries are already on the search
-        # path needs nothing here -- so warn rather than refuse.
-        logger.warning(
-            "DBO_LIB_PATHS is not set; %s will run with the inherited "
-            "library path. Set it if it fails to load its libraries.",
-            "dbo-opt",
-        )
-
 
 def get_output_dir(kernel_name: str):
     spyre_dir = os.path.join(cache_dir(), "inductor-spyre")
@@ -239,23 +230,16 @@ class SpyreAsyncCompile(AsyncCompile):
             ktir_path,
         ]
 
-        # dbo-opt ships without an RPATH, so its deeptools libraries have to be
-        # named explicitly -- but only in the CHILD environment: shadowing the
-        # runtime's own libraries here would silently corrupt results.
-        env = dict(os.environ)
-        if _spyre_config.dbo_lib_paths:
-            existing = env.get("LD_LIBRARY_PATH")
-            env["LD_LIBRARY_PATH"] = (
-                f"{_spyre_config.dbo_lib_paths}:{existing}"
-                if existing
-                else _spyre_config.dbo_lib_paths
-            )
-
+        # No environment override: dbo-opt inherits ours, so whatever library
+        # search path was exported for this process is what it resolves against.
+        # A build that cannot find its own libraries that way is a deployment
+        # problem to fix in the shell, not something to paper over per-child --
+        # and a child-only path stopped being separable once a process commits
+        # to one backend for its lifetime via ``ktir_emitter``.
         with torch.profiler.record_function(f"dbo-opt:{kernel_name}"):
             try:
                 proc = subprocess.run(
                     cmd,
-                    env=env,
                     capture_output=True,
                     text=True,
                     check=True,

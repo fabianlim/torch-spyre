@@ -40,10 +40,6 @@ ktir_emitter: bool = os.environ.get("TORCH_SPYRE_KTIR", "0") == "1"
 # A .mlir declaring the target device, passed to the backend compiler.
 ktir_device_mlir: str = os.environ.get("KTIR_DEVICE_MLIR", "")
 
-# Optional. Colon-separated library dirs prepended to LD_LIBRARY_PATH for the
-# backend-compiler subprocess only, never this process.
-dbo_lib_paths: str = os.environ.get("DBO_LIB_PATHS", "")
-
 allow_all_ops_in_lx_planning: bool = False
 
 dxp_lx_frac_avail: float = float(os.environ.get("DXP_LX_FRAC_AVAIL", "0.2"))

@@ -151,35 +151,6 @@ def _mlir_ktdp_linalg_available() -> bool:
     return _mlir_ktdp_available()
 
 
-# ``_EXPECTED_ADD_KTIR``'s add in the baked form (dataflow-scheduler#65): no func
-# args, each view rooted at an ``arith.constant`` (HBM slot ``arg_index << 34``
-# bytes, in ELEMENTS), and ``linalg`` over ``tensor.empty`` -- neither alone works.
-_EXPECTED_ADD_KTIR_BAKED = """\
-#map = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
-#set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 15 >= 0, d1 >= 0, -d1 + 511 >= 0, d2 >= 0, -d2 + 63 >= 0)>
-module {
-  func.func @ktir_fused_add_0() attributes {grid = [1]} {
-    %c0 = arith.constant 0 : index
-    %c0_0 = arith.constant 0 : index
-    %0 = ktdp.construct_memory_view %c0_0, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
-    %c8589934592 = arith.constant 8589934592 : index
-    %1 = ktdp.construct_memory_view %c8589934592, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
-    %c17179869184 = arith.constant 17179869184 : index
-    %2 = ktdp.construct_memory_view %c17179869184, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
-    %3 = ktdp.construct_access_tile %0[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
-    %4 = ktdp.load %3 : <16x512x64xindex> -> tensor<16x512x64xf16>
-    %5 = ktdp.construct_access_tile %1[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
-    %6 = ktdp.load %5 : <16x512x64xindex> -> tensor<16x512x64xf16>
-    %7 = tensor.empty() : tensor<16x512x64xf16>
-    %8 = linalg.add ins(%4, %6 : tensor<16x512x64xf16>, tensor<16x512x64xf16>) outs(%7 : tensor<16x512x64xf16>) -> tensor<16x512x64xf16>
-    %9 = ktdp.construct_access_tile %2[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
-    ktdp.store %8, %9 : tensor<16x512x64xf16>, <16x512x64xindex>
-    return
-  }
-}
-"""
-
-
 @mock.patch("torch_spyre._inductor.config.bundle_symbolic_args", False)
 @mock.patch("torch_spyre._inductor.config.sencores", 1)
 class TestKtirBakedAddresses(unittest.TestCase):
@@ -190,14 +161,35 @@ class TestKtirBakedAddresses(unittest.TestCase):
         return arg
 
     @unittest.skipUnless(_mlir_ktdp_linalg_available(), "no mlir_ktdp linalg")
-    def test_pointwise_add_golden(self):
+    def test_baked_form_deltas(self):
+        """The baked form (dataflow-scheduler#65) vs ``_EXPECTED_ADD_KTIR``.
+
+        Asserted as deltas rather than a second golden: the two texts differ in
+        5 of 24 lines, so a full copy would be 19 lines of duplication that churn
+        together, and this form is deleted outright when #65 is fixed.  The
+        loads / tiles / views the two share are already pinned by
+        ``_EXPECTED_ADD_KTIR``.
+        """
         from torch_spyre._inductor.codegen.ktir import generate_ktir
 
         specs = _add_op_specs()
         for arg in specs[0].args:
             arg.allocation = {"hbm": arg.arg_index << 34}
         emitted = generate_ktir("ktir_fused_add_0", specs)
-        self.assertEqual(emitted, _EXPECTED_ADD_KTIR_BAKED)
+
+        # 1. No address is a runtime value: zero-arg func, no %arg anywhere.
+        self.assertIn("func.func @ktir_fused_add_0() attributes {grid = [1]}", emitted)
+        self.assertNotIn("%arg", emitted)
+        # 2. Each base is a constant, in ELEMENTS (the byte slot >> 1 for fp16).
+        for arg_index in range(3):
+            with self.subTest(arg_index=arg_index):
+                base = (arg_index << 34) // 2
+                self.assertIn(f"arith.constant {base} : index", emitted)
+        # 3. linalg over tensor.empty, never arith on tensors -- required for the
+        #    memref offset to fold to static, which ktdp.load's verifier needs.
+        self.assertIn("tensor.empty()", emitted)
+        self.assertIn("linalg.add ins(", emitted)
+        self.assertNotIn("arith.addf", emitted)
 
     def test_addresses_resolved_without_the_dialect(self):
         from torch_spyre._inductor.codegen.ktir import _base_address_elements

@@ -41,9 +41,9 @@ Structure
 2. ``KtirBuilder.create()`` -- the single ``mlir_ktdp`` import site; owns the
    context and the per-module state.
 3. ``emit_specs(b, specs)`` -- a recursive walk over the same spec tree,
-   dispatching each ``OpSpec`` through the module-level ``REGISTRY``.
+   dispatching each ``OpSpec`` through ``KtirBuilder.RECIPES``.
 
-Adding a pointwise op is one ``REGISTRY`` entry.  Enabling counted loops is
+Adding a pointwise op is one ``RECIPES`` entry.  Enabling counted loops is
 dropping the ``LoopSpec`` rejection in ``_validate_list`` and filling in
 ``emit_loop``; the walk already recurses.
 """
@@ -54,7 +54,7 @@ import contextlib
 import dataclasses
 import enum
 from collections.abc import Callable, Iterator, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from torch_spyre._C import DataFormats
 from torch_spyre._inductor import config as _spyre_config
@@ -297,10 +297,10 @@ def _validate_list(specs, table: BufferTable) -> None:
             )
         if entry.is_reduction:
             raise NotImplementedError("OpSpec->KTIR: reductions are not supported yet")
-        if entry.op not in REGISTRY:
+        if entry.op not in KtirBuilder.RECIPES:
             raise NotImplementedError(
                 f"OpSpec->KTIR: op {entry.op!r} is not supported yet "
-                f"(registered: {sorted(REGISTRY)})"
+                f"(registered: {sorted(KtirBuilder.RECIPES)})"
             )
         _validate_op(entry, table)
 
@@ -345,7 +345,7 @@ def validated_roles(spec: OpSpec) -> tuple[TensorArg, list[TensorArg]]:
         raise NotImplementedError(
             f"OpSpec->KTIR: expected exactly one output, got {len(outputs)}"
         )
-    arity = REGISTRY[spec.op].arity
+    arity = KtirBuilder.RECIPES[spec.op].arity
     if len(inputs) != arity:
         raise NotImplementedError(
             f"OpSpec->KTIR: {spec.op!r} expects {arity} inputs, got {len(inputs)}"
@@ -354,12 +354,12 @@ def validated_roles(spec: OpSpec) -> tuple[TensorArg, list[TensorArg]]:
 
 
 # ---------------------------------------------------------------------------
-# Op registration
+# Ops
 # ---------------------------------------------------------------------------
 #
-# A recipe declares one op: its arity, its emission family, and the dialect
-# builder that implements it.  Emission itself lives in the family method on
-# ``KtirBuilder``, so an op is one ``@register`` block.
+# A recipe declares one op: how many inputs it takes, which emission family it
+# belongs to, and the dialect builder that implements it.  The recipes live on
+# ``KtirBuilder`` beside the family methods that execute them.
 #
 # ``binding`` returns the builder rather than being it.  The call defers the
 # dialect reference to emit time, keeping this module importable without a
@@ -367,51 +367,28 @@ def validated_roles(spec: OpSpec) -> tuple[TensorArg, list[TensorArg]]:
 
 
 class Family(enum.Enum):
-    """An emission shape.  ``family_of`` reads the one a spec wants from the
-    spec; a recipe declares the one its binding implements."""
+    """An emission shape.  A recipe declares the one its binding implements;
+    ``Family.of`` reads the one a spec asks for."""
 
     ELEMENTWISE = enum.auto()
     REDUCTION = enum.auto()
 
+    @classmethod
+    def of(cls, spec: OpSpec) -> Family:
+        """The family ``spec`` asks for, read from the spec rather than the op
+        name: the same binding can be wanted in more than one shape."""
+        return cls.REDUCTION if spec.is_reduction else cls.ELEMENTWISE
+
 
 @dataclasses.dataclass(frozen=True)
 class Recipe:
-    name: str
     arity: int
     family: Family
     binding: Callable[[], Any]
 
-
-REGISTRY: dict[str, Recipe] = {}
-
-
-def register(name: str, *, arity: int, family: Family):
-    """Declare op ``name``. Decorates the thunk that names its dialect builder."""
-
-    def wrap(binding: Callable[[], Any]) -> Callable[[], Any]:
-        if name in REGISTRY:
-            raise ValueError(f"OpSpec->KTIR: {name!r} is already registered")
-        if arity < 1:
-            raise ValueError(f"OpSpec->KTIR: {name!r} needs arity >= 1")
-        REGISTRY[name] = Recipe(name=name, arity=arity, family=family, binding=binding)
-        return binding
-
-    return wrap
-
-
-def family_of(spec: OpSpec) -> Family:
-    """The emission family this *spec* asks for, read from the spec itself."""
-    return Family.REDUCTION if spec.is_reduction else Family.ELEMENTWISE
-
-
-@register("add", arity=2, family=Family.ELEMENTWISE)
-def _add():
-    return linalg.add
-
-
-@register("mul", arity=2, family=Family.ELEMENTWISE)
-def _mul():
-    return linalg.mul
+    def __post_init__(self) -> None:
+        if self.arity < 1:
+            raise ValueError(f"OpSpec->KTIR: arity must be >= 1, got {self.arity}")
 
 
 # ---------------------------------------------------------------------------
@@ -437,8 +414,8 @@ def emit_specs(b: KtirBuilder, specs) -> None:
 
 def _emit_op(b: KtirBuilder, spec: OpSpec) -> None:
     """Dispatch one ``OpSpec`` to the builder method for its family."""
-    recipe = REGISTRY[spec.op]
-    family = family_of(spec)
+    recipe = KtirBuilder.RECIPES[spec.op]
+    family = Family.of(spec)
     if family is Family.ELEMENTWISE:
         b.elementwise(spec, recipe)
     else:
@@ -589,6 +566,7 @@ class KtirBuilder:
         try:
             module = ir.Module.create()
             with ir.InsertionPoint(module.body):
+                # [] is the result list: a KTIR kernel returns nothing.
                 fn = func.FuncOp(kernel_name, ir.FunctionType.get(params, []))
                 i64 = ir.IntegerType.get_signless(64)
                 fn.attributes["grid"] = ir.ArrayAttr.get(
@@ -599,7 +577,7 @@ class KtirBuilder:
                 with ir.InsertionPoint(block):
                     self.c0 = self.icst_index(0)
                     yield
-                    func.ReturnOp([])
+                    func.ReturnOp([])  # no operands, matching the signature
             # Printed while the context is still alive.
             self._text = str(module)
         finally:
@@ -622,17 +600,18 @@ class KtirBuilder:
         # attribute (only the ktdp *types* have getters), so this small enum
         # literal is the one unavoidable textual attribute.
         memory_space = ir.Attribute.parse("#ktdp.spyre_memory_space<HBM>")
-        # All extents are static -> empty dynamic size/stride operand lists.
         return self.val(
             ktdp.construct_memory_view(
-                memref_t,
-                base,
-                [],
-                [],
-                sizes,
-                strides,
-                memory_space,
-                self.coord_set(sizes),
+                result=memref_t,
+                offset=base,
+                # SSA operands for dynamic extents, of which there are none:
+                # every size and stride is a literal, passed as static_* below.
+                sizes=[],
+                strides=[],
+                static_sizes=sizes,
+                static_strides=strides,
+                memory_space=memory_space,
+                coordinate_set=self.coord_set(sizes),
             )
         )
 
@@ -649,13 +628,16 @@ class KtirBuilder:
         identity = ir.AffineMapAttr.get(ir.AffineMap.get_identity(rank))
         return self.val(
             ktdp.construct_access_tile(
-                at_t,
-                view,
-                identity,
-                offsets,
-                [],
-                self.coord_set(sizes),
-                identity,
+                result=at_t,
+                base=view,
+                # How the view is indexed, and the order of the tile's own axes.
+                # Both identity: the tile covers the view one-to-one.
+                base_map=identity,
+                access_tile_order=identity,
+                indices=offsets,
+                # SSA operands for symbols in base_map; it uses none.
+                symbol_operands=[],
+                access_tile_set=self.coord_set(sizes),
             )
         )
 
@@ -674,7 +656,7 @@ class KtirBuilder:
         sizes = [int(s) for s in arg.device_size]
         tensor_t = ir.RankedTensorType.get(sizes, self.elt_type(arg.device_dtype))
         tile = self.access_tile(self.view(arg), sizes, self.zero_offsets(len(sizes)))
-        return self.val(ktdp.load(tensor_t, tile))
+        return self.val(ktdp.load(result=tensor_t, access_tile=tile))
 
     def result(self, arg: TensorArg, value) -> None:
         """Dispose of an op's result: thread it, or materialise it.
@@ -690,7 +672,7 @@ class KtirBuilder:
         """An access tile + ``ktdp.store`` of ``value`` into output ``arg``."""
         sizes = [int(s) for s in arg.device_size]
         tile = self.access_tile(self.view(arg), sizes, self.zero_offsets(len(sizes)))
-        ktdp.store(value, tile)
+        ktdp.store(data_tile=value, access_tile=tile)
 
     # -- compute -----------------------------------------------------------
     #
@@ -700,6 +682,12 @@ class KtirBuilder:
     # Bindings are dialect *functions*, not OpView classes: ``linalg.AddOp``
     # constructed directly leaves the named op's body region empty and fails
     # verification, while the OpDSL function generates that body.
+    #
+    # A repeated key here is ruff F601, so an op cannot be declared twice.
+    RECIPES: ClassVar[dict[str, Recipe]] = {
+        "add": Recipe(arity=2, family=Family.ELEMENTWISE, binding=lambda: linalg.add),
+        "mul": Recipe(arity=2, family=Family.ELEMENTWISE, binding=lambda: linalg.mul),
+    }
 
     def elementwise(self, spec: OpSpec, recipe: Recipe) -> None:
         """Load the operands, apply ``recipe``'s builder, store the result.

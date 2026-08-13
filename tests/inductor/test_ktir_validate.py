@@ -133,7 +133,7 @@ class TestValidateRejections(unittest.TestCase):
         """An op with no recipe is rejected, and the message names what exists."""
         specs = _add_op_specs()
         specs[0].op = "atan2"
-        self.assertNotIn("atan2", ktir.REGISTRY)
+        self.assertNotIn("atan2", ktir.KtirBuilder.RECIPES)
         self._rejects(specs, "op 'atan2' is not supported yet")
 
     # -- per-op roles ------------------------------------------------------
@@ -288,14 +288,13 @@ class TestInternalBufferSignal(unittest.TestCase):
         self.assertTrue(ktir.is_internal(arg))
 
 
-class TestRegistry(unittest.TestCase):
+class TestRecipes(unittest.TestCase):
     """One recipe per op, and every recipe is emittable by some family method."""
 
     def test_every_recipe_is_complete(self):
-        self.assertTrue(ktir.REGISTRY)
-        for op, recipe in ktir.REGISTRY.items():
+        self.assertTrue(ktir.KtirBuilder.RECIPES)
+        for op, recipe in ktir.KtirBuilder.RECIPES.items():
             with self.subTest(op=op):
-                self.assertEqual(recipe.name, op)
                 self.assertGreaterEqual(recipe.arity, 1)
                 self.assertIsInstance(recipe.family, ktir.Family)
                 # A thunk, not the builder itself: resolving it here would need
@@ -310,19 +309,19 @@ class TestRegistry(unittest.TestCase):
                     f"KtirBuilder has no {recipe.family.name.lower()}() for {op!r}",
                 )
 
-    def test_register_rejects_a_duplicate_name(self):
-        """Registration is the one place an op is declared, so it must be unique."""
+    def test_recipe_rejects_a_nonsense_arity(self):
+        """A duplicate op name is ruff F601; arity is checked at construction."""
         with self.assertRaises(ValueError):
-            ktir.register("add", arity=2, family=ktir.Family.ELEMENTWISE)(lambda: None)
+            ktir.Recipe(arity=0, family=ktir.Family.ELEMENTWISE, binding=lambda: None)
 
     def test_family_comes_from_the_spec_not_the_name(self):
         """A reducing spec asks for REDUCTION even when the op is registered
         elementwise -- which is why validate rejects it rather than the walk
         silently emitting the wrong shape."""
         spec = _add_op_specs()[0]
-        self.assertIs(ktir.family_of(spec), ktir.Family.ELEMENTWISE)
+        self.assertIs(ktir.Family.of(spec), ktir.Family.ELEMENTWISE)
         reducing = dataclasses.replace(spec, is_reduction=True)
-        self.assertIs(ktir.family_of(reducing), ktir.Family.REDUCTION)
+        self.assertIs(ktir.Family.of(reducing), ktir.Family.REDUCTION)
 
     def test_emit_specs_asserts_on_unvalidated_entries(self):
         """The emitter's only remaining ``raise`` is this validation-bug guard."""

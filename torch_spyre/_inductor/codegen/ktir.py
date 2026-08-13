@@ -66,14 +66,10 @@ from torch_spyre._inductor.codegen.opspec_utils import (
 )
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
 
-# The dialect handles.  Modules are singletons in sys.modules, so they are held
-# here rather than threaded through KtirBuilder: one name per dialect, bound once
-# by _load_dialects().
-#
-# Under TYPE_CHECKING these are the real imports, which is what gives `ir.Module`
-# and `arith.AddFOp` their types.  At runtime the block does not execute, so
-# importing this module needs no dialect build -- `validate` stays usable without
-# one -- and the names are None until _load_dialects() runs.
+# The dialect handles: one module-level name each, None until _load_dialects()
+# binds them.  Under TYPE_CHECKING they are the real imports, so `ir.Module` and
+# `linalg.add` carry types; at runtime the block does not execute, so importing
+# this module requires no dialect build.
 if TYPE_CHECKING:
     from mlir_ktdp import ir
     from mlir_ktdp.dialects import arith, func, ktdp, linalg, scf, tensor
@@ -106,11 +102,7 @@ def _load_dialects() -> None:
 
 
 def dialect_available() -> bool:
-    """True when the bindings the emitter needs are importable.
-
-    Asked of this module rather than reimplemented by callers, so the import list
-    exists in exactly one place and cannot drift.
-    """
+    """True when the bindings ``_load_dialects`` needs are importable."""
     try:
         _load_dialects()
     except ImportError:
@@ -144,35 +136,58 @@ _MLIR_ELT_TYPE_NAMES: dict[DataFormats, str] = {
 # than resolved into records.
 
 
+def is_internal(arg: TensorArg) -> bool:
+    """Whether the kernel produces this buffer only for its own later ops.
+
+    An internal buffer is threaded as an SSA value: not stored, and read back as
+    a value rather than loaded.  SDSC says the same thing by giving the buffer an
+    LX or HBM-pool allocation, which KTIR does not want -- the scheduler owns
+    buffering -- so the KTIR form needs a spec-level flag instead.
+
+    OpSpec does not carry one yet, so this reads a field that does not exist and
+    nothing is internal.  When ``TensorArg`` grows the flag, the body becomes
+    ``return arg.is_internal`` and no caller changes.
+    """
+    return bool(getattr(arg, "is_internal", False))
+
+
 @dataclasses.dataclass(frozen=True)
 class BufferEntry:
     """One unique buffer referenced by the kernel."""
 
     buf_id: str  # opspec_utils._buf_id(arg)
-    arg_index: int  # >= 0 external; -1 fused intermediate (rejected today)
+    arg_index: int  # position in the kernel call; -1 => not a kernel argument
     sizes: list[int]  # arg.device_size
     dtype: DataFormats
     base_elements: int | None  # ELEMENTS for the baked form; None => func arg
 
 
 class BufferTable:
-    """Unique buffers in first-seen order, keyed by ``_buf_id``."""
+    """Unique buffers in first-seen order, keyed by ``_buf_id``.
 
-    def __init__(self) -> None:
+    Carries the address form, because it is what resolves each buffer's base.
+    """
+
+    def __init__(self, *, bake_addresses: bool = False) -> None:
         self.buffers: dict[str, BufferEntry] = {}
+        self.bake_addresses = bake_addresses
 
     def add(self, arg: TensorArg) -> None:
         """Register ``arg``'s buffer, rejecting what the emitter cannot address."""
         buf_id = _buf_id(arg)
         if buf_id in self.buffers:
             return
-        # Only real external buffers become func parameters; register-threaded
-        # fused intermediates carry the -1 sentinel and would have to be threaded
-        # as SSA values instead.
+        # An internal buffer never reaches memory: no func parameter, no memory
+        # view, no address.  It is threaded as a value instead.
+        if is_internal(arg):
+            return
+        # ``arg_index`` stays -1 for buffers the frontend does not pass to the
+        # kernel, which today means an LX or HBM-pool allocation.  This emitter
+        # constructs HBM memory views only.
         if arg.arg_index < 0:
             raise NotImplementedError(
-                "OpSpec->KTIR: fused intermediates (register threading) "
-                "not supported yet"
+                f"OpSpec->KTIR: buffer {arg.name!r} is not a kernel argument "
+                f"(allocation={arg.allocation!r}); only HBM buffers are supported"
             )
         if arg.device_dtype not in _MLIR_ELT_TYPE_NAMES:
             raise NotImplementedError(
@@ -187,7 +202,7 @@ class BufferTable:
             # from func arguments and never reads ``allocation["hbm"]``, whose
             # units differ between the two forms.
             base_elements=(
-                _base_address_elements(arg) if _addresses_are_baked() else None
+                _base_address_elements(arg) if self.bake_addresses else None
             ),
         )
 
@@ -203,14 +218,6 @@ class BufferTable:
             (e for e in self.buffers.values() if e.arg_index >= 0),
             key=lambda e: e.arg_index,
         )
-
-
-def _addresses_are_baked() -> bool:
-    """True when base addresses are baked ``arith.constant``s, not func args.
-
-    TENTATIVE (dataflow-scheduler#65): the backend rejects symbolic addresses.
-    """
-    return not _spyre_config.bundle_symbolic_args
 
 
 def _base_address_elements(arg: TensorArg) -> int:
@@ -248,6 +255,8 @@ def _base_address_elements(arg: TensorArg) -> int:
 
 def validate(
     specs: Sequence[OpSpec | LoopSpec | UnimplementedOp],
+    *,
+    bake_addresses: bool = False,
 ) -> BufferTable:
     """Pure. Raises every ``NotImplementedError`` the emitter can raise.
 
@@ -265,7 +274,7 @@ def validate(
             "OpSpec->KTIR: multi-core work division is not supported yet "
             f"(SENCORES={_spyre_config.sencores}, only 1 is supported)"
         )
-    table = BufferTable()
+    table = BufferTable(bake_addresses=bake_addresses)
     _validate_list(specs, table)
     if not table.buffers:
         raise NotImplementedError("OpSpec->KTIR: no OpSpec to emit")
@@ -348,22 +357,18 @@ def validated_roles(spec: OpSpec) -> tuple[TensorArg, list[TensorArg]]:
 # Op registration
 # ---------------------------------------------------------------------------
 #
-# A recipe is pure declaration: how many inputs an op takes, which family of
-# emission it belongs to, and which dialect builder implements it.  It holds no
-# emission code -- the family method on ``KtirBuilder`` does that -- so adding an
-# op is one ``@register`` block.
+# A recipe declares one op: its arity, its emission family, and the dialect
+# builder that implements it.  Emission itself lives in the family method on
+# ``KtirBuilder``, so an op is one ``@register`` block.
 #
-# ``binding`` is a callable returning the builder rather than the builder itself,
-# because a dialect reference evaluated at module scope would import mlir_ktdp at
-# import time and cost us the dialect-free ``validate``.  Written as a literal
-# inside the body, it stays greppable and the type checker resolves it -- neither
-# of which is true of a name looked up with getattr.
+# ``binding`` returns the builder rather than being it.  The call defers the
+# dialect reference to emit time, keeping this module importable without a
+# dialect build, and keeps the reference a literal that tooling can resolve.
 
 
 class Family(enum.Enum):
-    """The emission shape an op needs. Which one a spec wants is read off the
-    spec, not the op name: ``sum`` reducing and ``sum`` not reducing are
-    different shapes over the same binding."""
+    """An emission shape.  ``family_of`` reads the one a spec wants from the
+    spec; a recipe declares the one its binding implements."""
 
     ELEMENTWISE = enum.auto()
     REDUCTION = enum.auto()
@@ -548,11 +553,13 @@ class KtirBuilder:
 
     # -- generic helpers ---------------------------------------------------
 
-    def val(self, x):
+    @staticmethod
+    def val(x):
         """The SSA ``Value`` of a builder result (builders return ``OpView`` or ``Value``)."""
         return x.result if hasattr(x, "result") else x
 
-    def elt_type(self, dtype: DataFormats):
+    @staticmethod
+    def elt_type(dtype: DataFormats):
         """The ``ir`` element type for a Spyre device dtype (validated already)."""
         return getattr(ir, _MLIR_ELT_TYPE_NAMES[dtype]).get()
 
@@ -669,6 +676,16 @@ class KtirBuilder:
         tile = self.access_tile(self.view(arg), sizes, self.zero_offsets(len(sizes)))
         return self.val(ktdp.load(tensor_t, tile))
 
+    def result(self, arg: TensorArg, value) -> None:
+        """Dispose of an op's result: thread it, or materialise it.
+
+        The mirror of ``operand`` on the way out.
+        """
+        if is_internal(arg):
+            self.env.bind_produced(_buf_id(arg), value)
+        else:
+            self.store_to(arg, value)
+
     def store_to(self, arg: TensorArg, value) -> None:
         """An access tile + ``ktdp.store`` of ``value`` into output ``arg``."""
         sizes = [int(s) for s in arg.device_size]
@@ -680,21 +697,18 @@ class KtirBuilder:
     # One method per emission family, not per op: the op contributes only its
     # dialect builder, via ``recipe.binding()``.
     #
-    # Compute is always a ``linalg`` named op over a destination tensor.  There is
-    # no second spelling -- ``arith`` on tensors was emission-only, no backend
-    # accepted it, and which dialect expresses a computation has nothing to do
-    # with where its base addresses come from.
-    #
-    # Bindings are the dialects' *functions*, not their OpView classes:
-    # ``linalg.AddOp`` cannot be used directly -- the tablegen OpView leaves the
-    # named op's body region empty and the module fails verification, while the
-    # OpDSL function generates that body.
+    # Bindings are dialect *functions*, not OpView classes: ``linalg.AddOp``
+    # constructed directly leaves the named op's body region empty and fails
+    # verification, while the OpDSL function generates that body.
 
     def elementwise(self, spec: OpSpec, recipe: Recipe) -> None:
         """Load the operands, apply ``recipe``'s builder, store the result.
 
-        Every operand and the result share the output's extents, which is what
-        makes this one method rather than one per op.
+        Every operand and the result share the output's extents.
+
+        The destination is an uninitialised ``tensor.empty``, valid because an
+        elementwise op writes every element of it.  An accumulating op reads its
+        destination and needs it filled with an identity instead.
         """
         out, inputs = validated_roles(spec)
         ins = [self.operand(a) for a in inputs]
@@ -706,11 +720,12 @@ class KtirBuilder:
             outs=[dest],
             result_tensors=[ir.RankedTensorType.get(extents, elt_t)],
         )
-        self.store_to(out, result)
+        self.result(out, result)
 
     # -- attributes --------------------------------------------------------
 
-    def coord_set(self, sizes: list[int]):
+    @staticmethod
+    def coord_set(sizes: list[int]):
         """Per-dim bounding integer set ``(0 <= d_i <= size_i - 1)`` as an attribute.
 
         Built with ``ir.IntegerSet`` from ``AffineExpr`` constraints (no textual
@@ -739,28 +754,26 @@ class KtirBuilder:
 # The two bundle_symbolic_args forms
 # ---------------------------------------------------------------------------
 #
-# ``config.bundle_symbolic_args`` is a pre-existing flag the SDSC path honours
-# too; it selects where a buffer's base address comes from.  Symbolic: a func
-# argument.  Baked: an ``arith.constant`` in elements.
+# ``config.bundle_symbolic_args`` selects where a buffer's base address comes
+# from: a func argument (symbolic) or an ``arith.constant`` in elements (baked).
+# The SDSC path reads the same flag.
 #
-# The baked form also uses ``linalg`` named compute, because ``ktdp.load`` needs a
-# static memref offset -- ``offset: ?`` persists even with an ``arith.constant``
-# base and folds only when the consumer is a ``linalg`` op, while ``linalg`` alone
-# cannot help when the base is a func argument.  So the two travel together and
-# the flag is read in three places: the two below and ``OpEntry.build``.  Reverting dataflow-scheduler#65 means
-# deleting the baked arm of each.
+# The baked form exists because ``ktdp.load`` requires a static memref offset,
+# which a constant base gives only when the consumer is a ``linalg`` op.  It is
+# the dataflow-scheduler#65 workaround: deleting the baked arm of the two
+# functions below reverts it.
 
 
 def _func_param_types(b: KtirBuilder, table: BufferTable) -> list:
     """Baked bases need no func arguments; symbolic ones need an index each."""
-    if _addresses_are_baked():
+    if table.bake_addresses:
         return []
     return [b.index_t] * len(table.param_entries)
 
 
 def _bind_views(b: KtirBuilder, table: BufferTable) -> None:
     """One memory view per buffer, based on a constant or on a func argument."""
-    baked = _addresses_are_baked()
+    baked = table.bake_addresses
     for position, entry in enumerate(table.param_entries):
         base = b.icst_index(entry.base_elements) if baked else b.block_args[position]
         b.bind_view(entry.buf_id, b.memory_view(base, entry))
@@ -774,6 +787,7 @@ def _bind_views(b: KtirBuilder, table: BufferTable) -> None:
 def generate_ktir(
     kernel_name: str,
     specs: Sequence[OpSpec | LoopSpec | UnimplementedOp],
+    **options,
 ) -> str:
     """Build a KTDP-dialect MLIR module for ``specs`` and return ``str(module)``.
 
@@ -786,7 +800,16 @@ def generate_ktir(
     # Every rejection lives in validate(), and validate() completes before
     # KtirBuilder.create(), so an unsupported request fails fast -- and is
     # testable -- whether or not mlir_ktdp is installed.
-    table = validate(specs)
+    # Emission options, defaulted here so callers pass only what they need.
+    #
+    # bake_addresses: emit each base as an arith.constant instead of a func
+    # argument.  Canonical KTIR is symbolic; baking is what dbo-opt requires
+    # (dataflow-scheduler#65), so the caller that runs dbo-opt asks for it.
+    bake_addresses = bool(options.pop("bake_addresses", False))
+    if options:
+        raise TypeError(f"generate_ktir: unknown option(s) {sorted(options)}")
+
+    table = validate(specs, bake_addresses=bake_addresses)
     b = KtirBuilder.create()
     # Single-core (SENCORES=1) grid; work-division scaling is future work.
     with b.module(kernel_name, grid=[1], params=_func_param_types(b, table)):

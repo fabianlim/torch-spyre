@@ -89,7 +89,6 @@ def _baked_add_op_specs() -> list:
 # ``allocation["hbm"]``, so the rejections under test are the ones the fixture
 # is about.  Single-core is pinned so per-op guards fire rather than the
 # multi-core guard, which would otherwise come first on the default SENCORES=32.
-@mock.patch(f"{_CONFIG}.bundle_symbolic_args", True)
 @mock.patch(f"{_CONFIG}.sencores", 1)
 class TestValidateRejections(unittest.TestCase):
     """One test per rejection ``validate`` is responsible for.
@@ -98,9 +97,9 @@ class TestValidateRejections(unittest.TestCase):
     message, so a rejection cannot silently turn into a different rejection.
     """
 
-    def _rejects(self, specs, fragment):
+    def _rejects(self, specs, fragment, **options):
         with self.assertRaises(NotImplementedError) as ctx:
-            ktir.validate(specs)
+            ktir.validate(specs, **options)
         self.assertIn(fragment, str(ctx.exception))
 
     # -- whole-request capability ------------------------------------------
@@ -162,10 +161,11 @@ class TestValidateRejections(unittest.TestCase):
 
     # -- per-buffer --------------------------------------------------------
 
-    def test_fused_intermediate_rejected(self):
+    def test_non_kernel_argument_buffer_rejected(self):
+        """arg_index stays -1 for LX / HBM-pool buffers; only HBM is emitted."""
         specs = _add_op_specs()
         specs[0].args[0].arg_index = -1
-        self._rejects(specs, "fused intermediates (register threading)")
+        self._rejects(specs, "is not a kernel argument")
 
     def test_unsupported_dtype_rejected(self):
         specs = _add_op_specs()
@@ -177,16 +177,13 @@ class TestValidateRejections(unittest.TestCase):
     def test_baked_non_hbm_allocation_rejected(self):
         specs = _baked_add_op_specs()
         specs[0].args[0].allocation = {"lx": 0x1000}
-        with mock.patch(f"{_CONFIG}.bundle_symbolic_args", False):
-            self._rejects(specs, "is not HBM-allocated")
+        self._rejects(specs, "is not HBM-allocated", bake_addresses=True)
 
     def test_baked_unassigned_hbm_address_rejected(self):
         # _add_op_specs leaves every 'hbm' address None.
-        with mock.patch(f"{_CONFIG}.bundle_symbolic_args", False):
-            self._rejects(_add_op_specs(), "unassigned 'hbm' address")
+        self._rejects(_add_op_specs(), "unassigned 'hbm' address", bake_addresses=True)
 
 
-@mock.patch(f"{_CONFIG}.bundle_symbolic_args", True)
 @mock.patch(f"{_CONFIG}.sencores", 1)
 class TestRejectionsThroughGenerateKtir(unittest.TestCase):
     """``generate_ktir`` surfaces the rejections *without* reaching the dialect.
@@ -215,7 +212,6 @@ class TestRejectionsThroughGenerateKtir(unittest.TestCase):
             ktir.generate_ktir("ktir_fused_add_0", _add_op_specs())
 
 
-@mock.patch(f"{_CONFIG}.bundle_symbolic_args", True)
 @mock.patch(f"{_CONFIG}.sencores", 1)
 class TestBufferTable(unittest.TestCase):
     """What ``validate`` returns: the func signature, before any emission."""
@@ -239,8 +235,7 @@ class TestBufferTable(unittest.TestCase):
         self.assertEqual([e.base_elements for e in table.param_entries], [None] * 3)
 
     def test_baked_form_resolves_bases_in_elements(self):
-        with mock.patch(f"{_CONFIG}.bundle_symbolic_args", False):
-            table = ktir.validate(_baked_add_op_specs())
+        table = ktir.validate(_baked_add_op_specs(), bake_addresses=True)
         # fp16: 2 bytes per element, so the byte slot halves.
         self.assertEqual(
             [e.base_elements for e in table.param_entries],
@@ -276,6 +271,21 @@ class TestBaseAddressElements(unittest.TestCase):
                 self.assertRaises(NotImplementedError),
             ):
                 ktir._base_address_elements(self._arg(allocation))
+
+
+class TestInternalBufferSignal(unittest.TestCase):
+    """``is_internal`` decides materialise-vs-thread. Nothing sets it yet."""
+
+    def test_nothing_is_internal_today(self):
+        for arg in _add_op_specs()[0].args:
+            self.assertFalse(ktir.is_internal(arg))
+
+    def test_reads_the_flag_when_a_spec_carries_one(self):
+        """The signal is a TensorArg field OpSpec does not have yet, so this
+        fakes it: when it appears, only ``is_internal``'s body changes."""
+        arg = _add_op_specs()[0].args[2]
+        arg.is_internal = True
+        self.assertTrue(ktir.is_internal(arg))
 
 
 class TestRegistry(unittest.TestCase):

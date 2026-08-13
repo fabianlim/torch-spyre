@@ -69,12 +69,8 @@ module {
 """
 
 
-# ``bundle_symbolic_args`` is pinned True for the same reason
-# ``TestKtirBakedAddresses`` pins it False: _EXPECTED_ADD_KTIR is the symbolic
-# form, so leaving it to ambient BUNDLE_SYMBOLIC_ARGS makes the golden fail under
-# BUNDLE_SYMBOLIC_ARGS=0 -- which is exactly how the device path is run.
-# ``sencores`` is pinned to the single core the emitted grid hardcodes.
-@mock.patch(f"{_CONFIG}.bundle_symbolic_args", True)
+# ``sencores`` is pinned to the single core the emitted grid hardcodes.  The
+# address form is an argument to generate_ktir, not a patched global.
 @mock.patch(f"{_CONFIG}.sencores", 1)
 @unittest.skipUnless(
     _mlir_ktdp_available(),
@@ -110,7 +106,6 @@ class TestKtirEmitter(unittest.TestCase):
         )
 
 
-@mock.patch(f"{_CONFIG}.bundle_symbolic_args", False)
 @mock.patch(f"{_CONFIG}.sencores", 1)
 @unittest.skipUnless(
     _mlir_ktdp_available(),
@@ -127,7 +122,9 @@ class TestKtirBakedAddresses(unittest.TestCase):
         """
         from torch_spyre._inductor.codegen.ktir import generate_ktir
 
-        emitted = generate_ktir("ktir_fused_add_0", _baked_add_op_specs())
+        emitted = generate_ktir(
+            "ktir_fused_add_0", _baked_add_op_specs(), bake_addresses=True
+        )
 
         # 1. No address is a runtime value: zero-arg func, no %arg anywhere.
         self.assertIn("func.func @ktir_fused_add_0() attributes {grid = [1]}", emitted)
@@ -140,6 +137,56 @@ class TestKtirBakedAddresses(unittest.TestCase):
         # Compute is deliberately NOT asserted here: both forms emit the same
         # linalg.add over a tensor.empty, so it is pinned by _EXPECTED_ADD_KTIR
         # and is not a delta.  The two texts now differ only in addressing.
+
+
+@mock.patch(f"{_CONFIG}.sencores", 1)
+@unittest.skipUnless(
+    _mlir_ktdp_available(),
+    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
+)
+class TestInternalBufferIsThreaded(unittest.TestCase):
+    """Two ops in one kernel, with the intermediate threaded as an SSA value.
+
+    The signal is stubbed (``ktir.is_internal`` reads a TensorArg field that does
+    not exist yet), so this fakes it to pin the emission shape now: an internal
+    buffer is neither stored nor loaded, and the second op consumes the first
+    op's result directly.
+    """
+
+    def _chain(self):
+        """``(a + b) + c``, where the intermediate is internal."""
+        import dataclasses
+
+        base = _add_op_specs()[0]
+        a, b, mid = base.args
+        c = dataclasses.replace(a, name="arg2", arg_index=3)
+        out = dataclasses.replace(mid, name="buf1", arg_index=4)
+        mid.is_internal = True
+        first = dataclasses.replace(base, args=[a, b, mid])
+        mid_in = dataclasses.replace(mid, is_input=True)
+        mid_in.is_internal = True
+        second = dataclasses.replace(base, args=[mid_in, c, out])
+        return [first, second]
+
+    def test_intermediate_is_neither_stored_nor_loaded(self):
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir("ktir_fused_add_add_0", self._chain())
+        # Three loads (a, b, c) -- not four: the intermediate is a live value.
+        self.assertEqual(emitted.count("ktdp.load"), 3)
+        # One store: only the kernel's real output is materialised.
+        self.assertEqual(emitted.count("ktdp.store"), 1)
+        # Two adds, and the second consumes the first's result directly.
+        adds = [ln for ln in emitted.splitlines() if "linalg.add ins(" in ln]
+        self.assertEqual(len(adds), 2)
+        produced = adds[0].split("=")[0].strip()
+        self.assertIn(f"ins({produced},", adds[1])
+        # Four buffers reach memory, not five: the intermediate gets no func
+        # parameter and no memory view.
+        self.assertEqual(emitted.count("ktdp.construct_memory_view"), 4)
+        self.assertIn(
+            "(%arg0: index, %arg1: index, %arg2: index, %arg3: index)", emitted
+        )
 
 
 if __name__ == "__main__":

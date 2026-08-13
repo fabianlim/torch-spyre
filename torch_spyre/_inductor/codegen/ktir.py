@@ -28,11 +28,34 @@ Base addresses are emitted either as func arguments or as baked
 ``arith.constant``s, selected by ``config.bundle_symbolic_args``.  The baked
 form is a temporary dataflow-scheduler#65 workaround, to be reverted when the
 backend accepts symbolic addresses.
+
+Structure
+---------
+
+``generate_ktir`` is four steps, in this order:
+
+1. ``validate(specs)`` -- a **pure** recursive walk that raises every
+   ``NotImplementedError`` the emitter can raise and returns a ``BufferTable``.
+   It imports nothing from ``mlir_ktdp``, so every rejection is reachable and
+   testable where the dialect build is absent.
+2. ``address_source(table)`` -- picks ``BakedConstants`` or
+   ``FuncArgAddresses``.  The single seam for reverting #65.
+3. ``KtirBuilder.create(...)`` -- the single ``mlir_ktdp`` import site; owns the
+   context, the dialect handles and the per-module state.
+4. ``emit_specs(b, specs)`` -- a recursive walk over the same spec tree,
+   dispatching each ``OpSpec`` through the module-level ``REGISTRY``.
+
+Adding a pointwise op is one ``REGISTRY`` entry.  Enabling counted loops is
+dropping the ``LoopSpec`` rejection in ``_validate_list`` and filling in
+``emit_loop``; the walk already recurses.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import contextlib
+import dataclasses
+from collections.abc import Callable, Iterator, Sequence
+from typing import Any
 
 from torch_spyre._C import DataFormats
 from torch_spyre._inductor import config as _spyre_config
@@ -44,57 +67,99 @@ from torch_spyre._inductor.codegen.opspec_utils import (
 )
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
 
-# Pointwise op name -> the ``arith`` float builder that implements it.  Only
-# ``add`` is wired up so far; other ops raise before reaching here.
-_ARITH_FLOAT_OP = {"add": "AddFOp"}
-# The same ops as ``linalg`` named-op builders, for the baked form.
-_LINALG_FLOAT_OP = {"add": "add"}
+# Supported device dtype -> the *name* of the ``mlir_ktdp.ir`` type builder for
+# it.  Names, not builder references, so this table stays importable without the
+# dialect: ``validate`` uses it as the supported-dtype predicate and
+# ``KtirBuilder.elt_type`` resolves the name against the imported ``ir``.  The
+# two fp16 device formats both map to ``f16``; extend this map (never fall
+# through silently) as new dtypes are supported.
+_MLIR_ELT_TYPE_NAMES: dict[DataFormats, str] = {
+    DataFormats.IEEE_FP16: "F16Type",
+    DataFormats.SEN169_FP16: "F16Type",
+    DataFormats.IEEE_FP32: "F32Type",
+    DataFormats.BFLOAT16: "BF16Type",
+}
 
 
-def _val(x):
-    """The SSA ``Value`` of a builder result (builders return ``OpView`` or ``Value``)."""
-    return x.result if hasattr(x, "result") else x
+# ---------------------------------------------------------------------------
+# BufferTable: the one record the walk needs up front
+# ---------------------------------------------------------------------------
+#
+# The func signature must be known before the body is emitted, and the address
+# source needs the buffer list to choose zero-arg versus N-arg, so the buffers
+# are collected by the validation walk into a flat table keyed by ``_buf_id``.
+# Everything else (strides, block shapes, coordinate bounds) is a pure function
+# of ``sizes`` and is recomputed per access by a single helper apiece, rather
+# than resolved into records.
 
 
-def _mlir_elt_type(ir, device_dtype: DataFormats):
-    """The ``mlir_ktdp.ir`` element type for a Spyre device dtype.
+@dataclasses.dataclass(frozen=True)
+class BufferEntry:
+    """One unique buffer referenced by the kernel."""
 
-    ``ir`` is the lazily-imported ``mlir_ktdp.ir`` module (the file never
-    imports it at top level, so it stays importable where the dialect build is
-    absent).  The two fp16 device formats both map to ``f16``; extend this map
-    (never fall through silently) as new dtypes are supported.
-    """
-    # Direct type-builder references (not name strings) resolved here, where
-    # ``ir`` is in scope.
-    mapping = {
-        DataFormats.IEEE_FP16: ir.F16Type,
-        DataFormats.SEN169_FP16: ir.F16Type,
-        DataFormats.IEEE_FP32: ir.F32Type,
-        DataFormats.BFLOAT16: ir.BF16Type,
-    }
-    builder = mapping.get(device_dtype)
-    if builder is None:
-        raise NotImplementedError(
-            f"OpSpec->KTIR: unsupported device dtype {device_dtype!r}"
+    buf_id: str  # opspec_utils._buf_id(arg)
+    arg_index: int  # >= 0 external; -1 fused intermediate (rejected today)
+    sizes: list[int]  # arg.device_size
+    dtype: DataFormats
+    base_elements: int | None  # ELEMENTS for the baked form; None => func arg
+
+
+class BufferTable:
+    """Unique buffers in first-seen order, keyed by ``_buf_id``."""
+
+    def __init__(self) -> None:
+        self.buffers: dict[str, BufferEntry] = {}
+
+    def add(self, arg: TensorArg) -> None:
+        """Register ``arg``'s buffer, rejecting what the emitter cannot address."""
+        buf_id = _buf_id(arg)
+        if buf_id in self.buffers:
+            return
+        # Only real external buffers become func parameters; register-threaded
+        # fused intermediates carry the -1 sentinel and would have to be threaded
+        # as SSA values instead.
+        if arg.arg_index < 0:
+            raise NotImplementedError(
+                "OpSpec->KTIR: fused intermediates (register threading) "
+                "not supported yet"
+            )
+        if arg.device_dtype not in _MLIR_ELT_TYPE_NAMES:
+            raise NotImplementedError(
+                f"OpSpec->KTIR: unsupported device dtype {arg.device_dtype!r}"
+            )
+        self.buffers[buf_id] = BufferEntry(
+            buf_id=buf_id,
+            arg_index=arg.arg_index,
+            sizes=[int(s) for s in arg.device_size],
+            dtype=arg.device_dtype,
+            # Resolved only for the baked form: the symbolic form takes its bases
+            # from func arguments and never reads ``allocation["hbm"]``, whose
+            # units differ between the two forms.
+            base_elements=(
+                _base_address_elements(arg) if _addresses_are_baked() else None
+            ),
         )
-    return builder.get()
+
+    @property
+    def param_entries(self) -> list[BufferEntry]:
+        """External buffers in ascending ``arg_index``.
+
+        Ascending ``arg_index`` matches the positional order ``call_kernel``
+        passes to ``.run(...)``, so the emitted func signature lines up with
+        that binding.
+        """
+        return sorted(
+            (e for e in self.buffers.values() if e.arg_index >= 0),
+            key=lambda e: e.arg_index,
+        )
 
 
-def _emit_linalg_pointwise(ir, spec: OpSpec, loaded, out: TensorArg):
-    """``linalg`` named op over an uninitialised ``tensor.empty`` out.
+def _addresses_are_baked() -> bool:
+    """True when base addresses are baked ``arith.constant``s, not func args.
 
-    Required by the baked form, not an independent requirement: a memref offset
-    only folds to *static* when the ``ktdp.load``'s consumer is a linalg op, and
-    a constant base alone still yields ``offset: ?``, which ``ktdp.load`` rejects.
+    TENTATIVE (dataflow-scheduler#65): the backend rejects symbolic addresses.
     """
-    from mlir_ktdp.dialects import linalg, tensor
-
-    out_extents = [int(s) for s in out.device_size]
-    elt_t = _mlir_elt_type(ir, out.device_dtype)
-    tensor_t = ir.RankedTensorType.get(out_extents, elt_t)
-    empty = _val(tensor.EmptyOp(out_extents, elt_t))
-    builder = getattr(linalg, _LINALG_FLOAT_OP[spec.op])
-    return _val(builder(*loaded, outs=[empty], result_tensors=[tensor_t]))
+    return not _spyre_config.bundle_symbolic_args
 
 
 def _base_address_elements(arg: TensorArg) -> int:
@@ -125,102 +190,39 @@ def _base_address_elements(arg: TensorArg) -> int:
     return int(byte_offset) // num_bytes(arg.device_dtype)
 
 
-def generate_ktir(
-    kernel_name: str,
-    specs: Sequence[OpSpec | LoopSpec | UnimplementedOp],
-) -> str:
-    """Build a KTDP-dialect MLIR module for ``specs`` and return ``str(module)``.
+# ---------------------------------------------------------------------------
+# validate: every rejection, with no mlir_ktdp
+# ---------------------------------------------------------------------------
 
-    ``specs`` is the finished OpSpec kernel contract (the same value
-    ``call_kernel`` passes positionally to ``.run(...)``).  Func parameters are
-    the unique operand buffers in ascending ``arg_index`` order so the emitted
-    signature matches that positional binding (or, in the baked form, no
-    parameters at all and one ``arith.constant`` base address per buffer).
+
+def validate(
+    specs: Sequence[OpSpec | LoopSpec | UnimplementedOp],
+) -> BufferTable:
+    """Pure. Raises every ``NotImplementedError`` the emitter can raise.
+
+    Imports nothing from ``mlir_ktdp`` (the dialect import is lazy, inside
+    ``KtirBuilder.create``), so it is testable wherever ``import ktir`` works --
+    which is everywhere.  Afterwards the emission path holds no ``raise`` but
+    the ``AssertionError`` in ``emit_specs``, which only fires on a validation
+    bug.
     """
-    # Pure capability checks first, before the mlir_ktdp import: they need no
-    # dialect build, so an unsupported request fails fast (and is testable)
-    # whether or not mlir_ktdp is installed.
-    #
-    # Multi-core work division is future work; the grid below is hard-coded to a
-    # single core, so reject anything else rather than silently emitting a
+    # Multi-core work division is future work; the emitted grid is hard-coded to
+    # a single core, so reject anything else rather than silently emitting a
     # single-core grid on a multi-core request.
     if _spyre_config.sencores != 1:
         raise NotImplementedError(
             "OpSpec->KTIR: multi-core work division is not supported yet "
             f"(SENCORES={_spyre_config.sencores}, only 1 is supported)"
         )
-    op_specs = _collect_pointwise_op_specs(specs)
-
-    # ``mlir_ktdp`` is imported lazily so the module stays importable (and the
-    # golden test can skip) where the dialect-packaged mlir_ktdp is not built.
-    from mlir_ktdp import ir
-    from mlir_ktdp.dialects import arith, func, ktdp
-
-    # Ordered unique operand buffers -> func parameter position.  Ascending
-    # arg_index matches the positional order call_kernel passes to .run(...),
-    # so the emitted func signature lines up with that binding.  Only real
-    # external buffers (arg_index >= 0) become func parameters; register-threaded
-    # fused intermediates carry the -1 sentinel and are threaded as SSA values,
-    # never bound positionally.
-    ordered_args: dict[object, TensorArg] = {}
-    for spec in op_specs:
-        for arg in spec.args:
-            ordered_args.setdefault(_buf_id(arg), arg)
-    param_args = sorted(
-        (a for a in ordered_args.values() if a.arg_index >= 0),
-        key=lambda a: a.arg_index,
-    )
-    param_index = {_buf_id(a): i for i, a in enumerate(param_args)}
-    # TENTATIVE (dataflow-scheduler#65): bake constant base addresses, and use
-    # linalg compute, because the backend rejects symbolic ones.
-    baked = not _spyre_config.bundle_symbolic_args
-
-    with ir.Context() as ctx, ir.Location.unknown():
-        ktdp.register_dialects(ctx)
-        index_t = ir.IndexType.get()
-
-        module = ir.Module.create()
-        with ir.InsertionPoint(module.body):
-            param_types = [] if baked else [index_t] * len(param_args)
-            fn_type = ir.FunctionType.get(param_types, [])
-            fn = func.FuncOp(kernel_name, fn_type)
-            # Single-core (SENCORES=1) grid; work-division scaling is future work.
-            i64 = ir.IntegerType.get_signless(64)
-            fn.attributes["grid"] = ir.ArrayAttr.get([ir.IntegerAttr.get(i64, 1)])
-            block = fn.add_entry_block()
-            block_args = list(block.arguments)
-
-            with ir.InsertionPoint(block):
-                c0 = arith.ConstantOp(index_t, 0)
-
-                # One memory view per unique buffer, in param order.
-                memory_views: dict[object, ir.Value] = {}
-                for arg in param_args:
-                    bid = _buf_id(arg)
-                    base = (
-                        _val(arith.ConstantOp(index_t, _base_address_elements(arg)))
-                        if baked
-                        else block_args[param_index[bid]]
-                    )
-                    memory_views[bid] = _emit_memory_view(ir, ktdp, arg, base)
-
-                for spec in op_specs:
-                    _emit_pointwise_op(ir, ktdp, arith, spec, memory_views, c0, baked)
-
-                func.ReturnOp([])
-
-        return str(module)
+    table = BufferTable()
+    _validate_list(specs, table)
+    if not table.buffers:
+        raise NotImplementedError("OpSpec->KTIR: no OpSpec to emit")
+    return table
 
 
-def _collect_pointwise_op_specs(
-    specs: Sequence[OpSpec | LoopSpec | UnimplementedOp],
-) -> list[OpSpec]:
-    """Validate ``specs`` and return the flat list of pointwise ``OpSpec``s.
-
-    Rejects everything outside the supported scope with an explicit
-    ``NotImplementedError``.
-    """
-    op_specs: list[OpSpec] = []
+def _validate_list(specs, table: BufferTable) -> None:
+    """Recursive: validate one spec list. Mirrors ``emit_specs``' structure."""
     for entry in specs:
         if isinstance(entry, UnimplementedOp):
             raise NotImplementedError(f"OpSpec->KTIR: unimplemented op {entry.op!r}")
@@ -228,60 +230,24 @@ def _collect_pointwise_op_specs(
             raise NotImplementedError(
                 "OpSpec->KTIR: counted loops (LoopSpec) are not supported yet"
             )
+            # When loops land, this becomes: _validate_list(entry.body, table)
         if not isinstance(entry, OpSpec):
             raise NotImplementedError(
                 f"OpSpec->KTIR: unexpected spec entry {type(entry).__name__}"
             )
         if entry.is_reduction:
             raise NotImplementedError("OpSpec->KTIR: reductions are not supported yet")
-        if entry.op not in _ARITH_FLOAT_OP:
+        if entry.op not in REGISTRY:
             raise NotImplementedError(
                 f"OpSpec->KTIR: op {entry.op!r} is not supported yet "
                 "(only pointwise 'add')"
             )
-        op_specs.append(entry)
-    if not op_specs:
-        raise NotImplementedError("OpSpec->KTIR: no OpSpec to emit")
-    return op_specs
+        _validate_op(entry, table)
 
 
-def _emit_memory_view(ir, ktdp, arg: TensorArg, offset):
-    """Emit ``ktdp.construct_memory_view`` for one buffer, return its SSA value."""
-    sizes = [int(s) for s in arg.device_size]
-    strides = _row_major_strides(sizes)
-    memref_t = ir.MemRefType.get(sizes, _mlir_elt_type(ir, arg.device_dtype))
-    coord_set = _coordinate_set_attr(ir, sizes)
-    # No Python builder is exposed for the ``spyre_memory_space`` enum attribute
-    # (only the ktdp *types* have getters), so this small enum literal is the one
-    # unavoidable textual attribute.
-    memory_space = ir.Attribute.parse("#ktdp.spyre_memory_space<HBM>")
-    # All extents are static -> empty dynamic size/stride operand lists.
-    return ktdp.construct_memory_view(
-        memref_t,
-        offset,
-        [],
-        [],
-        sizes,
-        strides,
-        memory_space,
-        coord_set,
-    )
-
-
-def _emit_pointwise_op(ir, ktdp, arith, spec: OpSpec, memory_views, c0, baked):
-    """Emit the load / compute / store sequence for one pointwise ``OpSpec``."""
-    inputs = [a for a in spec.args if a.is_input]
-    outputs = [a for a in spec.args if not a.is_input]
-    if len(outputs) != 1:
-        raise NotImplementedError(
-            f"OpSpec->KTIR: expected exactly one output, got {len(outputs)}"
-        )
-    if len(inputs) != 2:
-        raise NotImplementedError(
-            f"OpSpec->KTIR: 'add' expects two inputs, got {len(inputs)}"
-        )
-    out = outputs[0]
-
+def _validate_op(spec: OpSpec, table: BufferTable) -> None:
+    """Per-op checks: roles/arity, in-place aliasing, operand alignment, buffers."""
+    out, inputs = validated_roles(spec)
     out_extents = [int(s) for s in out.device_size]
     for arg in inputs:
         # In-place (input buffer aliases the output) is not supported yet.
@@ -301,83 +267,459 @@ def _emit_pointwise_op(ir, ktdp, arith, spec: OpSpec, memory_views, c0, baked):
             raise NotImplementedError(
                 "OpSpec->KTIR: broadcast / reshape operands not supported yet"
             )
-
-    # Every operand buffer must be a func parameter (register-threaded fused
-    # intermediates are not supported yet).
+    # Buffer-level rejections (fused intermediate, dtype, base address) live in
+    # BufferTable.add, so registration and validation cannot disagree.
     for arg in spec.args:
-        if _buf_id(arg) not in memory_views:
-            raise NotImplementedError(
-                "OpSpec->KTIR: fused intermediates (register threading) "
-                "not supported yet"
+        table.add(arg)
+
+
+def validated_roles(spec: OpSpec) -> tuple[TensorArg, list[TensorArg]]:
+    """``(output, inputs)`` for ``spec``, or raise. Pure; shared with ``validate``.
+
+    Handlers call this instead of re-deriving the roles, so the arity and
+    single-output rejections have exactly one implementation.
+    """
+    inputs = [a for a in spec.args if a.is_input]
+    outputs = [a for a in spec.args if not a.is_input]
+    if len(outputs) != 1:
+        raise NotImplementedError(
+            f"OpSpec->KTIR: expected exactly one output, got {len(outputs)}"
+        )
+    arity = REGISTRY[spec.op].arity
+    if len(inputs) != arity:
+        raise NotImplementedError(
+            f"OpSpec->KTIR: {spec.op!r} expects {arity} inputs, got {len(inputs)}"
+        )
+    return outputs[0], inputs
+
+
+# ---------------------------------------------------------------------------
+# Op registration: one module-level map
+# ---------------------------------------------------------------------------
+
+
+def _emit_add(b: KtirBuilder, spec: OpSpec) -> None:
+    """Load / compute / store for one pointwise ``OpSpec``."""
+    out, inputs = validated_roles(spec)
+    loaded = [b.operand(a) for a in inputs]
+    result = b.pointwise(spec.op, loaded, out)
+    b.store_to(out, result)
+
+
+@dataclasses.dataclass(frozen=True)
+class OpEntry:
+    """Everything the emitter knows about one supported op name.
+
+    One record per op, so adding an op is one ``REGISTRY`` entry rather than an
+    entry in each of several maps keyed by the same op name.
+
+    ``arith_builder`` / ``linalg_builder`` are the two compute spellings the two
+    address forms need (see ``AddressSource``); they are builder *names*, not
+    references, so this table needs no dialect import.
+    """
+
+    emit: Callable[[KtirBuilder, OpSpec], None]
+    arity: int
+    arith_builder: str  # ``arith`` op class, for the symbolic form
+    linalg_builder: str  # ``linalg`` named op, for the baked form
+
+
+# A map, not a decorator: registration is explicit, greppable, has no
+# import-order dependency, and is enumerable by ``validate`` and by tests.
+REGISTRY: dict[str, OpEntry] = {
+    "add": OpEntry(
+        emit=_emit_add, arity=2, arith_builder="AddFOp", linalg_builder="add"
+    ),
+}
+
+
+# ---------------------------------------------------------------------------
+# The walk
+# ---------------------------------------------------------------------------
+
+
+def emit_specs(b: KtirBuilder, specs) -> None:
+    """Emit a spec list into the current insertion point. Recursive."""
+    for entry in specs:
+        if isinstance(entry, LoopSpec):
+            emit_loop(b, entry)
+        elif isinstance(entry, OpSpec):
+            REGISTRY[entry.op].emit(b, entry)
+        else:
+            # validate() already rejected UnimplementedOp and anything else, so
+            # reaching here is a validation bug, not an unsupported request.
+            # AssertionError (not TypeError) says exactly that.
+            raise AssertionError(  # noqa: TRY004
+                f"unvalidated spec entry {type(entry).__name__}"
             )
 
-    loaded = [
-        _emit_load(ir, ktdp, arg, memory_views[_buf_id(arg)], c0) for arg in inputs
-    ]
 
-    if baked:
-        result = _emit_linalg_pointwise(ir, spec, loaded, out)
-    else:
-        result = _val(getattr(arith, _ARITH_FLOAT_OP[spec.op])(loaded[0], loaded[1]))
+def emit_loop(b: KtirBuilder, loop: LoopSpec) -> None:
+    """``scf.for`` over ``loop.count``, body emitted inside the loop's region.
 
-    _emit_store(ir, ktdp, out, memory_views[_buf_id(out)], result, c0)
-
-
-def _emit_access_tile(ir, ktdp, arg: TensorArg, memory_view, c0):
-    """Emit ``ktdp.construct_access_tile`` for ``arg``, return its SSA value."""
-    sizes = [int(s) for s in arg.device_size]
-    rank = len(sizes)
-    at_t = ktdp.AccessTileType.get(sizes, ir.IndexType.get())
-    identity = ir.AffineMapAttr.get(ir.AffineMap.get_identity(rank))
-    tile_set = _coordinate_set_attr(ir, sizes)
-    return ktdp.construct_access_tile(
-        at_t,
-        memory_view,
-        identity,
-        [c0] * rank,
-        [],
-        tile_set,
-        identity,
-    )
-
-
-def _emit_load(ir, ktdp, arg: TensorArg, memory_view, c0):
-    """Emit an access tile + ``ktdp.load`` for an input ``arg``."""
-    sizes = [int(s) for s in arg.device_size]
-    tensor_t = ir.RankedTensorType.get(sizes, _mlir_elt_type(ir, arg.device_dtype))
-    tile = _emit_access_tile(ir, ktdp, arg, memory_view, c0)
-    return ktdp.load(tensor_t, tile)
-
-
-def _emit_store(ir, ktdp, arg: TensorArg, memory_view, value, c0):
-    """Emit an access tile + ``ktdp.store`` of ``value`` into output ``arg``."""
-    tile = _emit_access_tile(ir, ktdp, arg, memory_view, c0)
-    ktdp.store(value, tile)
-
-
-# ---------------------------------------------------------------------------
-# Attribute builders
-# ---------------------------------------------------------------------------
-
-
-def _coordinate_set_attr(ir, sizes: list[int]):
-    """Per-dim bounding integer set ``(0 <= d_i <= size_i - 1)`` as an attribute.
-
-    Built with ``ir.IntegerSet`` from ``AffineExpr`` constraints (no textual
-    round-trip): for each dim ``i`` two inequalities ``d_i >= 0`` and
-    ``-d_i + (size_i - 1) >= 0``, matching the ``affine_set`` MLIR prints.
+    Not supported yet -- ``_validate_list`` rejects ``LoopSpec``, so this is
+    unreachable.  The shape is here so that enabling loops is a local change
+    rather than a restructure: the nesting in the emitted IR comes from
+    ``ir.InsertionPoint`` plus ``b.env.scope(...)``, both scoped by ``with``, so
+    the walk needs no parallel structure to know where it is.
     """
-    exprs = []
-    eq_flags: list[bool] = []
-    for i, s in enumerate(sizes):
-        dim = ir.AffineExpr.get_dim(i)
-        # d_i >= 0
-        exprs.append(dim)
-        eq_flags.append(False)
-        # -d_i + (size_i - 1) >= 0
-        neg_dim = ir.AffineExpr.get_mul(ir.AffineExpr.get_constant(-1), dim)
-        upper = ir.AffineExpr.get_add(neg_dim, ir.AffineExpr.get_constant(int(s) - 1))
-        exprs.append(upper)
-        eq_flags.append(False)
-    integer_set = ir.IntegerSet.get(len(sizes), 0, exprs, eq_flags)
-    return ir.IntegerSetAttr.get(integer_set)
+    lo, step = b.icst_index(0), b.icst_index(1)
+    hi = b.trip_count(loop.count)  # int today; sympy later
+    for_op = b.scf.ForOp(lo, hi, step)
+    with (
+        b.ir.InsertionPoint(for_op.body),
+        b.env.scope(iv=for_op.induction_variable),
+    ):
+        emit_specs(b, loop.body)  # the recursion point
+
+
+# ---------------------------------------------------------------------------
+# What the walk carries in scope
+# ---------------------------------------------------------------------------
+
+
+class ScopeStack:
+    """Builder-owned lexical scope: loop induction variables and live values.
+
+    Pushed and popped by the walk via ``with``.  A base frame is always present
+    so values produced at function level have somewhere to live.
+    """
+
+    def __init__(self) -> None:
+        # (induction variable or None, {buf_id: Value}) innermost last.
+        self._frames: list[tuple[Any, dict[str, Any]]] = [(None, {})]
+
+    @contextlib.contextmanager
+    def scope(self, iv: Any = None) -> Iterator[None]:
+        self._frames.append((iv, {}))
+        try:
+            yield
+        finally:
+            self._frames.pop()
+
+    def produced(self, buf_id: str):
+        """The ``Value`` a live node produced for ``buf_id``, else ``None``."""
+        for _, produced in reversed(self._frames):
+            if buf_id in produced:
+                return produced[buf_id]
+        return None
+
+    def bind_produced(self, buf_id: str, value) -> None:
+        self._frames[-1][1][buf_id] = value
+
+    def ivs(self) -> list:
+        """Enclosing induction variables, innermost last."""
+        return [iv for iv, _ in self._frames if iv is not None]
+
+
+# ---------------------------------------------------------------------------
+# KtirBuilder
+# ---------------------------------------------------------------------------
+
+
+class KtirBuilder:
+    """Owns the MLIR context, the dialect handles and per-module state.
+
+    Knows nothing about ``OpSpec`` beyond what handlers pass in.  Every ktdp
+    shape method returns an SSA ``Value``, so ``val()`` does not appear at call
+    sites.
+    """
+
+    def __init__(self, ir, arith, func, ktdp, linalg, scf, tensor, addrs, stack):
+        self.ir = ir
+        self.arith = arith
+        self.func = func
+        self.ktdp = ktdp
+        self.linalg = linalg
+        self.scf = scf
+        self.tensor = tensor
+        self.addrs = addrs
+        self._stack = stack
+        self.env = ScopeStack()
+        # Requires the live context entered by create().
+        self.index_t = ir.IndexType.get()
+        self.block_args: list = []
+        self.views: dict[str, Any] = {}
+        self.c0 = None
+        self._text: str | None = None
+
+    @classmethod
+    def create(cls, addrs: AddressSource) -> KtirBuilder:
+        """THE single lazy-import site, and the owner of the MLIR context.
+
+        Module level stays ``mlir_ktdp``-free, so ``import ktir`` -- and
+        therefore ``validate`` -- works where the dialect build is absent.
+
+        The context is entered here rather than in ``module()`` because
+        ``AddressSource.func_param_types`` builds ``ir`` types and is called
+        before the module is opened; ``module()`` closes it on the way out.
+        """
+        from mlir_ktdp import ir
+        from mlir_ktdp.dialects import arith, func, ktdp, linalg, scf, tensor
+
+        stack = contextlib.ExitStack()
+        try:
+            ctx = stack.enter_context(ir.Context())
+            stack.enter_context(ir.Location.unknown())
+            ktdp.register_dialects(ctx)
+            return cls(ir, arith, func, ktdp, linalg, scf, tensor, addrs, stack)
+        except BaseException:
+            stack.close()
+            raise
+
+    # -- generic helpers ---------------------------------------------------
+
+    def val(self, x):
+        """The SSA ``Value`` of a builder result (builders return ``OpView`` or ``Value``)."""
+        return x.result if hasattr(x, "result") else x
+
+    def elt_type(self, dtype: DataFormats):
+        """The ``ir`` element type for a Spyre device dtype (validated already)."""
+        return getattr(self.ir, _MLIR_ELT_TYPE_NAMES[dtype]).get()
+
+    def icst_index(self, value: int):
+        """A fresh ``arith.constant <value> : index``."""
+        return self.val(self.arith.ConstantOp(self.index_t, int(value)))
+
+    def trip_count(self, count):
+        """``count`` as an index SSA value. ``int`` today; sympy later."""
+        return self.icst_index(int(count))
+
+    def zero_offsets(self, rank: int) -> list:
+        """``rank`` copies of the function-entry ``%c0``.
+
+        Access-tile offsets are all-zero while multi-core work division is
+        rejected.  The *same* ``%c0`` value, not one constant per axis: when work
+        division lands, an axis start becomes that core's slice index times the
+        per-core extent, replacing this list element-wise.
+        """
+        return [self.c0] * rank
+
+    # -- module scaffolding ------------------------------------------------
+
+    @contextlib.contextmanager
+    def module(self, kernel_name: str, grid: list[int], params: list) -> Iterator[None]:
+        """Open ``module { func.func @kernel_name(params) }`` and emit into it."""
+        ir = self.ir
+        try:
+            module = self.ir.Module.create()
+            with ir.InsertionPoint(module.body):
+                fn = self.func.FuncOp(kernel_name, ir.FunctionType.get(params, []))
+                i64 = ir.IntegerType.get_signless(64)
+                fn.attributes["grid"] = ir.ArrayAttr.get(
+                    [ir.IntegerAttr.get(i64, int(g)) for g in grid]
+                )
+                block = fn.add_entry_block()
+                self.block_args = list(block.arguments)
+                with ir.InsertionPoint(block):
+                    self.c0 = self.icst_index(0)
+                    yield
+                    self.func.ReturnOp([])
+            # Printed while the context is still alive.
+            self._text = str(module)
+        finally:
+            self._stack.close()
+
+    def finish(self) -> str:
+        """The canonical MLIR text of the module built by ``module()``."""
+        if self._text is None:
+            raise AssertionError("KtirBuilder.finish() before module() completed")
+        return self._text
+
+    # -- ktdp shapes -------------------------------------------------------
+
+    def memory_view(self, base, entry: BufferEntry):
+        """``ktdp.construct_memory_view`` for one buffer, at base address ``base``."""
+        ir = self.ir
+        sizes = list(entry.sizes)
+        strides = _row_major_strides(sizes)
+        memref_t = ir.MemRefType.get(sizes, self.elt_type(entry.dtype))
+        # No Python builder is exposed for the ``spyre_memory_space`` enum
+        # attribute (only the ktdp *types* have getters), so this small enum
+        # literal is the one unavoidable textual attribute.
+        memory_space = ir.Attribute.parse("#ktdp.spyre_memory_space<HBM>")
+        # All extents are static -> empty dynamic size/stride operand lists.
+        return self.val(
+            self.ktdp.construct_memory_view(
+                memref_t,
+                base,
+                [],
+                [],
+                sizes,
+                strides,
+                memory_space,
+                self.coord_set(sizes),
+            )
+        )
+
+    def bind_view(self, buf_id: str, view) -> None:
+        self.views[buf_id] = view
+
+    def view(self, arg: TensorArg):
+        return self.views[_buf_id(arg)]
+
+    def access_tile(self, view, sizes: list[int], offsets: list):
+        """``ktdp.construct_access_tile`` at ``offsets`` into ``view``."""
+        ir = self.ir
+        rank = len(sizes)
+        at_t = self.ktdp.AccessTileType.get(sizes, ir.IndexType.get())
+        identity = ir.AffineMapAttr.get(ir.AffineMap.get_identity(rank))
+        return self.val(
+            self.ktdp.construct_access_tile(
+                at_t,
+                view,
+                identity,
+                offsets,
+                [],
+                self.coord_set(sizes),
+                identity,
+            )
+        )
+
+    def operand(self, arg: TensorArg):
+        """The value of an input operand: a live produced value, or a fresh load.
+
+        Reusing a produced value is what register-threaded fused intermediates
+        will need; they are rejected today, so ``produced`` is always ``None``
+        and this always loads.
+        """
+        produced = self.env.produced(_buf_id(arg))
+        return produced if produced is not None else self.load(arg)
+
+    def load(self, arg: TensorArg):
+        """An access tile + ``ktdp.load`` for an input ``arg``."""
+        sizes = [int(s) for s in arg.device_size]
+        tensor_t = self.ir.RankedTensorType.get(sizes, self.elt_type(arg.device_dtype))
+        tile = self.access_tile(self.view(arg), sizes, self.zero_offsets(len(sizes)))
+        return self.val(self.ktdp.load(tensor_t, tile))
+
+    def store_to(self, arg: TensorArg, value) -> None:
+        """An access tile + ``ktdp.store`` of ``value`` into output ``arg``."""
+        sizes = [int(s) for s in arg.device_size]
+        tile = self.access_tile(self.view(arg), sizes, self.zero_offsets(len(sizes)))
+        self.ktdp.store(value, tile)
+
+    def pointwise(self, op: str, ins, out: TensorArg):
+        """The compute op for ``op``. Spelled by the address form (see #65)."""
+        return self.addrs.pointwise(self, op, ins, out)
+
+    # -- attributes --------------------------------------------------------
+
+    def coord_set(self, sizes: list[int]):
+        """Per-dim bounding integer set ``(0 <= d_i <= size_i - 1)`` as an attribute.
+
+        Built with ``ir.IntegerSet`` from ``AffineExpr`` constraints (no textual
+        round-trip): for each dim ``i`` two inequalities ``d_i >= 0`` and
+        ``-d_i + (size_i - 1) >= 0``, matching the ``affine_set`` MLIR prints.
+        """
+        ir = self.ir
+        exprs = []
+        eq_flags: list[bool] = []
+        for i, s in enumerate(sizes):
+            dim = ir.AffineExpr.get_dim(i)
+            # d_i >= 0
+            exprs.append(dim)
+            eq_flags.append(False)
+            # -d_i + (size_i - 1) >= 0
+            neg_dim = ir.AffineExpr.get_mul(ir.AffineExpr.get_constant(-1), dim)
+            upper = ir.AffineExpr.get_add(
+                neg_dim, ir.AffineExpr.get_constant(int(s) - 1)
+            )
+            exprs.append(upper)
+            eq_flags.append(False)
+        integer_set = ir.IntegerSet.get(len(sizes), 0, exprs, eq_flags)
+        return ir.IntegerSetAttr.get(integer_set)
+
+
+# ---------------------------------------------------------------------------
+# AddressSource: the one seam for dataflow-scheduler#65
+# ---------------------------------------------------------------------------
+#
+# Two members, not four: constant addresses and ``linalg`` named compute must
+# revert together.  ``ktdp.load`` needs a *static* memref offset; ``offset: ?``
+# persists even with an ``arith.constant`` base and folds to static only when the
+# consumer is a ``linalg`` op, and ``linalg`` alone cannot help while the base is
+# a func argument.  Splitting the halves would admit configurations that do not
+# work, so ``pointwise`` lives here with the address spelling rather than on the
+# op registry.
+
+
+class BakedConstants:
+    """TENTATIVE: dataflow-scheduler#65. Zero-arg func, ``arith.constant`` bases
+    in elements, ``linalg`` named compute. Delete this class to revert."""
+
+    def __init__(self, table: BufferTable) -> None:
+        self.table = table
+
+    def func_param_types(self, b: KtirBuilder) -> list:
+        return []
+
+    def bind_views(self, b: KtirBuilder, table: BufferTable) -> None:
+        for entry in table.param_entries:
+            base = b.icst_index(entry.base_elements)
+            b.bind_view(entry.buf_id, b.memory_view(base, entry))
+
+    def pointwise(self, b: KtirBuilder, op: str, ins, out: TensorArg):
+        """``linalg`` named op over an uninitialised ``tensor.empty`` out."""
+        out_extents = [int(s) for s in out.device_size]
+        elt_t = b.elt_type(out.device_dtype)
+        tensor_t = b.ir.RankedTensorType.get(out_extents, elt_t)
+        empty = b.val(b.tensor.EmptyOp(out_extents, elt_t))
+        builder = getattr(b.linalg, REGISTRY[op].linalg_builder)
+        return b.val(builder(*ins, outs=[empty], result_tensors=[tensor_t]))
+
+
+class FuncArgAddresses:
+    """The revert target: one ``index`` func arg per buffer, ``arith`` compute."""
+
+    def __init__(self, table: BufferTable) -> None:
+        self.table = table
+
+    def func_param_types(self, b: KtirBuilder) -> list:
+        return [b.index_t] * len(self.table.param_entries)
+
+    def bind_views(self, b: KtirBuilder, table: BufferTable) -> None:
+        for position, entry in enumerate(table.param_entries):
+            base = b.block_args[position]
+            b.bind_view(entry.buf_id, b.memory_view(base, entry))
+
+    def pointwise(self, b: KtirBuilder, op: str, ins, out: TensorArg):
+        return b.val(getattr(b.arith, REGISTRY[op].arith_builder)(*ins))
+
+
+AddressSource = BakedConstants | FuncArgAddresses
+
+
+def address_source(table: BufferTable) -> AddressSource:
+    """The address form for this kernel: the single #65 revert seam."""
+    return BakedConstants(table) if _addresses_are_baked() else FuncArgAddresses(table)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+def generate_ktir(
+    kernel_name: str,
+    specs: Sequence[OpSpec | LoopSpec | UnimplementedOp],
+) -> str:
+    """Build a KTDP-dialect MLIR module for ``specs`` and return ``str(module)``.
+
+    ``specs`` is the finished OpSpec kernel contract (the same value
+    ``call_kernel`` passes positionally to ``.run(...)``).  Func parameters are
+    the unique operand buffers in ascending ``arg_index`` order so the emitted
+    signature matches that positional binding (or, in the baked form, no
+    parameters at all and one ``arith.constant`` base address per buffer).
+    """
+    # Every rejection lives in validate(), and validate() completes before
+    # KtirBuilder.create(), so an unsupported request fails fast -- and is
+    # testable -- whether or not mlir_ktdp is installed.
+    table = validate(specs)
+    addrs = address_source(table)
+    b = KtirBuilder.create(addrs)
+    # Single-core (SENCORES=1) grid; work-division scaling is future work.
+    with b.module(kernel_name, grid=[1], params=addrs.func_param_types(b)):
+        addrs.bind_views(b, table)
+        emit_specs(b, specs)
+    return b.finish()

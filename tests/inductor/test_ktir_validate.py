@@ -26,15 +26,19 @@ do need the dialect build and are skipped without it.  It imports the shared
 """
 
 import ast
+import contextlib
 import dataclasses
+import importlib
 import inspect
+import sys
 import unittest
 from unittest import mock
 
 import sympy
 
-from torch_spyre._C import DataFormats
+from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor.codegen import ktir
+from torch_spyre._inductor.constants import STAGGERED_EAS
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
 
 _CONFIG = "torch_spyre._inductor.config"
@@ -226,7 +230,10 @@ class TestBufferTable(unittest.TestCase):
         self.assertEqual(
             [e.buf_id for e in table.param_entries], ["arg0", "arg1", "buf0"]
         )
-        self.assertEqual(table.param_entries[0].sizes, [16, 512, 64])
+        # The table holds the derived records, so the buffer's extent and its
+        # row-major strides are readable here rather than only in the MLIR.
+        self.assertEqual(table.param_entries[0].layout.extent, (16, 512, 64))
+        self.assertEqual(table.param_entries[0].layout.strides, (32768, 64, 1))
 
     def test_symbolic_form_resolves_no_base_addresses(self):
         table = ktir.validate(_add_op_specs())
@@ -329,6 +336,316 @@ class TestRecipes(unittest.TestCase):
             ktir.emit_specs(None, [UnimplementedOp(op="atan2")])
 
 
+def _tiled_reduction_specs() -> tuple:
+    """The loop-nest shape of the committed ``sum`` 1-core KTIR fixture.
+
+    Two ``scf.for`` levels over a [2, 256, 64] fp16 input reduced to a [2, 64]
+    output: the outer level walks whole sticks (2 trips), the inner level walks
+    rows within a stick (256 trips).  The input's tile is one row, the output's
+    one stick, and each arg's ``device_tile_advance_expr`` is the linearized
+    element offset for one step of each level:
+
+        a: 16384*n_stick + 64*m     c: 64*n_stick
+
+    Returns ``(spec, levels)``, where ``levels`` carries a placeholder induction
+    variable per level (the derivations only pass it through).
+    """
+    n_stick, m = sympy.symbols("n_stick m")
+
+    def arg(name, index, is_input, size, advance):
+        return TensorArg(
+            is_input=is_input,
+            arg_index=index,
+            device_dtype=DataFormats.IEEE_FP16,
+            device_size=list(size),
+            device_coordinates=[],
+            allocation={"hbm": 0},
+            name=name,
+            device_tile_advance_expr=advance,
+        )
+
+    spec = OpSpec(
+        op="add",
+        is_reduction=False,
+        iteration_space={},
+        args=[
+            arg("a", 0, True, [1, 1, 64], 16384 * n_stick + 64 * m),
+            arg("c", 1, False, [1, 64], 64 * n_stick),
+        ],
+        op_info={},
+        # innermost-first, one entry per enclosing level
+        tiled_symbols=[[m], [n_stick]],
+        tiled_symbol_trip_counts={m: 256, n_stick: 2},
+    )
+    loops = [
+        (LoopSpec(count=2, body=[]), "%n_stick"),
+        (LoopSpec(count=256, body=[]), "%m"),
+    ]
+    return spec, loops
+
+
+class TestLoopDerivations(unittest.TestCase):
+    """``_levels`` / ``_solve_layout`` / ``_access`` against the ``sum`` fixture.
+
+    ``validate`` still rejects ``LoopSpec``, so no emission reaches these numbers
+    yet; they are pinned against a KTIR file that a scheduler already consumes,
+    so enabling loops is a matter of dropping that rejection rather than of
+    working out what the loop form should be.
+    """
+
+    def test_levels_are_outermost_first_with_their_trip_counts(self):
+        spec, loops = _tiled_reduction_specs()
+        levels = ktir._levels(spec, loops)
+        self.assertEqual([lvl.trip for lvl in levels], [2, 256])
+        # tiled_symbols is innermost-first; the levels come back outermost-first.
+        self.assertEqual(
+            [str(s) for lvl in levels for s in lvl.symbols], ["n_stick", "m"]
+        )
+        self.assertEqual([lvl.iv for lvl in levels], ["%n_stick", "%m"])
+
+    def test_levels_must_match_the_enclosing_nest(self):
+        spec, loops = _tiled_reduction_specs()
+        with self.assertRaises(NotImplementedError) as ctx:
+            ktir._levels(spec, loops[:1])
+        self.assertIn("tiled_symbols", str(ctx.exception))
+
+    def test_symbolic_trip_count_is_guarded(self):
+        spec, loops = _tiled_reduction_specs()
+        loops[0] = (LoopSpec(count=sympy.Symbol("s0"), body=[]), "%n_stick")
+        with self.assertRaises(ktir.DownstreamUnsupported) as ctx:
+            ktir._levels(spec, loops)
+        self.assertIn("symbolic-loop-count", str(ctx.exception))
+
+    def test_buffer_extent_grows_out_of_the_tile_extent(self):
+        """``E_i = A_i + q[l][i] * (T_l - 1)``, matching the fixture's views."""
+        spec, loops = _tiled_reduction_specs()
+        levels = ktir._levels(spec, loops)
+        a, c = spec.args
+
+        a_layout, a_q = ktir._solve_layout(a, levels)
+        # 2 = 1 + 1*(2-1), 256 = 1 + 1*(256-1), and the stick dim is unchanged.
+        self.assertEqual(a_layout.extent, (2, 256, 64))
+        self.assertEqual(a_layout.strides, (16384, 64, 1))
+        # One dim per level: the outer level walks dim 0, the inner walks dim 1.
+        self.assertEqual(a_q, [(1, 0, 0), (0, 1, 0)])
+
+        c_layout, c_q = ktir._solve_layout(c, levels)
+        self.assertEqual(c_layout.extent, (2, 64))
+        self.assertEqual(c_layout.strides, (64, 1))
+        # The inner level does not move the output: it is the reduced dim.
+        self.assertEqual(c_q, [(1, 0), (0, 0)])
+
+    def test_access_indices_are_the_fixture_subscripts(self):
+        """``%a_view[%n_stick, %m, %c0]`` and ``%c_view[%n_stick, %c0]``."""
+        spec, loops = _tiled_reduction_specs()
+        levels = ktir._levels(spec, loops)
+        a, c = spec.args
+
+        a_layout, a_q = ktir._solve_layout(a, levels)
+        a_access = ktir._access(a, levels, a_q, a_layout)
+        # The tile extent is device_size, which is what tiling already baked in.
+        self.assertEqual(a_access.extent, (1, 1, 64))
+        # Per view dim, the step each level takes: dim 0 <- n_stick, dim 1 <- m,
+        # dim 2 <- nothing, i.e. the constant zero the fixture spells as %c0.
+        self.assertEqual(a_access.index_coeffs, ((1, 0), (0, 1), (0, 0)))
+        self.assertEqual(a_access.indices, ("%n_stick", "%m"))
+
+        c_layout, c_q = ktir._solve_layout(c, levels)
+        c_access = ktir._access(c, levels, c_q, c_layout)
+        self.assertEqual(c_access.extent, (1, 64))
+        self.assertEqual(c_access.index_coeffs, ((1, 0), (0, 0)))
+
+    def test_untiled_access_sits_at_the_view_origin(self):
+        """Depth zero is the general answer, not a special case."""
+        arg = _add_op_specs()[0].args[0]
+        layout, q = ktir._solve_layout(arg, [])
+        self.assertEqual(layout.extent, (16, 512, 64))
+        self.assertEqual(q, [])
+        access = ktir._access(arg, [], q, layout)
+        # One empty sum per dim: every index expression is zero.
+        self.assertEqual(access.index_coeffs, ((), (), ()))
+        self.assertEqual(access.indices, ())
+
+    def test_advance_no_dim_divides_is_reported(self):
+        spec, loops = _tiled_reduction_specs()
+        levels = ktir._levels(spec, loops)
+        a = spec.args[0]
+        # 100 elements is not a whole number of steps along any dim of a view
+        # whose strides are 16384, 64 and 1 (the stick dim is never stepped).
+        a.device_tile_advance_expr = 100 * sympy.Symbol("n_stick")
+        with self.assertRaises(NotImplementedError) as ctx:
+            ktir._solve_layout(a, levels)
+        self.assertIn("not a whole number of steps", str(ctx.exception))
+
+
+class TestGuardedDerivationsStillProduceTheirAnswer(unittest.TestCase):
+    """A guarded capability's derivation is exercised with the guard bypassed.
+
+    The guards are one call each in front of code that works, so dropping a guard
+    is all that enabling the capability takes.  These call the derivation
+    directly, which is what proves there is something behind the guard.
+    """
+
+    @staticmethod
+    def _symbolic_arg():
+        arg = _add_op_specs()[0].args[0]
+        # A symbolic outer-stick count, as a dynamic batch dim produces.
+        arg.device_size = [sympy.Symbol("s0"), 512, 64]
+        return arg
+
+    def test_default_mode_guards_the_symbolic_extent(self):
+        with self.assertRaises(ktir.DownstreamUnsupported) as ctx:
+            ktir._layout(self._symbolic_arg(), [], [])
+        self.assertIn("dynamic-view-extent", str(ctx.exception))
+
+    def test_dynamic_mode_derives_the_symbolic_view(self):
+        s0 = sympy.Symbol("s0")
+        layout = ktir._layout(self._symbolic_arg(), [], [], symbolic_extent="dynamic")
+        # The extent stays symbolic and the strides are row-major over it: the
+        # trailing two dims are still integers, the outer stride is the product.
+        self.assertEqual(layout.extent, (s0, 512, 64))
+        self.assertEqual(layout.strides, (32768, 64, 1))
+
+    def test_max_mode_bakes_the_bound(self):
+        layout = ktir._layout(
+            self._symbolic_arg(),
+            [],
+            [],
+            symbolic_extent="max",
+            bounds={"s0": (16, 1)},  # (max, granularity)
+        )
+        self.assertEqual(layout.extent, (16, 512, 64))
+        self.assertEqual(layout.strides, (32768, 64, 1))
+
+    def test_max_mode_needs_a_bound(self):
+        with self.assertRaises(NotImplementedError) as ctx:
+            ktir._layout(self._symbolic_arg(), [], [], symbolic_extent="max", bounds={})
+        self.assertIn("no bound for 's0'", str(ctx.exception))
+
+
+class TestStatusTable(unittest.TestCase):
+    """``STATUS_TABLE`` is the single record of what the emitter can emit."""
+
+    def test_labels_are_unique_and_resolvable(self):
+        labels = [row.label for row in ktir.STATUS_TABLE]
+        self.assertEqual(len(labels), len(set(labels)))
+        for label in labels:
+            self.assertIs(ktir.status_of(label), ktir.status_of(label))
+        with self.assertRaises(KeyError):
+            ktir.status_of("no-such-capability")
+
+    def test_every_guard_label_has_a_row(self):
+        """A guard raises with a label; the label must be in the table."""
+        for label in ("dynamic-view-extent", "symbolic-loop-count"):
+            with self.subTest(label=label):
+                self.assertIs(
+                    ktir.status_of(label).status, ktir.Status.DOWNSTREAM_GUARDED
+                )
+
+    def test_staggered_arrangement_is_the_only_unspecified_item(self):
+        """FAILS ONCE THE STAGGERED LAYOUT IS IMPLEMENTED, deliberately.
+
+        There is one capability with no derivation behind it.  This test fails
+        the moment ``_arrangement_layout`` returns numbers for a staggered
+        arrangement instead of raising, so the ``STATUS_TABLE`` row must be moved
+        off ``UNSPECIFIED`` in the same commit that implements it -- the table
+        cannot go stale while the code moves on.
+        """
+        unspecified = [
+            row.label
+            for row in ktir.STATUS_TABLE
+            if row.status is ktir.Status.UNSPECIFIED
+        ]
+        self.assertEqual(unspecified, ["staggered-element-arrangement"])
+
+        arrangement = next(iter(STAGGERED_EAS))
+        with self.assertRaises(ktir.Unspecified) as ctx:
+            ktir._arrangement_layout(arrangement, (16, 512, 64), (32768, 64, 1))
+        self.assertIn("staggered-element-arrangement", str(ctx.exception))
+
+    def test_standard_arrangement_is_plain_row_major(self):
+        extent, strides = (16, 512, 64), (32768, 64, 1)
+        for arrangement in (
+            None,
+            ElementArrangement.STANDARD,
+            ElementArrangement.QFP8CH,
+        ):
+            with self.subTest(arrangement=arrangement):
+                self.assertEqual(
+                    ktir._arrangement_layout(arrangement, extent, strides),
+                    (extent, strides),
+                )
+
+    def test_coordinate_set_is_recorded_as_informational(self):
+        """It is emitted with no known reader; the row is why that is on purpose."""
+        self.assertIs(
+            ktir.status_of("coordinate-set").status, ktir.Status.INFORMATIONAL
+        )
+
+
+class TestWithoutTheDialectBuild(unittest.TestCase):
+    """``ktir`` imports, and rejects, with ``mlir_ktdp`` made unimportable.
+
+    The rest of this module relies on the dialect never being needed; here it is
+    actively blocked, so the reliance is checked rather than assumed.
+    """
+
+    class _Blocker:
+        """A ``sys.meta_path`` finder that refuses ``mlir_ktdp``."""
+
+        def find_spec(self, name, path=None, target=None):
+            if name == "mlir_ktdp" or name.startswith("mlir_ktdp."):
+                raise ImportError(f"blocked: {name}")
+            # None: every other name falls through to the real finders.
+
+    @contextlib.contextmanager
+    def _blocked(self):
+        """A freshly imported ``ktir`` that cannot reach the dialect.
+
+        A fresh module because ``_load_dialects`` caches its handles: an already
+        loaded ``ktir`` in this process may have bound them before the block.
+        """
+        name = ktir.__name__
+        blocker = self._Blocker()
+        saved = {
+            key: module
+            for key, module in sys.modules.items()
+            if key == "mlir_ktdp" or key.startswith("mlir_ktdp.")
+        }
+        saved[name] = sys.modules.pop(name)
+        for key in saved:
+            sys.modules.pop(key, None)
+        sys.meta_path.insert(0, blocker)
+        try:
+            yield importlib.import_module(name)
+        finally:
+            sys.meta_path.remove(blocker)
+            sys.modules.pop(name, None)
+            sys.modules.update(saved)
+
+    def test_imports_and_rejects_without_the_dialect(self):
+        with self._blocked() as fresh:
+            self.assertFalse(fresh.dialect_available())
+            with mock.patch(f"{_CONFIG}.sencores", 1):
+                # A rejection, not an ImportError: validate runs first and needs
+                # nothing from the dialect.
+                with self.assertRaises(NotImplementedError) as ctx:
+                    fresh.generate_ktir("k", [LoopSpec(count=4, body=[])])
+                self.assertIn("counted loops", str(ctx.exception))
+                # And the derivations answer, dialect or no dialect.
+                layout, _ = fresh._solve_layout(_add_op_specs()[0].args[0], [])
+                self.assertEqual(layout.extent, (16, 512, 64))
+
+    def test_emission_is_what_needs_the_dialect(self):
+        # A *valid* request gets as far as the builder and no further.
+        with (
+            self._blocked() as fresh,
+            mock.patch(f"{_CONFIG}.sencores", 1),
+            self.assertRaises(ImportError),
+        ):
+            fresh.generate_ktir("k", _add_op_specs())
+
+
 class TestScopeStack(unittest.TestCase):
     """The lexical scope the walk carries: induction variables and live values."""
 
@@ -347,6 +664,19 @@ class TestScopeStack(unittest.TestCase):
             env.bind_produced("buf0", "inner")
             self.assertEqual(env.produced("buf0"), "inner")
         self.assertEqual(env.produced("buf0"), "outer")
+
+    def test_loops_are_outermost_first(self):
+        """What ``_levels`` zips against: only frames that carry a LoopSpec."""
+        env = ktir.ScopeStack()
+        self.assertEqual(env.loops(), [])
+        outer, inner = LoopSpec(count=2, body=[]), LoopSpec(count=256, body=[])
+        with env.scope(iv="i", loop=outer):
+            # A frame with no loop (a plain value scope) is not a level.
+            with env.scope():
+                self.assertEqual(env.loops(), [(outer, "i")])
+            with env.scope(iv="j", loop=inner):
+                self.assertEqual(env.loops(), [(outer, "i"), (inner, "j")])
+        self.assertEqual(env.loops(), [])
 
     def test_ivs_are_innermost_last(self):
         env = ktir.ScopeStack()

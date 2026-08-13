@@ -189,5 +189,121 @@ class TestInternalBufferIsThreaded(unittest.TestCase):
         )
 
 
+_EXPECTED_TILED_ADD_KTIR = """\
+#map = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+#set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 255 >= 0, d2 >= 0, -d2 + 63 >= 0)>
+#set1 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 >= 0, d2 >= 0, -d2 + 63 >= 0)>
+module {
+  func.func @ktir_tiled_add_0(%arg0: index, %arg1: index, %arg2: index) attributes {grid = [1]} {
+    %c0 = arith.constant 0 : index
+    %0 = ktdp.construct_memory_view %arg0, sizes: [2, 256, 64], strides: [16384, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<2x256x64xf16>
+    %1 = ktdp.construct_memory_view %arg1, sizes: [2, 256, 64], strides: [16384, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<2x256x64xf16>
+    %2 = ktdp.construct_memory_view %arg2, sizes: [2, 256, 64], strides: [16384, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<2x256x64xf16>
+    %c0_0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    scf.for %arg3 = %c0_0 to %c2 step %c1 {
+      %c0_1 = arith.constant 0 : index
+      %c1_2 = arith.constant 1 : index
+      %c256 = arith.constant 256 : index
+      scf.for %arg4 = %c0_1 to %c256 step %c1_2 {
+        %3 = ktdp.construct_access_tile %0[%arg3, %arg4, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<2x256x64xf16> -> !ktdp.access_tile<1x1x64xindex>
+        %4 = ktdp.load %3 : <1x1x64xindex> -> tensor<1x1x64xf16>
+        %5 = ktdp.construct_access_tile %1[%arg3, %arg4, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<2x256x64xf16> -> !ktdp.access_tile<1x1x64xindex>
+        %6 = ktdp.load %5 : <1x1x64xindex> -> tensor<1x1x64xf16>
+        %7 = tensor.empty() : tensor<1x1x64xf16>
+        %8 = linalg.add ins(%4, %6 : tensor<1x1x64xf16>, tensor<1x1x64xf16>) outs(%7 : tensor<1x1x64xf16>) -> tensor<1x1x64xf16>
+        %9 = ktdp.construct_access_tile %2[%arg3, %arg4, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<2x256x64xf16> -> !ktdp.access_tile<1x1x64xindex>
+        ktdp.store %8, %9 : tensor<1x1x64xf16>, <1x1x64xindex>
+      }
+    }
+    return
+  }
+}
+"""
+
+
+@mock.patch(f"{_CONFIG}.sencores", 1)
+@unittest.skipUnless(
+    _mlir_ktdp_available(),
+    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
+)
+class TestTiledLoopEmission(unittest.TestCase):
+    """The loop nest, emitted with ``validate``'s ``LoopSpec`` rejection bypassed.
+
+    ``validate`` still refuses ``LoopSpec``, so ``generate_ktir`` cannot reach
+    this; the walk, the derivations and the builders behind that refusal are
+    complete, and this pins what they emit.  The subscripts and view extents are
+    the ones the committed ``sum`` 1-core KTIR fixture carries
+    (``[2, 256, 64]`` strides ``[16384, 64, 1]``, tiles indexed
+    ``[%n_stick, %m, %c0]``), so what comes out is a form a consumer already
+    reads.
+    """
+
+    @staticmethod
+    def _tiled_specs():
+        """``a + b`` over one row per iteration of a two-level nest."""
+        import sympy
+
+        from torch_spyre._C import DataFormats
+        from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg
+
+        n_stick, m = sympy.symbols("n_stick m")
+        advance = 16384 * n_stick + 64 * m
+
+        def arg(name, index, is_input):
+            return TensorArg(
+                is_input=is_input,
+                arg_index=index,
+                device_dtype=DataFormats.SEN169_FP16,
+                device_size=[1, 1, 64],
+                device_coordinates=[],
+                allocation={"hbm": None},
+                name=name,
+                device_tile_advance_expr=advance,
+            )
+
+        spec = OpSpec(
+            op="add",
+            is_reduction=False,
+            iteration_space={},
+            args=[arg("arg0", 0, True), arg("arg1", 1, True), arg("buf0", 2, False)],
+            op_info={},
+            tiled_symbols=[[m], [n_stick]],  # innermost-first
+            tiled_symbol_trip_counts={m: 256, n_stick: 2},
+        )
+        return spec, LoopSpec(count=2, body=[LoopSpec(count=256, body=[spec])])
+
+    def test_two_level_nest_golden(self):
+        from torch_spyre._inductor.codegen import ktir
+
+        spec, outer = self._tiled_specs()
+        # The table validate() would return, built from the same derivations, at
+        # the nest depth the op sits at.
+        table = ktir.BufferTable()
+        levels = ktir._levels(spec, [(outer, None), (outer.body[0], None)])
+        for arg in spec.args:
+            layout, _ = ktir._solve_layout(arg, levels)
+            table.add(ktir._buffer(arg, layout, ktir._elem_types(arg)))
+
+        b = ktir.KtirBuilder.create(table)
+        with b.module(
+            "ktir_tiled_add_0", grid=[1], params=ktir._func_param_types(b, table)
+        ):
+            ktir._bind_views(b, table)
+            ktir.emit_specs(b, [outer])
+        # Pretty (non-generic) MLIR: the module verifies, terminators included.
+        self.assertEqual(b.finish(), _EXPECTED_TILED_ADD_KTIR)
+
+    def test_generate_ktir_still_refuses_the_loop(self):
+        """The guard the test above bypasses is still in place."""
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        _, outer = self._tiled_specs()
+        with self.assertRaises(NotImplementedError) as ctx:
+            generate_ktir("ktir_tiled_add_0", [outer])
+        self.assertIn("counted loops", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

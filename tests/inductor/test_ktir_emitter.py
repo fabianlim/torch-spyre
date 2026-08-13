@@ -15,7 +15,7 @@
 """Golden-text snapshot tests for the OpSpec->KTIR emitter (``generate_ktir``).
 
 **Everything in this file needs the ``mlir_ktdp`` dialect build and is skipped
-without it.**  The emitter's *rejections* need no dialect -- ``ktir.validate``
+without it.**  The emitter's *rejections* need no dialect -- the plan walk
 raises them all before the lazy import -- so they live in
 ``test_ktir_validate.py``, which is never skipped and which owns the shared
 ``_add_op_specs`` fixture.
@@ -229,20 +229,25 @@ module {
     "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
 )
 class TestTiledLoopEmission(unittest.TestCase):
-    """The loop nest, emitted with ``validate``'s ``LoopSpec`` rejection bypassed.
+    """A two-level nest, planned and emitted through the ordinary path.
 
-    ``validate`` still refuses ``LoopSpec``, so ``generate_ktir`` cannot reach
-    this; the walk, the derivations and the builders behind that refusal are
-    complete, and this pins what they emit.  The subscripts and view extents are
-    the ones the committed ``sum`` 1-core KTIR fixture carries
-    (``[2, 256, 64]`` strides ``[16384, 64, 1]``, tiles indexed
-    ``[%n_stick, %m, %c0]``), so what comes out is a form a consumer already
-    reads.
+    ``generate_ktir`` refuses a ``LoopSpec``, so what this changes is one
+    argument: the plan is built with ``counted_loops='walk'`` instead of the
+    default ``'reject'``.  Everything after that -- the plan, the func signature,
+    the views, the walk, the builders -- is what an add over a nest emits today.
+    The subscripts and view extents are the ones the committed ``sum`` 1-core
+    KTIR fixture carries (``[2, 256, 64]`` strides ``[16384, 64, 1]``, tiles
+    indexed ``[%n_stick, %m, %c0]``), so what comes out is a form a consumer
+    already reads.
     """
 
     @staticmethod
-    def _tiled_specs():
-        """``a + b`` over one row per iteration of a two-level nest."""
+    def _tiled_nest():
+        """``a + b`` over one row per iteration of a two-level nest.
+
+        The nest is the whole kernel contract: the op sits in the inner body, so
+        it is reached by walking, not by being handed out separately.
+        """
         import sympy
 
         from torch_spyre._C import DataFormats
@@ -272,37 +277,46 @@ class TestTiledLoopEmission(unittest.TestCase):
             tiled_symbols=[[m], [n_stick]],  # innermost-first
             tiled_symbol_trip_counts={m: 256, n_stick: 2},
         )
-        return spec, LoopSpec(count=2, body=[LoopSpec(count=256, body=[spec])])
+        return LoopSpec(count=2, body=[LoopSpec(count=256, body=[spec])])
 
     def test_two_level_nest_golden(self):
         from torch_spyre._inductor.codegen import ktir
 
-        spec, outer = self._tiled_specs()
-        # The table validate() would return, built from the same derivations, at
-        # the nest depth the op sits at.
-        table = ktir.BufferTable()
-        levels = ktir._levels(spec, [(outer, None), (outer.body[0], None)])
-        for arg in spec.args:
-            layout, _ = ktir._solve_layout(arg, levels)
-            table.add(ktir._buffer(arg, layout, ktir._elem_types(arg)))
-
-        b = ktir.KtirBuilder.create(table)
+        nest = self._tiled_nest()
+        # The plan walk descends the nest and plans each buffer at the depth its
+        # op sits at: the extents below are what the two levels walk over.
+        plan = ktir.build_buffer_plan([nest], counted_loops="walk")
+        b = ktir.KtirBuilder.create(plan)
         with b.module(
-            "ktir_tiled_add_0", grid=[1], params=ktir._func_param_types(b, table)
+            "ktir_tiled_add_0", grid=[1], params=ktir._func_param_types(b, plan)
         ):
-            ktir._bind_views(b, table)
-            ktir.emit_specs(b, [outer])
+            ktir._bind_views(b, plan)
+            ktir.emit_specs(b, [nest])
         # Pretty (non-generic) MLIR: the module verifies, terminators included.
         self.assertEqual(b.finish(), _EXPECTED_TILED_ADD_KTIR)
 
-    def test_generate_ktir_still_refuses_the_loop(self):
-        """The guard the test above bypasses is still in place."""
-        from torch_spyre._inductor.codegen.ktir import generate_ktir
+    def test_plan_walk_grows_the_views_out_of_the_tile(self):
+        """The buffer extents in the golden, read off the plan the walk built."""
+        from torch_spyre._inductor.codegen import ktir
 
-        _, outer = self._tiled_specs()
+        plan = ktir.build_buffer_plan([self._tiled_nest()], counted_loops="walk")
+        self.assertEqual([b.buf_id for b in plan.parameters], ["arg0", "arg1", "buf0"])
+        for buffer in plan.parameters:
+            with self.subTest(buf_id=buffer.buf_id):
+                self.assertEqual(buffer.layout.extent, (2, 256, 64))
+                self.assertEqual(buffer.layout.strides, (16384, 64, 1))
+
+    def test_generate_ktir_still_refuses_the_loop(self):
+        """The default mode, which is the one ``generate_ktir`` asks for."""
+        from torch_spyre._inductor.codegen import ktir
+
+        nest = self._tiled_nest()
         with self.assertRaises(NotImplementedError) as ctx:
-            generate_ktir("ktir_tiled_add_0", [outer])
+            ktir.generate_ktir("ktir_tiled_add_0", [nest])
         self.assertIn("counted loops", str(ctx.exception))
+        # Same refusal from the plan walk itself, at its default mode.
+        with self.assertRaises(NotImplementedError):
+            ktir.build_buffer_plan([nest])
 
 
 if __name__ == "__main__":

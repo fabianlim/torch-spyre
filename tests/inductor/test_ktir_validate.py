@@ -15,9 +15,9 @@
 """Dialect-free tests for the OpSpec->KTIR emitter's *rejections*.
 
 **Nothing in this file imports ``mlir_ktdp``, directly or transitively, and
-nothing in it is skipped.**  That is the property ``ktir.validate`` exists to
-provide: every ``NotImplementedError`` the emitter can raise is raised by a pure
-walk over the spec tree, before the lazy dialect import, so the whole rejection
+nothing in it is skipped.**  That is the property ``ktir.build_buffer_plan``
+exists to provide: every ``NotImplementedError`` the emitter can raise is raised
+by a pure walk over the spec tree, before the lazy dialect import, so the whole rejection
 surface is covered wherever ``import torch_spyre`` works.
 
 ``test_ktir_emitter.py`` holds the complement -- the golden MLIR snapshots, which
@@ -95,7 +95,7 @@ def _baked_add_op_specs() -> list:
 # multi-core guard, which would otherwise come first on the default SENCORES=32.
 @mock.patch(f"{_CONFIG}.sencores", 1)
 class TestValidateRejections(unittest.TestCase):
-    """One test per rejection ``validate`` is responsible for.
+    """One test per rejection ``build_buffer_plan`` is responsible for.
 
     Each asserts the exception type and a distinguishing fragment of the
     message, so a rejection cannot silently turn into a different rejection.
@@ -103,7 +103,7 @@ class TestValidateRejections(unittest.TestCase):
 
     def _rejects(self, specs, fragment, **options):
         with self.assertRaises(NotImplementedError) as ctx:
-            ktir.validate(specs, **options)
+            ktir.build_buffer_plan(specs, **options)
         self.assertIn(fragment, str(ctx.exception))
 
     # -- whole-request capability ------------------------------------------
@@ -218,41 +218,39 @@ class TestRejectionsThroughGenerateKtir(unittest.TestCase):
 
 @mock.patch(f"{_CONFIG}.sencores", 1)
 class TestBufferTable(unittest.TestCase):
-    """What ``validate`` returns: the func signature, before any emission."""
+    """What ``build_buffer_plan`` returns: the func signature, before any emission."""
 
     def test_param_entries_are_ordered_by_arg_index(self):
         specs = _add_op_specs()
         # Registration order (spec.args) is 0, 1, 2; shuffle it so the sort is
         # doing the work rather than agreeing with insertion order by luck.
         specs[0].args = [specs[0].args[2], specs[0].args[0], specs[0].args[1]]
-        table = ktir.validate(specs)
-        self.assertEqual([e.arg_index for e in table.param_entries], [0, 1, 2])
-        self.assertEqual(
-            [e.buf_id for e in table.param_entries], ["arg0", "arg1", "buf0"]
-        )
-        # The table holds the derived records, so the buffer's extent and its
+        plan = ktir.build_buffer_plan(specs)
+        self.assertEqual([e.arg_index for e in plan.parameters], [0, 1, 2])
+        self.assertEqual([e.buf_id for e in plan.parameters], ["arg0", "arg1", "buf0"])
+        # The plan holds the derived records, so the buffer's extent and its
         # row-major strides are readable here rather than only in the MLIR.
-        self.assertEqual(table.param_entries[0].layout.extent, (16, 512, 64))
-        self.assertEqual(table.param_entries[0].layout.strides, (32768, 64, 1))
+        self.assertEqual(plan.parameters[0].layout.extent, (16, 512, 64))
+        self.assertEqual(plan.parameters[0].layout.strides, (32768, 64, 1))
 
     def test_symbolic_form_resolves_no_base_addresses(self):
-        table = ktir.validate(_add_op_specs())
+        plan = ktir.build_buffer_plan(_add_op_specs())
         # Every 'hbm' address in the fixture is None and never read: the bases
         # are func arguments.
-        self.assertEqual([e.base_elements for e in table.param_entries], [None] * 3)
+        self.assertEqual([e.base_elements for e in plan.parameters], [None] * 3)
 
     def test_baked_form_resolves_bases_in_elements(self):
-        table = ktir.validate(_baked_add_op_specs(), bake_addresses=True)
+        plan = ktir.build_buffer_plan(_baked_add_op_specs(), bake_addresses=True)
         # fp16: 2 bytes per element, so the byte slot halves.
         self.assertEqual(
-            [e.base_elements for e in table.param_entries],
+            [e.base_elements for e in plan.parameters],
             [0, (1 << 34) // 2, (2 << 34) // 2],
         )
 
     def test_repeated_buffer_is_registered_once(self):
         specs = _add_op_specs() + _add_op_specs()
-        table = ktir.validate(specs)
-        self.assertEqual(len(table.buffers), 3)
+        plan = ktir.build_buffer_plan(specs)
+        self.assertEqual(len(plan.buffers), 3)
 
 
 class TestBaseAddressElements(unittest.TestCase):
@@ -323,7 +321,7 @@ class TestRecipes(unittest.TestCase):
 
     def test_family_comes_from_the_spec_not_the_name(self):
         """A reducing spec asks for REDUCTION even when the op is registered
-        elementwise -- which is why validate rejects it rather than the walk
+        elementwise -- which is why the plan walk rejects it rather than the walk
         silently emitting the wrong shape."""
         spec = _add_op_specs()[0]
         self.assertIs(ktir.Family.of(spec), ktir.Family.ELEMENTWISE)
@@ -347,8 +345,10 @@ def _tiled_reduction_specs() -> tuple:
 
         a: 16384*n_stick + 64*m     c: 64*n_stick
 
-    Returns ``(spec, levels)``, where ``levels`` carries a placeholder induction
-    variable per level (the derivations only pass it through).
+    Returns ``(spec, loops)``: the op, and the ``(LoopSpec, induction variable)``
+    chain the walk would reach it with.  The chain is read off one real nest, so
+    the trip counts the derivations see are the nest's own; the induction
+    variables stand in for SSA values, which the derivations only pass through.
     """
     n_stick, m = sympy.symbols("n_stick m")
 
@@ -377,18 +377,15 @@ def _tiled_reduction_specs() -> tuple:
         tiled_symbols=[[m], [n_stick]],
         tiled_symbol_trip_counts={m: 256, n_stick: 2},
     )
-    loops = [
-        (LoopSpec(count=2, body=[]), "%n_stick"),
-        (LoopSpec(count=256, body=[]), "%m"),
-    ]
-    return spec, loops
+    nest = LoopSpec(count=2, body=[LoopSpec(count=256, body=[spec])])
+    return spec, [(nest, "%n_stick"), (nest.body[0], "%m")]
 
 
 class TestLoopDerivations(unittest.TestCase):
     """``_levels`` / ``_solve_layout`` / ``_access`` against the ``sum`` fixture.
 
-    ``validate`` still rejects ``LoopSpec``, so no emission reaches these numbers
-    yet; they are pinned against a KTIR file that a scheduler already consumes,
+    ``generate_ktir`` still rejects a ``LoopSpec``, so no emission reaches these
+    numbers yet; they are pinned against a KTIR file that a scheduler already consumes,
     so enabling loops is a matter of dropping that rejection rather than of
     working out what the loop form should be.
     """
@@ -535,7 +532,7 @@ class TestStatusTable(unittest.TestCase):
             ktir.status_of("no-such-capability")
 
     def test_every_guard_label_has_a_row(self):
-        """A guard raises with a label; the label must be in the table."""
+        """A guard raises with a label; the label must be in the status table."""
         for label in ("dynamic-view-extent", "symbolic-loop-count"):
             with self.subTest(label=label):
                 self.assertIs(
@@ -627,8 +624,8 @@ class TestWithoutTheDialectBuild(unittest.TestCase):
         with self._blocked() as fresh:
             self.assertFalse(fresh.dialect_available())
             with mock.patch(f"{_CONFIG}.sencores", 1):
-                # A rejection, not an ImportError: validate runs first and needs
-                # nothing from the dialect.
+                # A rejection, not an ImportError: the plan walk runs first and
+                # needs nothing from the dialect.
                 with self.assertRaises(NotImplementedError) as ctx:
                     fresh.generate_ktir("k", [LoopSpec(count=4, body=[])])
                 self.assertIn("counted loops", str(ctx.exception))
@@ -691,7 +688,7 @@ class TestScopeStack(unittest.TestCase):
 class TestNoModuleLevelDialectImport(unittest.TestCase):
     """The property this whole file depends on, asserted rather than assumed.
 
-    ``ktir`` must not import ``mlir_ktdp`` at module level, or ``validate`` --
+    ``ktir`` must not import ``mlir_ktdp`` at module level, or the plan walk --
     and every test above -- becomes unrunnable without the dialect build.
     """
 

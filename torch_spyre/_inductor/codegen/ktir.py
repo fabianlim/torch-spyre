@@ -55,7 +55,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 from collections.abc import Callable, Iterator, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from torch_spyre._C import DataFormats
 from torch_spyre._inductor import config as _spyre_config
@@ -66,6 +66,58 @@ from torch_spyre._inductor.codegen.opspec_utils import (
     _row_major_strides,
 )
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
+
+# The dialect handles.  Modules are singletons in sys.modules, so they are held
+# here rather than threaded through KtirBuilder: one name per dialect, bound once
+# by _load_dialects().
+#
+# Under TYPE_CHECKING these are the real imports, which is what gives `ir.Module`
+# and `arith.AddFOp` their types.  At runtime the block does not execute, so
+# importing this module needs no dialect build -- `validate` stays usable without
+# one -- and the names are None until _load_dialects() runs.
+if TYPE_CHECKING:
+    from mlir_ktdp import ir
+    from mlir_ktdp.dialects import arith, func, ktdp, linalg, scf, tensor
+else:
+    ir = arith = func = ktdp = linalg = scf = tensor = None
+
+
+def _load_dialects() -> None:
+    """Bind the dialect handles into this module, once.  The only import site."""
+    global ir, arith, func, ktdp, linalg, scf, tensor
+    if ir is not None:
+        return
+    from mlir_ktdp import ir as _ir
+    from mlir_ktdp.dialects import arith as _arith
+    from mlir_ktdp.dialects import func as _func
+    from mlir_ktdp.dialects import ktdp as _ktdp
+    from mlir_ktdp.dialects import linalg as _linalg
+    from mlir_ktdp.dialects import scf as _scf
+    from mlir_ktdp.dialects import tensor as _tensor
+
+    ir, arith, func, ktdp, linalg, scf, tensor = (
+        _ir,
+        _arith,
+        _func,
+        _ktdp,
+        _linalg,
+        _scf,
+        _tensor,
+    )
+
+
+def dialect_available() -> bool:
+    """True when the bindings the emitter needs are importable.
+
+    Asked of this module rather than reimplemented by callers, so the import list
+    exists in exactly one place and cannot drift.
+    """
+    try:
+        _load_dialects()
+    except ImportError:
+        return False
+    return True
+
 
 # Supported device dtype -> the *name* of the ``mlir_ktdp.ir`` type builder for
 # it.  Names, not builder references, so this table stays importable without the
@@ -365,9 +417,9 @@ def emit_loop(b: KtirBuilder, loop: LoopSpec) -> None:
     """
     lo, step = b.icst_index(0), b.icst_index(1)
     hi = b.trip_count(loop.count)  # int today; sympy later
-    for_op = b.scf.ForOp(lo, hi, step)
+    for_op = scf.ForOp(lo, hi, step)
     with (
-        b.ir.InsertionPoint(for_op.body),
+        ir.InsertionPoint(for_op.body),
         b.env.scope(iv=for_op.induction_variable),
     ):
         emit_specs(b, loop.body)  # the recursion point
@@ -425,14 +477,7 @@ class KtirBuilder:
     sites.
     """
 
-    def __init__(self, ir, arith, func, ktdp, linalg, scf, tensor, addrs, stack):
-        self.ir = ir
-        self.arith = arith
-        self.func = func
-        self.ktdp = ktdp
-        self.linalg = linalg
-        self.scf = scf
-        self.tensor = tensor
+    def __init__(self, addrs, stack):
         self.addrs = addrs
         self._stack = stack
         self.env = ScopeStack()
@@ -454,15 +499,14 @@ class KtirBuilder:
         ``AddressSource.func_param_types`` builds ``ir`` types and is called
         before the module is opened; ``module()`` closes it on the way out.
         """
-        from mlir_ktdp import ir
-        from mlir_ktdp.dialects import arith, func, ktdp, linalg, scf, tensor
+        _load_dialects()
 
         stack = contextlib.ExitStack()
         try:
             ctx = stack.enter_context(ir.Context())
             stack.enter_context(ir.Location.unknown())
             ktdp.register_dialects(ctx)
-            return cls(ir, arith, func, ktdp, linalg, scf, tensor, addrs, stack)
+            return cls(addrs, stack)
         except BaseException:
             stack.close()
             raise
@@ -475,11 +519,11 @@ class KtirBuilder:
 
     def elt_type(self, dtype: DataFormats):
         """The ``ir`` element type for a Spyre device dtype (validated already)."""
-        return getattr(self.ir, _MLIR_ELT_TYPE_NAMES[dtype]).get()
+        return getattr(ir, _MLIR_ELT_TYPE_NAMES[dtype]).get()
 
     def icst_index(self, value: int):
         """A fresh ``arith.constant <value> : index``."""
-        return self.val(self.arith.ConstantOp(self.index_t, int(value)))
+        return self.val(arith.ConstantOp(self.index_t, int(value)))
 
     def trip_count(self, count):
         """``count`` as an index SSA value. ``int`` today; sympy later."""
@@ -500,11 +544,10 @@ class KtirBuilder:
     @contextlib.contextmanager
     def module(self, kernel_name: str, grid: list[int], params: list) -> Iterator[None]:
         """Open ``module { func.func @kernel_name(params) }`` and emit into it."""
-        ir = self.ir
         try:
-            module = self.ir.Module.create()
+            module = ir.Module.create()
             with ir.InsertionPoint(module.body):
-                fn = self.func.FuncOp(kernel_name, ir.FunctionType.get(params, []))
+                fn = func.FuncOp(kernel_name, ir.FunctionType.get(params, []))
                 i64 = ir.IntegerType.get_signless(64)
                 fn.attributes["grid"] = ir.ArrayAttr.get(
                     [ir.IntegerAttr.get(i64, int(g)) for g in grid]
@@ -514,7 +557,7 @@ class KtirBuilder:
                 with ir.InsertionPoint(block):
                     self.c0 = self.icst_index(0)
                     yield
-                    self.func.ReturnOp([])
+                    func.ReturnOp([])
             # Printed while the context is still alive.
             self._text = str(module)
         finally:
@@ -530,7 +573,6 @@ class KtirBuilder:
 
     def memory_view(self, base, entry: BufferEntry):
         """``ktdp.construct_memory_view`` for one buffer, at base address ``base``."""
-        ir = self.ir
         sizes = list(entry.sizes)
         strides = _row_major_strides(sizes)
         memref_t = ir.MemRefType.get(sizes, self.elt_type(entry.dtype))
@@ -540,7 +582,7 @@ class KtirBuilder:
         memory_space = ir.Attribute.parse("#ktdp.spyre_memory_space<HBM>")
         # All extents are static -> empty dynamic size/stride operand lists.
         return self.val(
-            self.ktdp.construct_memory_view(
+            ktdp.construct_memory_view(
                 memref_t,
                 base,
                 [],
@@ -560,12 +602,11 @@ class KtirBuilder:
 
     def access_tile(self, view, sizes: list[int], offsets: list):
         """``ktdp.construct_access_tile`` at ``offsets`` into ``view``."""
-        ir = self.ir
         rank = len(sizes)
-        at_t = self.ktdp.AccessTileType.get(sizes, ir.IndexType.get())
+        at_t = ktdp.AccessTileType.get(sizes, ir.IndexType.get())
         identity = ir.AffineMapAttr.get(ir.AffineMap.get_identity(rank))
         return self.val(
-            self.ktdp.construct_access_tile(
+            ktdp.construct_access_tile(
                 at_t,
                 view,
                 identity,
@@ -589,15 +630,15 @@ class KtirBuilder:
     def load(self, arg: TensorArg):
         """An access tile + ``ktdp.load`` for an input ``arg``."""
         sizes = [int(s) for s in arg.device_size]
-        tensor_t = self.ir.RankedTensorType.get(sizes, self.elt_type(arg.device_dtype))
+        tensor_t = ir.RankedTensorType.get(sizes, self.elt_type(arg.device_dtype))
         tile = self.access_tile(self.view(arg), sizes, self.zero_offsets(len(sizes)))
-        return self.val(self.ktdp.load(tensor_t, tile))
+        return self.val(ktdp.load(tensor_t, tile))
 
     def store_to(self, arg: TensorArg, value) -> None:
         """An access tile + ``ktdp.store`` of ``value`` into output ``arg``."""
         sizes = [int(s) for s in arg.device_size]
         tile = self.access_tile(self.view(arg), sizes, self.zero_offsets(len(sizes)))
-        self.ktdp.store(value, tile)
+        ktdp.store(value, tile)
 
     def pointwise(self, op: str, ins, out: TensorArg):
         """The compute op for ``op``. Spelled by the address form (see #65)."""
@@ -612,7 +653,6 @@ class KtirBuilder:
         round-trip): for each dim ``i`` two inequalities ``d_i >= 0`` and
         ``-d_i + (size_i - 1) >= 0``, matching the ``affine_set`` MLIR prints.
         """
-        ir = self.ir
         exprs = []
         eq_flags: list[bool] = []
         for i, s in enumerate(sizes):
@@ -663,9 +703,9 @@ class BakedConstants:
         """``linalg`` named op over an uninitialised ``tensor.empty`` out."""
         out_extents = [int(s) for s in out.device_size]
         elt_t = b.elt_type(out.device_dtype)
-        tensor_t = b.ir.RankedTensorType.get(out_extents, elt_t)
-        empty = b.val(b.tensor.EmptyOp(out_extents, elt_t))
-        builder = getattr(b.linalg, REGISTRY[op].linalg_builder)
+        tensor_t = ir.RankedTensorType.get(out_extents, elt_t)
+        empty = b.val(tensor.EmptyOp(out_extents, elt_t))
+        builder = getattr(linalg, REGISTRY[op].linalg_builder)
         return b.val(builder(*ins, outs=[empty], result_tensors=[tensor_t]))
 
 
@@ -684,7 +724,7 @@ class FuncArgAddresses:
             b.bind_view(entry.buf_id, b.memory_view(base, entry))
 
     def pointwise(self, b: KtirBuilder, op: str, ins, out: TensorArg):
-        return b.val(getattr(b.arith, REGISTRY[op].arith_builder)(*ins))
+        return b.val(getattr(arith, REGISTRY[op].arith_builder)(*ins))
 
 
 AddressSource = BakedConstants | FuncArgAddresses

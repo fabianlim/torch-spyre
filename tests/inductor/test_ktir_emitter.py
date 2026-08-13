@@ -32,25 +32,16 @@ _CONFIG = "torch_spyre._inductor.config"
 
 
 def _mlir_ktdp_available() -> bool:
-    """True when mlir_ktdp is built with every dialect binding the emitter uses.
+    """Whether this build can emit, asked of the emitter rather than guessed.
 
-    ``KtirBuilder.create`` is a single import site covering both address forms,
-    so the availability question is likewise a single one: a build that exposes
-    ktdp but not linalg/scf/tensor is not a build this emitter runs on.
+    The import list belongs to ``KtirBuilder.create``; duplicating it here is how
+    the two drift, and a build missing one binding would then error instead of
+    skipping.  ``ktir`` imports without a dialect build, so this is safe at
+    module scope.
     """
-    try:
-        from mlir_ktdp import ir  # noqa: F401
-        from mlir_ktdp.dialects import (  # noqa: F401
-            arith,
-            func,
-            ktdp,
-            linalg,
-            scf,
-            tensor,
-        )
-    except ImportError:
-        return False
-    return True
+    from torch_spyre._inductor.codegen.ktir import dialect_available
+
+    return dialect_available()
 
 
 # The canonical KTIR text ``generate_ktir`` emits for a single pointwise ``add``

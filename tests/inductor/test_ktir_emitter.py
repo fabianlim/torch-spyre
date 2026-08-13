@@ -44,9 +44,21 @@ def _mlir_ktdp_available() -> bool:
     return dialect_available()
 
 
-# The canonical KTIR text ``generate_ktir`` emits for a single pointwise ``add``
-# over a [512, 1024] fp16 tensor stickified to device shape [16, 512, 64].
-_EXPECTED_ADD_KTIR = """\
+# ``sencores`` is pinned to the single core the emitted grid hardcodes.  The
+# address form is an argument to generate_ktir, not a patched global.
+@mock.patch(f"{_CONFIG}.sencores", 1)
+@unittest.skipUnless(
+    _mlir_ktdp_available(),
+    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
+)
+class TestKtirEmitter(unittest.TestCase):
+    """The flat, untiled form: one pointwise add over a whole [16, 512, 64]
+    device tile, which is what the frontend produces today."""
+
+    # The canonical KTIR text ``generate_ktir`` emits for a single pointwise
+    # ``add`` over a [512, 1024] fp16 tensor stickified to device shape
+    # [16, 512, 64].
+    EXPECTED_ADD_KTIR = """\
 #map = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
 #set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 15 >= 0, d1 >= 0, -d1 + 511 >= 0, d2 >= 0, -d2 + 63 >= 0)>
 module {
@@ -68,20 +80,11 @@ module {
 }
 """
 
-
-# ``sencores`` is pinned to the single core the emitted grid hardcodes.  The
-# address form is an argument to generate_ktir, not a patched global.
-@mock.patch(f"{_CONFIG}.sencores", 1)
-@unittest.skipUnless(
-    _mlir_ktdp_available(),
-    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
-)
-class TestKtirEmitter(unittest.TestCase):
     def test_pointwise_add_golden(self):
         from torch_spyre._inductor.codegen.ktir import generate_ktir
 
         emitted = generate_ktir("ktir_fused_add_0", _add_op_specs())
-        self.assertEqual(emitted, _EXPECTED_ADD_KTIR)
+        self.assertEqual(emitted, self.EXPECTED_ADD_KTIR)
 
     def test_registered_ops_reach_their_own_binding(self):
         """A second op costs one recipe: same shape, different linalg builder.
@@ -102,7 +105,7 @@ class TestKtirEmitter(unittest.TestCase):
             emitted.replace("linalg.mul", "linalg.add").replace(
                 "@ktir_fused_mul_0", "@ktir_fused_add_0"
             ),
-            _EXPECTED_ADD_KTIR,
+            self.EXPECTED_ADD_KTIR,
         )
 
 
@@ -113,7 +116,7 @@ class TestKtirEmitter(unittest.TestCase):
 )
 class TestKtirBakedAddresses(unittest.TestCase):
     def test_baked_form_deltas(self):
-        """The baked form (dataflow-scheduler#65) vs ``_EXPECTED_ADD_KTIR``.
+        """The baked form (#65) vs ``TestKtirEmitter.EXPECTED_ADD_KTIR``.
 
         Asserted as deltas rather than a second golden: the two texts differ
         only in how base addresses are spelled, so a full copy would duplicate
@@ -135,7 +138,7 @@ class TestKtirBakedAddresses(unittest.TestCase):
                 base = (arg_index << 34) // 2
                 self.assertIn(f"arith.constant {base} : index", emitted)
         # Compute is deliberately NOT asserted here: both forms emit the same
-        # linalg.add over a tensor.empty, so it is pinned by _EXPECTED_ADD_KTIR
+        # linalg.add over a tensor.empty, so it is pinned by the symbolic golden
         # and is not a delta.  The two texts now differ only in addressing.
 
 
@@ -189,7 +192,25 @@ class TestInternalBufferIsThreaded(unittest.TestCase):
         )
 
 
-_EXPECTED_TILED_ADD_KTIR = """\
+@mock.patch(f"{_CONFIG}.sencores", 1)
+@unittest.skipUnless(
+    _mlir_ktdp_available(),
+    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
+)
+class TestTiledLoopEmission(unittest.TestCase):
+    """A two-level nest, planned and emitted through the ordinary path.
+
+    ``generate_ktir`` refuses a ``LoopSpec``, so what this changes is one
+    argument: the plan is built with ``counted_loops='walk'`` instead of the
+    default ``'reject'``.  Everything after that -- the plan, the func signature,
+    the views, the walk, the builders -- is what an add over a nest emits today.
+    The subscripts and view extents are the ones the committed ``sum`` 1-core
+    KTIR fixture carries (``[2, 256, 64]`` strides ``[16384, 64, 1]``, tiles
+    indexed ``[%n_stick, %m, %c0]``), so what comes out is a form a consumer
+    already reads.
+    """
+
+    EXPECTED_TILED_ADD_KTIR = """\
 #map = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
 #set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 255 >= 0, d2 >= 0, -d2 + 63 >= 0)>
 #set1 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 >= 0, d2 >= 0, -d2 + 63 >= 0)>
@@ -221,25 +242,6 @@ module {
   }
 }
 """
-
-
-@mock.patch(f"{_CONFIG}.sencores", 1)
-@unittest.skipUnless(
-    _mlir_ktdp_available(),
-    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
-)
-class TestTiledLoopEmission(unittest.TestCase):
-    """A two-level nest, planned and emitted through the ordinary path.
-
-    ``generate_ktir`` refuses a ``LoopSpec``, so what this changes is one
-    argument: the plan is built with ``counted_loops='walk'`` instead of the
-    default ``'reject'``.  Everything after that -- the plan, the func signature,
-    the views, the walk, the builders -- is what an add over a nest emits today.
-    The subscripts and view extents are the ones the committed ``sum`` 1-core
-    KTIR fixture carries (``[2, 256, 64]`` strides ``[16384, 64, 1]``, tiles
-    indexed ``[%n_stick, %m, %c0]``), so what comes out is a form a consumer
-    already reads.
-    """
 
     @staticmethod
     def _tiled_nest():
@@ -287,13 +289,10 @@ class TestTiledLoopEmission(unittest.TestCase):
         # op sits at: the extents below are what the two levels walk over.
         plan = ktir.build_buffer_plan([nest], counted_loops="walk")
         b = ktir.KtirBuilder.create(plan)
-        with b.module(
-            "ktir_tiled_add_0", grid=[1], params=ktir._func_param_types(b, plan)
-        ):
-            ktir._bind_views(b, plan)
+        with b.open_kernel("ktir_tiled_add_0", plan):
             ktir.emit_specs(b, [nest])
         # Pretty (non-generic) MLIR: the module verifies, terminators included.
-        self.assertEqual(b.finish(), _EXPECTED_TILED_ADD_KTIR)
+        self.assertEqual(b.finish(), self.EXPECTED_TILED_ADD_KTIR)
 
     def test_plan_walk_grows_the_views_out_of_the_tile(self):
         """The buffer extents in the golden, read off the plan the walk built."""

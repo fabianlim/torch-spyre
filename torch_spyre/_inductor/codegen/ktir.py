@@ -835,18 +835,32 @@ def _buffer(
 class BufferPlan:
     """Unique ``Buffer`` records in first-seen order, keyed by ``buf_id``.
 
-    A container of records: it reads no ``TensorArg``, and ``_buffer`` is what
-    turns one into an entry.  Carries the address form because that is what
-    ``_buffer`` needs to resolve a base.
+    Fills itself from a spec tree: ``add_specs`` is the walk, so the buffers, the
+    address form and the walk that produces them are one object rather than a
+    dict threaded through free functions.  Filling it is what runs the
+    derivations, so it is also where every ``NotImplementedError`` the emitter
+    can raise comes from.
+
+    ``counted_loops`` selects what a ``LoopSpec`` does, the way ``_layout``'s
+    ``symbolic_extent`` selects an extent mode: ``'reject'`` (the default, and
+    what ``generate_ktir`` asks for) refuses the nest, ``'walk'`` descends into
+    it and plans each buffer at its real depth.  The walk, the derivations and
+    the builders behind the refusal are complete; ``'walk'`` is what an emission
+    of a nest is planned with while loops are not enabled end to end.
     """
 
-    def __init__(self, *, bake_addresses: bool = False) -> None:
+    MODES: ClassVar[tuple[str, ...]] = ("reject", "walk")
+
+    def __init__(
+        self, *, bake_addresses: bool = False, counted_loops: str = "reject"
+    ) -> None:
+        if counted_loops not in self.MODES:
+            raise ValueError(
+                f"OpSpec->KTIR: unknown counted_loops mode {counted_loops!r}"
+            )
         self.buffers: dict[str, Buffer] = {}
         self.bake_addresses = bake_addresses
-
-    def add(self, buffer: Buffer) -> None:
-        """Register ``buffer``, keeping the first record seen for its ``buf_id``."""
-        self.buffers.setdefault(buffer.buf_id, buffer)
+        self.counted_loops = counted_loops
 
     @property
     def parameters(self) -> list[Buffer]:
@@ -860,6 +874,84 @@ class BufferPlan:
             (e for e in self.buffers.values() if e.arg_index >= 0),
             key=lambda e: e.arg_index,
         )
+
+    def add_specs(self, specs, loops: Sequence = ()) -> None:
+        """Recursive: plan one spec list.  Mirrors ``emit_specs``' structure.
+
+        ``loops`` is the enclosing ``(LoopSpec, induction variable)`` chain, the
+        same value ``emit_specs`` reaches an op with, except that no induction
+        variable exists outside an emission and every entry's is ``None``.  The
+        derivations read only ``LoopSpec.count`` and the level ordering, so they
+        answer the same here as they do at emit time.
+        """
+        for entry in specs:
+            if isinstance(entry, UnimplementedOp):
+                raise NotImplementedError(
+                    f"OpSpec->KTIR: unimplemented op {entry.op!r}"
+                )
+            if isinstance(entry, LoopSpec):
+                if self.counted_loops == "reject":
+                    raise NotImplementedError(
+                        "OpSpec->KTIR: counted loops (LoopSpec) are not supported yet"
+                    )
+                self.add_specs(entry.body, [*loops, (entry, None)])
+                continue
+            if not isinstance(entry, OpSpec):
+                raise NotImplementedError(
+                    f"OpSpec->KTIR: unexpected spec entry {type(entry).__name__}"
+                )
+            if entry.is_reduction:
+                raise NotImplementedError(
+                    "OpSpec->KTIR: reductions are not supported yet"
+                )
+            if entry.op not in KtirBuilder.RECIPES:
+                raise NotImplementedError(
+                    f"OpSpec->KTIR: op {entry.op!r} is not supported yet "
+                    f"(registered: {sorted(KtirBuilder.RECIPES)})"
+                )
+            self._add_op(entry, loops)
+
+    def _add_op(self, spec: OpSpec, loops: Sequence) -> None:
+        """One op: roles/arity, in-place aliasing, operand alignment, buffers.
+
+        The buffer records are built by the same derivations the emission path
+        calls, so every raise those derivations own is reached before the dialect
+        is imported, and the plan cannot describe a buffer differently from the
+        view that gets emitted for it.
+        """
+        out, inputs = validated_roles(spec)
+        out_extents = [int(s) for s in out.device_size]
+        for arg in inputs:
+            # In-place (input buffer aliases the output) is not supported yet.
+            if _buf_id(arg) == _buf_id(out):
+                raise NotImplementedError(
+                    "OpSpec->KTIR: in-place ops (input aliases output) not supported"
+                )
+            # Reject broadcast / transpose operands: only operands whose device
+            # axes already match the output tile exactly are supported.
+            if (
+                _align_reshape_plan(
+                    list(arg.device_coordinates),
+                    [int(s) for s in arg.device_size],
+                    list(out.device_coordinates),
+                    out_extents,
+                )
+                is not None
+            ):
+                raise NotImplementedError(
+                    "OpSpec->KTIR: broadcast / reshape operands not supported yet"
+                )
+        levels = _levels(spec, loops)
+        for arg in spec.args:
+            layout, _ = _solve_layout(arg, levels)
+            elems = _elem_types(arg)
+            # An internal buffer never reaches memory: no func parameter, no
+            # memory view, no address.  It is threaded as a value instead, so it
+            # gets no entry here.
+            if is_internal(arg):
+                continue
+            buffer = _buffer(arg, layout, elems, bake_addresses=self.bake_addresses)
+            self.buffers.setdefault(buffer.buf_id, buffer)
 
 
 def _base_address_elements(arg: TensorArg) -> int:
@@ -903,20 +995,12 @@ def build_buffer_plan(
 ) -> BufferPlan:
     """The kernel's ``BufferPlan``, and every rejection on the way to it.  Pure.
 
-    Walking the spec tree is what runs the derivations, so building the plan and
-    raising every ``NotImplementedError`` the emitter can raise are one pass, not
-    two.  Imports nothing from ``mlir_ktdp`` (the dialect import is lazy, inside
-    ``KtirBuilder.create``), so it is usable wherever ``import ktir`` works --
-    which is everywhere.  Afterwards the emission path holds no ``raise`` but the
-    ``AssertionError`` in ``emit_specs``, which only fires on a plan-walk bug.
-
-    ``counted_loops`` selects what a ``LoopSpec`` does, in the same way
-    ``_layout``'s ``symbolic_extent`` selects an extent mode: ``'reject'`` (the
-    default, and what ``generate_ktir`` asks for) refuses the nest, ``'walk'``
-    descends into it and plans the buffers at their real depth.  The walk, the
-    derivations and the builders behind the refusal are complete; ``'walk'`` is
-    what an emission of a nest is planned with while end-to-end loop support is
-    not enabled.
+    The whole-request checks live here; everything per-spec is
+    ``BufferPlan.add_specs``.  Imports nothing from ``mlir_ktdp`` (the dialect
+    import is lazy, inside ``KtirBuilder.create``), so it is usable wherever
+    ``import ktir`` works -- which is everywhere.  Afterwards the emission path
+    holds no ``raise`` but the ``AssertionError`` in ``emit_specs``, which only
+    fires on a plan bug.
     """
     # Multi-core work division is future work; the emitted grid is hard-coded to
     # a single core, so reject anything else rather than silently emitting a
@@ -926,102 +1010,11 @@ def build_buffer_plan(
             "OpSpec->KTIR: multi-core work division is not supported yet "
             f"(SENCORES={_spyre_config.sencores}, only 1 is supported)"
         )
-    if counted_loops not in ("reject", "walk"):
-        raise ValueError(f"OpSpec->KTIR: unknown counted_loops mode {counted_loops!r}")
-    plan = BufferPlan(bake_addresses=bake_addresses)
-    _plan_list(specs, plan, counted_loops=counted_loops)
+    plan = BufferPlan(bake_addresses=bake_addresses, counted_loops=counted_loops)
+    plan.add_specs(specs)
     if not plan.buffers:
         raise NotImplementedError("OpSpec->KTIR: no OpSpec to emit")
     return plan
-
-
-def _plan_list(
-    specs,
-    plan: BufferPlan,
-    loops: Sequence = (),
-    *,
-    counted_loops: str = "reject",
-) -> None:
-    """Recursive: plan one spec list. Mirrors ``emit_specs``' structure.
-
-    ``loops`` is the enclosing ``(LoopSpec, induction variable)`` chain, the same
-    value ``emit_specs`` reaches an op with, except that no induction variable
-    exists outside an emission and every entry's is ``None``.  The derivations
-    read only ``LoopSpec.count`` and the level ordering, so they answer the same
-    here as they do at emit time.
-    """
-    for entry in specs:
-        if isinstance(entry, UnimplementedOp):
-            raise NotImplementedError(f"OpSpec->KTIR: unimplemented op {entry.op!r}")
-        if isinstance(entry, LoopSpec):
-            if counted_loops == "reject":
-                raise NotImplementedError(
-                    "OpSpec->KTIR: counted loops (LoopSpec) are not supported yet"
-                )
-            _plan_list(
-                entry.body,
-                plan,
-                [*loops, (entry, None)],
-                counted_loops=counted_loops,
-            )
-            continue
-        if not isinstance(entry, OpSpec):
-            raise NotImplementedError(
-                f"OpSpec->KTIR: unexpected spec entry {type(entry).__name__}"
-            )
-        if entry.is_reduction:
-            raise NotImplementedError("OpSpec->KTIR: reductions are not supported yet")
-        if entry.op not in KtirBuilder.RECIPES:
-            raise NotImplementedError(
-                f"OpSpec->KTIR: op {entry.op!r} is not supported yet "
-                f"(registered: {sorted(KtirBuilder.RECIPES)})"
-            )
-        _plan_op(entry, plan, loops)
-
-
-def _plan_op(spec: OpSpec, plan: BufferPlan, loops: Sequence = ()) -> None:
-    """Per-op checks: roles/arity, in-place aliasing, operand alignment, buffers.
-
-    The buffer records are built here by the same derivations the emission path
-    calls, so every raise those derivations own is reached before the dialect is
-    imported and the plan cannot describe a buffer differently from the view
-    that gets emitted for it.
-    """
-    out, inputs = validated_roles(spec)
-    out_extents = [int(s) for s in out.device_size]
-    for arg in inputs:
-        # In-place (input buffer aliases the output) is not supported yet.
-        if _buf_id(arg) == _buf_id(out):
-            raise NotImplementedError(
-                "OpSpec->KTIR: in-place ops (input aliases output) not supported"
-            )
-        # Reject broadcast / transpose operands: only operands whose device
-        # axes already match the output tile exactly are supported.
-        reshape = _align_reshape_plan(
-            list(arg.device_coordinates),
-            [int(s) for s in arg.device_size],
-            list(out.device_coordinates),
-            out_extents,
-        )
-        if reshape is not None:
-            raise NotImplementedError(
-                "OpSpec->KTIR: broadcast / reshape operands not supported yet"
-            )
-    # The derivations run here, so every raise they own -- unsupported dtype, an
-    # extent that stays symbolic, a tile advance no view dim divides, a buffer
-    # with no address -- is reached before the dialect is imported.  Their results
-    # go into the plan, so the plan describes each buffer exactly as the view
-    # emitted for it will.
-    levels = _levels(spec, loops)
-    for arg in spec.args:
-        layout, _ = _solve_layout(arg, levels)
-        elems = _elem_types(arg)
-        # An internal buffer never reaches memory: no func parameter, no memory
-        # view, no address.  It is threaded as a value instead, so it gets no
-        # plan entry.
-        if is_internal(arg):
-            continue
-        plan.add(_buffer(arg, layout, elems, bake_addresses=plan.bake_addresses))
 
 
 def validated_roles(spec: OpSpec) -> tuple[TensorArg, list[TensorArg]]:
@@ -1269,46 +1262,44 @@ class KtirBuilder:
         """A fresh ``arith.constant <value> : index``."""
         return self.val(arith.ConstantOp(self.index_t, int(value)))
 
-    def trip_count(self, count):
-        """``count`` as an index SSA value. ``int`` today; sympy later."""
-        return self.icst_index(int(count))
-
-    def scaled(self, value, factor: int):
-        """``factor * value`` as an index SSA value, without a ``* 1``."""
-        if factor == 1:
-            return value
-        return self.val(arith.MulIOp(value, self.icst_index(factor)))
-
-    def summed(self, terms: Sequence):
-        """``sum(terms)`` as an index SSA value; the empty sum is ``%c0``.
-
-        The function-entry ``%c0`` is reused rather than re-materialised, so an
-        access that does not move along a dim indexes it with the one zero.
-        """
-        if not terms:
-            return self.c0
-        return functools.reduce(
-            lambda lhs, rhs: self.val(arith.AddIOp(lhs, rhs)), terms
-        )
-
     # -- module scaffolding ------------------------------------------------
 
     @contextlib.contextmanager
-    def module(self, kernel_name: str, grid: list[int], params: list) -> Iterator[None]:
-        """Open ``module { func.func @kernel_name(params) }`` and emit into it."""
+    def open_kernel(self, kernel_name: str, plan: BufferPlan) -> Iterator[None]:
+        """Open the kernel func with its views bound, and emit its body into it.
+
+        ``module { func.func @kernel_name(...) { %c0, one memory view per buffer,
+        <body>, return } }``.  The signature and the views are two faces of one
+        decision -- where a base address comes from -- so they are made together
+        here rather than in two functions a caller has to order correctly.
+
+        Baked bases need no func arguments and appear as ``arith.constant``s;
+        symbolic bases are one ``index`` parameter each, in ``plan.parameters``
+        order.  Deleting the baked arm reverts the dataflow-scheduler#65
+        workaround.
+        """
+        baked = plan.bake_addresses
+        buffers = plan.parameters
+        params = [] if baked else [self.index_t] * len(buffers)
         try:
             module = ir.Module.create()
             with ir.InsertionPoint(module.body):
                 # [] is the result list: a KTIR kernel returns nothing.
                 fn = func.FuncOp(kernel_name, ir.FunctionType.get(params, []))
                 i64 = ir.IntegerType.get_signless(64)
-                fn.attributes["grid"] = ir.ArrayAttr.get(
-                    [ir.IntegerAttr.get(i64, int(g)) for g in grid]
-                )
+                # Single-core (SENCORES=1); work-division scaling is future work.
+                fn.attributes["grid"] = ir.ArrayAttr.get([ir.IntegerAttr.get(i64, 1)])
                 block = fn.add_entry_block()
                 self.block_args = list(block.arguments)
                 with ir.InsertionPoint(block):
                     self.c0 = self.icst_index(0)
+                    for position, buffer in enumerate(buffers):
+                        base = (
+                            self.icst_index(buffer.base_elements)
+                            if baked
+                            else self.block_args[position]
+                        )
+                        self.views[buffer.buf_id] = self.memory_view(base, buffer)
                     yield
                     func.ReturnOp([])  # no operands, matching the signature
             # Printed while the context is still alive.
@@ -1317,9 +1308,9 @@ class KtirBuilder:
             self._stack.close()
 
     def finish(self) -> str:
-        """The canonical MLIR text of the module built by ``module()``."""
+        """The canonical MLIR text of the module built by ``open_kernel()``."""
         if self._text is None:
-            raise AssertionError("KtirBuilder.finish() before module() completed")
+            raise AssertionError("KtirBuilder.finish() before open_kernel() completed")
         return self._text
 
     @contextlib.contextmanager
@@ -1332,7 +1323,7 @@ class KtirBuilder:
         because every value the body produces is stored to memory inside it.
         """
         lo, step = self.icst_index(0), self.icst_index(1)
-        hi = self.trip_count(trip)
+        hi = self.icst_index(int(trip))  # int today; sympy later
         for_op = scf.ForOp(lo, hi, step)
         with ir.InsertionPoint(for_op.body):
             yield for_op.induction_variable
@@ -1370,41 +1361,38 @@ class KtirBuilder:
             )
         )
 
-    def bind_view(self, buf_id: str, view) -> None:
-        self.views[buf_id] = view
+    def access_tile(self, access: Access):
+        """``ktdp.construct_access_tile`` for ``access``, into its buffer's view.
 
-    def view(self, buf_id: str):
-        """The memory view bound for ``buf_id``."""
-        return self.views[buf_id]
-
-    def tile_indices(self, access: Access) -> list:
-        """One index SSA value per view dim: ``sum_l coeffs[i][l] * indices[l]``."""
-        return [
-            self.summed(
-                [
-                    self.scaled(iv, coeff)
-                    for coeff, iv in zip(coeffs, access.indices, strict=True)
-                    if coeff
-                ]
-            )
-            for coeffs in access.index_coeffs
-        ]
-
-    def access_tile(self, view, access: Access):
-        """``ktdp.construct_access_tile`` for ``access`` into ``view``."""
+        The per-dim index is ``sum_l coeffs[i][l] * indices[l]``: a ``* 1`` is not
+        emitted, and an empty sum is the function-entry ``%c0`` rather than a
+        fresh zero, so a dim no level walks indexes the view with the one zero.
+        """
         sizes = list(access.extent)
-        rank = len(sizes)
-        at_t = ktdp.AccessTileType.get(sizes, ir.IndexType.get())
-        identity = ir.AffineMapAttr.get(ir.AffineMap.get_identity(rank))
+        indices = []
+        for coeffs in access.index_coeffs:
+            terms = [
+                iv if coeff == 1 else self.val(arith.MulIOp(iv, self.icst_index(coeff)))
+                for coeff, iv in zip(coeffs, access.indices, strict=True)
+                if coeff
+            ]
+            indices.append(
+                functools.reduce(
+                    lambda lhs, rhs: self.val(arith.AddIOp(lhs, rhs)), terms
+                )
+                if terms
+                else self.c0
+            )
+        identity = ir.AffineMapAttr.get(ir.AffineMap.get_identity(len(sizes)))
         return self.val(
             ktdp.construct_access_tile(
-                result=at_t,
-                base=view,
+                result=ktdp.AccessTileType.get(sizes, ir.IndexType.get()),
+                base=self.views[access.buffer.buf_id],
                 # How the view is indexed, and the order of the tile's own axes.
                 # Both identity: the tile covers the view one-to-one.
                 base_map=identity,
                 access_tile_order=identity,
-                indices=self.tile_indices(access),
+                indices=indices,
                 # SSA operands for symbols in base_map; it uses none.
                 symbol_operands=[],
                 access_tile_set=self.coord_set(sizes),
@@ -1412,25 +1400,24 @@ class KtirBuilder:
         )
 
     def operand(self, buf_id: str, access: Access):
-        """The value of an input operand: a live produced value, or a fresh load.
+        """An input operand's value: a live produced value, or an access + load.
 
         Reusing a produced value is what register-threaded fused intermediates
         will need; they are rejected today, so ``produced`` is always ``None``
         and this always loads.
         """
         produced = self.env.produced(buf_id)
-        return produced if produced is not None else self.load(access)
-
-    def load(self, access: Access):
-        """An access tile + ``ktdp.load`` of the tile ``access`` describes."""
+        if produced is not None:
+            return produced
         tensor_t = ir.RankedTensorType.get(
             list(access.extent), self.named_type(access.elems.value)
         )
-        tile = self.access_tile(self.view(access.buffer.buf_id), access)
-        return self.val(ktdp.load(result=tensor_t, access_tile=tile))
+        return self.val(
+            ktdp.load(result=tensor_t, access_tile=self.access_tile(access))
+        )
 
     def result(self, buf_id: str, access: Access | None, value) -> None:
-        """Dispose of an op's result: thread it, or materialise it.
+        """Dispose of an op's result: thread it, or store it through ``access``.
 
         The mirror of ``operand`` on the way out.  ``access is None`` is an
         internal buffer: it has no view to store through, so the value is bound
@@ -1439,12 +1426,7 @@ class KtirBuilder:
         if access is None:
             self.env.bind_produced(buf_id, value)
         else:
-            self.store_to(access, value)
-
-    def store_to(self, access: Access, value) -> None:
-        """An access tile + ``ktdp.store`` of ``value`` into the tile ``access``."""
-        tile = self.access_tile(self.view(access.buffer.buf_id), access)
-        ktdp.store(data_tile=value, access_tile=tile)
+            ktdp.store(data_tile=value, access_tile=self.access_tile(access))
 
     # -- compute -----------------------------------------------------------
     #
@@ -1509,35 +1491,6 @@ class KtirBuilder:
 
 
 # ---------------------------------------------------------------------------
-# The two address forms
-# ---------------------------------------------------------------------------
-#
-# ``BufferPlan.bake_addresses`` selects where a buffer's base address comes
-# from: a func argument (symbolic) or an ``arith.constant`` in elements (baked).
-# The SDSC path makes the same choice from ``config.bundle_symbolic_args``.
-#
-# The baked form exists because ``ktdp.load`` requires a static memref offset,
-# which a constant base gives only when the consumer is a ``linalg`` op.  It is
-# the dataflow-scheduler#65 workaround: deleting the baked arm of the two
-# functions below reverts it.
-
-
-def _func_param_types(b: KtirBuilder, plan: BufferPlan) -> list:
-    """Baked bases need no func arguments; symbolic ones need an index each."""
-    if plan.bake_addresses:
-        return []
-    return [b.index_t] * len(plan.parameters)
-
-
-def _bind_views(b: KtirBuilder, plan: BufferPlan) -> None:
-    """One memory view per buffer, based on a constant or on a func argument."""
-    baked = plan.bake_addresses
-    for position, buffer in enumerate(plan.parameters):
-        base = b.icst_index(buffer.base_elements) if baked else b.block_args[position]
-        b.bind_view(buffer.buf_id, b.memory_view(base, buffer))
-
-
-# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -1554,23 +1507,26 @@ def generate_ktir(
     the unique operand buffers in ascending ``arg_index`` order so the emitted
     signature matches that positional binding (or, in the baked form, no
     parameters at all and one ``arith.constant`` base address per buffer).
+
+    Three steps: plan the buffers (which raises every rejection), open the
+    kernel, walk the specs into it.  The plan completes before
+    ``KtirBuilder.create``, so an unsupported request fails fast -- and is
+    testable -- whether or not ``mlir_ktdp`` is installed.
     """
-    # Every rejection lives in build_buffer_plan(), and build_buffer_plan() completes before
-    # KtirBuilder.create(), so an unsupported request fails fast -- and is
-    # testable -- whether or not mlir_ktdp is installed.
     # Emission options, defaulted here so callers pass only what they need.
     #
     # bake_addresses: emit each base as an arith.constant instead of a func
-    # argument.  Canonical KTIR is symbolic; baking is what dbo-opt requires
-    # (dataflow-scheduler#65), so the caller that runs dbo-opt asks for it.
+    # argument, because ktdp.load requires a static memref offset, which a
+    # constant base gives only when the consumer is a linalg op.  Canonical KTIR
+    # is symbolic; baking is the dataflow-scheduler#65 workaround that dbo-opt
+    # requires, so the caller that runs dbo-opt asks for it.  The SDSC path makes
+    # the same choice from config.bundle_symbolic_args.
     bake_addresses = bool(options.pop("bake_addresses", False))
     if options:
         raise TypeError(f"generate_ktir: unknown option(s) {sorted(options)}")
 
     plan = build_buffer_plan(specs, bake_addresses=bake_addresses)
     b = KtirBuilder.create(plan)
-    # Single-core (SENCORES=1) grid; work-division scaling is future work.
-    with b.module(kernel_name, grid=[1], params=_func_param_types(b, plan)):
-        _bind_views(b, plan)
+    with b.open_kernel(kernel_name, plan):
         emit_specs(b, specs)
     return b.finish()

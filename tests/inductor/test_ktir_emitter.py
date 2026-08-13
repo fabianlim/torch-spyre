@@ -24,11 +24,15 @@ Self-contained otherwise: no live Inductor graph, no compiler run.
 """
 
 import unittest
-from unittest import mock
 
 from test_ktir_validate import _add_op_specs, _baked_add_op_specs
 
-_CONFIG = "torch_spyre._inductor.config"
+from torch_spyre._inductor.codegen.ktir import PlanOptions
+
+# One core, and a plan walk that descends a LoopSpec instead of refusing it:
+# what the tiled-nest tests need and nothing else asks for.  ``ktir`` imports
+# without a dialect build, so naming PlanOptions here costs no skip.
+_WALK_ONE_CORE = PlanOptions(sencores=1, counted_loops="walk")
 
 
 def _mlir_ktdp_available() -> bool:
@@ -44,9 +48,6 @@ def _mlir_ktdp_available() -> bool:
     return dialect_available()
 
 
-# ``sencores`` is pinned to the single core the emitted grid hardcodes.  The
-# address form is an argument to generate_ktir, not a patched global.
-@mock.patch(f"{_CONFIG}.sencores", 1)
 @unittest.skipUnless(
     _mlir_ktdp_available(),
     "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
@@ -83,7 +84,7 @@ module {
     def test_pointwise_add_golden(self):
         from torch_spyre._inductor.codegen.ktir import generate_ktir
 
-        emitted = generate_ktir("ktir_fused_add_0", _add_op_specs())
+        emitted = generate_ktir("ktir_fused_add_0", _add_op_specs(), sencores=1)
         self.assertEqual(emitted, self.EXPECTED_ADD_KTIR)
 
     def test_registered_ops_reach_their_own_binding(self):
@@ -97,7 +98,7 @@ module {
         from torch_spyre._inductor.codegen.ktir import generate_ktir
 
         specs = [dataclasses.replace(_add_op_specs()[0], op="mul")]
-        emitted = generate_ktir("ktir_fused_mul_0", specs)
+        emitted = generate_ktir("ktir_fused_mul_0", specs, sencores=1)
         self.assertIn("linalg.mul ins(", emitted)
         self.assertNotIn("linalg.add", emitted)
         # Everything either side of the compute op is unchanged by the op name.
@@ -109,7 +110,6 @@ module {
         )
 
 
-@mock.patch(f"{_CONFIG}.sencores", 1)
 @unittest.skipUnless(
     _mlir_ktdp_available(),
     "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
@@ -126,7 +126,7 @@ class TestKtirBakedAddresses(unittest.TestCase):
         from torch_spyre._inductor.codegen.ktir import generate_ktir
 
         emitted = generate_ktir(
-            "ktir_fused_add_0", _baked_add_op_specs(), bake_addresses=True
+            "ktir_fused_add_0", _baked_add_op_specs(), sencores=1, bake_addresses=True
         )
 
         # 1. No address is a runtime value: zero-arg func, no %arg anywhere.
@@ -142,7 +142,6 @@ class TestKtirBakedAddresses(unittest.TestCase):
         # and is not a delta.  The two texts now differ only in addressing.
 
 
-@mock.patch(f"{_CONFIG}.sencores", 1)
 @unittest.skipUnless(
     _mlir_ktdp_available(),
     "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
@@ -174,7 +173,7 @@ class TestInternalBufferIsThreaded(unittest.TestCase):
     def test_intermediate_is_neither_stored_nor_loaded(self):
         from torch_spyre._inductor.codegen.ktir import generate_ktir
 
-        emitted = generate_ktir("ktir_fused_add_add_0", self._chain())
+        emitted = generate_ktir("ktir_fused_add_add_0", self._chain(), sencores=1)
         # Three loads (a, b, c) -- not four: the intermediate is a live value.
         self.assertEqual(emitted.count("ktdp.load"), 3)
         # One store: only the kernel's real output is materialised.
@@ -192,7 +191,6 @@ class TestInternalBufferIsThreaded(unittest.TestCase):
         )
 
 
-@mock.patch(f"{_CONFIG}.sencores", 1)
 @unittest.skipUnless(
     _mlir_ktdp_available(),
     "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
@@ -287,9 +285,10 @@ module {
         nest = self._tiled_nest()
         # The plan walk descends the nest and plans each buffer at the depth its
         # op sits at: the extents below are what the two levels walk over.
-        plan = ktir.build_buffer_plan([nest], counted_loops="walk")
+        plan = ktir.build_buffer_plan([nest], _WALK_ONE_CORE)
         b = ktir.KtirBuilder.create(plan)
-        with b.open_kernel("ktir_tiled_add_0", plan):
+        # The builder already has the plan; opening the kernel needs only a name.
+        with b.open_kernel("ktir_tiled_add_0"):
             ktir.emit_specs(b, [nest])
         # Pretty (non-generic) MLIR: the module verifies, terminators included.
         self.assertEqual(b.finish(), self.EXPECTED_TILED_ADD_KTIR)
@@ -298,7 +297,7 @@ module {
         """The buffer extents in the golden, read off the plan the walk built."""
         from torch_spyre._inductor.codegen import ktir
 
-        plan = ktir.build_buffer_plan([self._tiled_nest()], counted_loops="walk")
+        plan = ktir.build_buffer_plan([self._tiled_nest()], _WALK_ONE_CORE)
         self.assertEqual([b.buf_id for b in plan.parameters], ["arg0", "arg1", "buf0"])
         for buffer in plan.parameters:
             with self.subTest(buf_id=buffer.buf_id):
@@ -311,11 +310,11 @@ module {
 
         nest = self._tiled_nest()
         with self.assertRaises(NotImplementedError) as ctx:
-            ktir.generate_ktir("ktir_tiled_add_0", [nest])
+            ktir.generate_ktir("ktir_tiled_add_0", [nest], sencores=1)
         self.assertIn("counted loops", str(ctx.exception))
         # Same refusal from the plan walk itself, at its default mode.
         with self.assertRaises(NotImplementedError):
-            ktir.build_buffer_plan([nest])
+            ktir.build_buffer_plan([nest], ktir.PlanOptions(sencores=1))
 
 
 if __name__ == "__main__":

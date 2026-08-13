@@ -247,7 +247,7 @@ STATUS_TABLE: tuple[StatusRow, ...] = (
         note=(
             "integer loop counts, one level per entry of OpSpec.tiled_symbols; "
             "derived, emitted and pinned by a golden, but reached only under "
-            "build_buffer_plan(counted_loops='walk') because generate_ktir's "
+            "PlanOptions(counted_loops='walk') because generate_ktir's "
             "default mode refuses a nest while loops are not enabled end to end"
         ),
     ),
@@ -832,14 +832,16 @@ def _buffer(
     )
 
 
-class BufferPlan:
-    """Unique ``Buffer`` records in first-seen order, keyed by ``buf_id``.
+@dataclasses.dataclass(frozen=True)
+class PlanOptions:
+    """Everything the caller chooses about one emission, in one value.
 
-    Fills itself from a spec tree: ``add_specs`` is the walk, so the buffers, the
-    address form and the walk that produces them are one object rather than a
-    dict threaded through free functions.  Filling it is what runs the
-    derivations, so it is also where every ``NotImplementedError`` the emitter
-    can raise comes from.
+    ``sencores`` is the core count the kernel is emitted for; ``None`` means
+    "whatever this build is configured for", which is what a production caller
+    wants and what makes the choice explicit for everyone else.  It is here
+    rather than read from the config at the point of use so that the three
+    choices an emission depends on are one argument, not one argument and two
+    globals.
 
     ``counted_loops`` selects what a ``LoopSpec`` does, the way ``_layout``'s
     ``symbolic_extent`` selects an extent mode: ``'reject'`` (the default, and
@@ -847,20 +849,66 @@ class BufferPlan:
     it and plans each buffer at its real depth.  The walk, the derivations and
     the builders behind the refusal are complete; ``'walk'`` is what an emission
     of a nest is planned with while loops are not enabled end to end.
+
+    ``bake_addresses`` emits each base as an ``arith.constant`` in elements
+    instead of a func argument, because ``ktdp.load`` requires a static memref
+    offset, which a constant base gives only when the consumer is a ``linalg``
+    op.  Canonical KTIR is symbolic; baking is the dataflow-scheduler#65
+    workaround that dbo-opt requires.  The SDSC path makes the same choice from
+    ``config.bundle_symbolic_args``.
     """
 
-    MODES: ClassVar[tuple[str, ...]] = ("reject", "walk")
+    COUNTED_LOOPS: ClassVar[tuple[str, ...]] = ("reject", "walk")
 
-    def __init__(
-        self, *, bake_addresses: bool = False, counted_loops: str = "reject"
-    ) -> None:
-        if counted_loops not in self.MODES:
+    sencores: int | None = None
+    bake_addresses: bool = False
+    counted_loops: str = "reject"
+
+    def __post_init__(self) -> None:
+        if self.counted_loops not in self.COUNTED_LOOPS:
             raise ValueError(
-                f"OpSpec->KTIR: unknown counted_loops mode {counted_loops!r}"
+                f"OpSpec->KTIR: unknown counted_loops mode {self.counted_loops!r}; "
+                f"expected one of {self.COUNTED_LOOPS}"
             )
+
+    @property
+    def cores(self) -> int:
+        """The core count to emit for: the configured one unless overridden."""
+        return _spyre_config.sencores if self.sencores is None else int(self.sencores)
+
+
+def _grid(cores: int) -> tuple[int, ...]:
+    """The ``grid`` attribute for ``cores``, which is ``(1,)`` or a rejection.
+
+    The only reader of the core count, so the multi-core rejection lives here.
+    Multi-core work division is future work: rather than silently emitting a
+    single-core grid on a multi-core request, there is no grid to emit for one.
+    """
+    if cores != 1:
+        raise NotImplementedError(
+            "OpSpec->KTIR: multi-core work division is not supported yet "
+            f"(SENCORES={cores}, only 1 is supported)"
+        )
+    return (1,)
+
+
+class BufferPlan:
+    """Unique ``Buffer`` records in first-seen order, keyed by ``buf_id``.
+
+    Fills itself from a spec tree: ``add_specs`` is the walk, so the buffers, the
+    options and the walk that produces them are one object rather than a dict
+    threaded through free functions.  Filling it is what runs the derivations, so
+    it is also where every ``NotImplementedError`` the emitter can raise comes
+    from.
+
+    ``grid`` is resolved here rather than at emit time: the builder emits the
+    grid it is given and does not know what a core is.
+    """
+
+    def __init__(self, options: PlanOptions | None = None) -> None:
+        self.options = options or PlanOptions()
+        self.grid = _grid(self.options.cores)
         self.buffers: dict[str, Buffer] = {}
-        self.bake_addresses = bake_addresses
-        self.counted_loops = counted_loops
 
     @property
     def parameters(self) -> list[Buffer]:
@@ -890,7 +938,7 @@ class BufferPlan:
                     f"OpSpec->KTIR: unimplemented op {entry.op!r}"
                 )
             if isinstance(entry, LoopSpec):
-                if self.counted_loops == "reject":
+                if self.options.counted_loops == "reject":
                     raise NotImplementedError(
                         "OpSpec->KTIR: counted loops (LoopSpec) are not supported yet"
                     )
@@ -950,7 +998,9 @@ class BufferPlan:
             # gets no entry here.
             if is_internal(arg):
                 continue
-            buffer = _buffer(arg, layout, elems, bake_addresses=self.bake_addresses)
+            buffer = _buffer(
+                arg, layout, elems, bake_addresses=self.options.bake_addresses
+            )
             self.buffers.setdefault(buffer.buf_id, buffer)
 
 
@@ -989,28 +1039,17 @@ def _base_address_elements(arg: TensorArg) -> int:
 
 def build_buffer_plan(
     specs: Sequence[OpSpec | LoopSpec | UnimplementedOp],
-    *,
-    bake_addresses: bool = False,
-    counted_loops: str = "reject",
+    options: PlanOptions | None = None,
 ) -> BufferPlan:
     """The kernel's ``BufferPlan``, and every rejection on the way to it.  Pure.
 
-    The whole-request checks live here; everything per-spec is
-    ``BufferPlan.add_specs``.  Imports nothing from ``mlir_ktdp`` (the dialect
-    import is lazy, inside ``KtirBuilder.create``), so it is usable wherever
-    ``import ktir`` works -- which is everywhere.  Afterwards the emission path
-    holds no ``raise`` but the ``AssertionError`` in ``emit_specs``, which only
-    fires on a plan bug.
+    The whole-request checks are the grid (in ``BufferPlan.__init__``) and the
+    empty-kernel check below; everything per-spec is ``BufferPlan.add_specs``.
+    Imports nothing from ``mlir_ktdp`` (the dialect import is lazy, inside
+    ``KtirBuilder.create``), so it is usable wherever ``import ktir`` works --
+    which is everywhere.
     """
-    # Multi-core work division is future work; the emitted grid is hard-coded to
-    # a single core, so reject anything else rather than silently emitting a
-    # single-core grid on a multi-core request.
-    if _spyre_config.sencores != 1:
-        raise NotImplementedError(
-            "OpSpec->KTIR: multi-core work division is not supported yet "
-            f"(SENCORES={_spyre_config.sencores}, only 1 is supported)"
-        )
-    plan = BufferPlan(bake_addresses=bake_addresses, counted_loops=counted_loops)
+    plan = BufferPlan(options)
     plan.add_specs(specs)
     if not plan.buffers:
         raise NotImplementedError("OpSpec->KTIR: no OpSpec to emit")
@@ -1265,21 +1304,22 @@ class KtirBuilder:
     # -- module scaffolding ------------------------------------------------
 
     @contextlib.contextmanager
-    def open_kernel(self, kernel_name: str, plan: BufferPlan) -> Iterator[None]:
+    def open_kernel(self, kernel_name: str) -> Iterator[None]:
         """Open the kernel func with its views bound, and emit its body into it.
 
         ``module { func.func @kernel_name(...) { %c0, one memory view per buffer,
         <body>, return } }``.  The signature and the views are two faces of one
         decision -- where a base address comes from -- so they are made together
-        here rather than in two functions a caller has to order correctly.
+        here rather than in two functions a caller has to order correctly.  All of
+        it comes off ``self.plan``, the plan this builder was created for.
 
         Baked bases need no func arguments and appear as ``arith.constant``s;
         symbolic bases are one ``index`` parameter each, in ``plan.parameters``
         order.  Deleting the baked arm reverts the dataflow-scheduler#65
         workaround.
         """
-        baked = plan.bake_addresses
-        buffers = plan.parameters
+        baked = self.plan.options.bake_addresses
+        buffers = self.plan.parameters
         params = [] if baked else [self.index_t] * len(buffers)
         try:
             module = ir.Module.create()
@@ -1287,8 +1327,11 @@ class KtirBuilder:
                 # [] is the result list: a KTIR kernel returns nothing.
                 fn = func.FuncOp(kernel_name, ir.FunctionType.get(params, []))
                 i64 = ir.IntegerType.get_signless(64)
-                # Single-core (SENCORES=1); work-division scaling is future work.
-                fn.attributes["grid"] = ir.ArrayAttr.get([ir.IntegerAttr.get(i64, 1)])
+                # The plan resolved the grid; a core count is not the builder's
+                # business.
+                fn.attributes["grid"] = ir.ArrayAttr.get(
+                    [ir.IntegerAttr.get(i64, int(g)) for g in self.plan.grid]
+                )
                 block = fn.add_entry_block()
                 self.block_args = list(block.arguments)
                 with ir.InsertionPoint(block):
@@ -1512,21 +1555,16 @@ def generate_ktir(
     kernel, walk the specs into it.  The plan completes before
     ``KtirBuilder.create``, so an unsupported request fails fast -- and is
     testable -- whether or not ``mlir_ktdp`` is installed.
-    """
-    # Emission options, defaulted here so callers pass only what they need.
-    #
-    # bake_addresses: emit each base as an arith.constant instead of a func
-    # argument, because ktdp.load requires a static memref offset, which a
-    # constant base gives only when the consumer is a linalg op.  Canonical KTIR
-    # is symbolic; baking is the dataflow-scheduler#65 workaround that dbo-opt
-    # requires, so the caller that runs dbo-opt asks for it.  The SDSC path makes
-    # the same choice from config.bundle_symbolic_args.
-    bake_addresses = bool(options.pop("bake_addresses", False))
-    if options:
-        raise TypeError(f"generate_ktir: unknown option(s) {sorted(options)}")
 
-    plan = build_buffer_plan(specs, bake_addresses=bake_addresses)
+    ``options`` are ``PlanOptions`` fields, spelled as keywords so a caller
+    passes only what it chooses and the defaults live in one place.
+    """
+    known = {f.name for f in dataclasses.fields(PlanOptions)}
+    if unknown := sorted(set(options) - known):
+        raise TypeError(f"generate_ktir: unknown option(s) {unknown}")
+
+    plan = build_buffer_plan(specs, PlanOptions(**options))
     b = KtirBuilder.create(plan)
-    with b.open_kernel(kernel_name, plan):
+    with b.open_kernel(kernel_name):
         emit_specs(b, specs)
     return b.finish()

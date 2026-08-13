@@ -43,6 +43,10 @@ from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, Unimpleme
 
 _CONFIG = "torch_spyre._inductor.config"
 
+# The single core the emitted grid is the only supported one, pinned explicitly
+# so these tests do not depend on how this build is configured.
+_ONE_CORE = ktir.PlanOptions(sencores=1)
+
 
 def _add_op_specs() -> list:
     """Finished OpSpec list for ``a + b`` at device shape [16, 512, 64] fp16.
@@ -89,30 +93,28 @@ def _baked_add_op_specs() -> list:
     return specs
 
 
-# The symbolic address form is pinned by default: it is the form that reads no
-# ``allocation["hbm"]``, so the rejections under test are the ones the fixture
-# is about.  Single-core is pinned so per-op guards fire rather than the
-# multi-core guard, which would otherwise come first on the default SENCORES=32.
-@mock.patch(f"{_CONFIG}.sencores", 1)
 class TestValidateRejections(unittest.TestCase):
     """One test per rejection ``build_buffer_plan`` is responsible for.
 
     Each asserts the exception type and a distinguishing fragment of the
     message, so a rejection cannot silently turn into a different rejection.
+
+    ``_rejects`` pins two options rather than patching globals: one core, so a
+    per-op guard fires instead of the multi-core guard; and the symbolic address
+    form, which reads no ``allocation["hbm"]``, so the rejection under test is
+    the one the fixture is about.
     """
 
     def _rejects(self, specs, fragment, **options):
+        options.setdefault("sencores", 1)
         with self.assertRaises(NotImplementedError) as ctx:
-            ktir.build_buffer_plan(specs, **options)
+            ktir.build_buffer_plan(specs, ktir.PlanOptions(**options))
         self.assertIn(fragment, str(ctx.exception))
 
     # -- whole-request capability ------------------------------------------
 
     def test_multicore_rejected(self):
-        # Patched inside the body, not as a method decorator: the class-level
-        # decorators are applied outermost and would override it.
-        with mock.patch(f"{_CONFIG}.sencores", 2):
-            self._rejects(_add_op_specs(), "multi-core work division")
+        self._rejects(_add_op_specs(), "multi-core work division", sencores=2)
 
     def test_empty_spec_list_rejected(self):
         self._rejects([], "no OpSpec to emit")
@@ -188,7 +190,6 @@ class TestValidateRejections(unittest.TestCase):
         self._rejects(_add_op_specs(), "unassigned 'hbm' address", bake_addresses=True)
 
 
-@mock.patch(f"{_CONFIG}.sencores", 1)
 class TestRejectionsThroughGenerateKtir(unittest.TestCase):
     """``generate_ktir`` surfaces the rejections *without* reaching the dialect.
 
@@ -200,24 +201,58 @@ class TestRejectionsThroughGenerateKtir(unittest.TestCase):
         specs = _add_op_specs()
         specs[0].is_reduction = True
         with self.assertRaises(NotImplementedError):
-            ktir.generate_ktir("ktir_fused_add_0", specs)
+            ktir.generate_ktir("ktir_fused_add_0", specs, sencores=1)
 
     def test_unregistered_op_unsupported(self):
         specs = _add_op_specs()
         specs[0].op = "atan2"
         with self.assertRaises(NotImplementedError):
-            ktir.generate_ktir("ktir_fused_atan2_0", specs)
+            ktir.generate_ktir("ktir_fused_atan2_0", specs, sencores=1)
 
     def test_multicore_unsupported(self):
-        with (
-            mock.patch(f"{_CONFIG}.sencores", 2),
-            self.assertRaises(NotImplementedError),
-        ):
-            ktir.generate_ktir("ktir_fused_add_0", _add_op_specs())
+        with self.assertRaises(NotImplementedError):
+            ktir.generate_ktir("ktir_fused_add_0", _add_op_specs(), sencores=2)
+
+    def test_unknown_option_is_a_typeerror(self):
+        """Options are PlanOptions fields; a typo is not silently ignored."""
+        with self.assertRaises(TypeError) as ctx:
+            ktir.generate_ktir("k", _add_op_specs(), bake_address=True)
+        self.assertIn("bake_address", str(ctx.exception))
 
 
-@mock.patch(f"{_CONFIG}.sencores", 1)
-class TestBufferTable(unittest.TestCase):
+class TestPlanOptions(unittest.TestCase):
+    """The caller's choices, including the one that defaults to the config.
+
+    ``sencores=None`` is the production case: nothing passes a core count, so the
+    option has to resolve to whatever this build is configured for.  That default
+    is the reason to test the config read at all -- every other test pins the
+    value explicitly instead.
+    """
+
+    def test_core_count_defaults_to_the_configured_one(self):
+        with mock.patch(f"{_CONFIG}.sencores", 7):
+            self.assertEqual(ktir.PlanOptions().cores, 7)
+            # An explicit value wins over the configuration.
+            self.assertEqual(ktir.PlanOptions(sencores=1).cores, 1)
+
+    def test_defaults_are_the_canonical_form(self):
+        options = ktir.PlanOptions()
+        self.assertFalse(options.bake_addresses)  # symbolic addresses
+        self.assertEqual(options.counted_loops, "reject")
+
+    def test_unknown_counted_loops_mode_rejected(self):
+        with self.assertRaises(ValueError) as ctx:
+            ktir.PlanOptions(counted_loops="unroll")
+        self.assertIn("counted_loops", str(ctx.exception))
+
+    def test_grid_comes_from_the_core_count(self):
+        self.assertEqual(ktir.BufferPlan(_ONE_CORE).grid, (1,))
+        with self.assertRaises(NotImplementedError) as ctx:
+            ktir.BufferPlan(ktir.PlanOptions(sencores=2))
+        self.assertIn("multi-core work division", str(ctx.exception))
+
+
+class TestBufferPlan(unittest.TestCase):
     """What ``build_buffer_plan`` returns: the func signature, before any emission."""
 
     def test_param_entries_are_ordered_by_arg_index(self):
@@ -225,7 +260,7 @@ class TestBufferTable(unittest.TestCase):
         # Registration order (spec.args) is 0, 1, 2; shuffle it so the sort is
         # doing the work rather than agreeing with insertion order by luck.
         specs[0].args = [specs[0].args[2], specs[0].args[0], specs[0].args[1]]
-        plan = ktir.build_buffer_plan(specs)
+        plan = ktir.build_buffer_plan(specs, _ONE_CORE)
         self.assertEqual([e.arg_index for e in plan.parameters], [0, 1, 2])
         self.assertEqual([e.buf_id for e in plan.parameters], ["arg0", "arg1", "buf0"])
         # The plan holds the derived records, so the buffer's extent and its
@@ -234,13 +269,16 @@ class TestBufferTable(unittest.TestCase):
         self.assertEqual(plan.parameters[0].layout.strides, (32768, 64, 1))
 
     def test_symbolic_form_resolves_no_base_addresses(self):
-        plan = ktir.build_buffer_plan(_add_op_specs())
+        plan = ktir.build_buffer_plan(_add_op_specs(), _ONE_CORE)
         # Every 'hbm' address in the fixture is None and never read: the bases
         # are func arguments.
         self.assertEqual([e.base_elements for e in plan.parameters], [None] * 3)
 
     def test_baked_form_resolves_bases_in_elements(self):
-        plan = ktir.build_buffer_plan(_baked_add_op_specs(), bake_addresses=True)
+        plan = ktir.build_buffer_plan(
+            _baked_add_op_specs(),
+            ktir.PlanOptions(sencores=1, bake_addresses=True),
+        )
         # fp16: 2 bytes per element, so the byte slot halves.
         self.assertEqual(
             [e.base_elements for e in plan.parameters],
@@ -249,7 +287,7 @@ class TestBufferTable(unittest.TestCase):
 
     def test_repeated_buffer_is_registered_once(self):
         specs = _add_op_specs() + _add_op_specs()
-        plan = ktir.build_buffer_plan(specs)
+        plan = ktir.build_buffer_plan(specs, _ONE_CORE)
         self.assertEqual(len(plan.buffers), 3)
 
 
@@ -623,24 +661,19 @@ class TestWithoutTheDialectBuild(unittest.TestCase):
     def test_imports_and_rejects_without_the_dialect(self):
         with self._blocked() as fresh:
             self.assertFalse(fresh.dialect_available())
-            with mock.patch(f"{_CONFIG}.sencores", 1):
-                # A rejection, not an ImportError: the plan walk runs first and
-                # needs nothing from the dialect.
-                with self.assertRaises(NotImplementedError) as ctx:
-                    fresh.generate_ktir("k", [LoopSpec(count=4, body=[])])
-                self.assertIn("counted loops", str(ctx.exception))
-                # And the derivations answer, dialect or no dialect.
-                layout, _ = fresh._solve_layout(_add_op_specs()[0].args[0], [])
-                self.assertEqual(layout.extent, (16, 512, 64))
+            # A rejection, not an ImportError: the plan walk runs first and needs
+            # nothing from the dialect.
+            with self.assertRaises(NotImplementedError) as ctx:
+                fresh.generate_ktir("k", [LoopSpec(count=4, body=[])], sencores=1)
+            self.assertIn("counted loops", str(ctx.exception))
+            # And the derivations answer, dialect or no dialect.
+            layout, _ = fresh._solve_layout(_add_op_specs()[0].args[0], [])
+            self.assertEqual(layout.extent, (16, 512, 64))
 
     def test_emission_is_what_needs_the_dialect(self):
         # A *valid* request gets as far as the builder and no further.
-        with (
-            self._blocked() as fresh,
-            mock.patch(f"{_CONFIG}.sencores", 1),
-            self.assertRaises(ImportError),
-        ):
-            fresh.generate_ktir("k", _add_op_specs())
+        with self._blocked() as fresh, self.assertRaises(ImportError):
+            fresh.generate_ktir("k", _add_op_specs(), sencores=1)
 
 
 class TestScopeStack(unittest.TestCase):

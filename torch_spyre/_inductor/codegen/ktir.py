@@ -32,17 +32,15 @@ backend accepts symbolic addresses.
 Structure
 ---------
 
-``generate_ktir`` is four steps, in this order:
+``generate_ktir`` is three steps, in this order:
 
 1. ``validate(specs)`` -- a **pure** recursive walk that raises every
    ``NotImplementedError`` the emitter can raise and returns a ``BufferTable``.
    It imports nothing from ``mlir_ktdp``, so every rejection is reachable and
    testable where the dialect build is absent.
-2. ``address_source(table)`` -- picks ``BakedConstants`` or
-   ``FuncArgAddresses``.  The single seam for reverting #65.
-3. ``KtirBuilder.create(...)`` -- the single ``mlir_ktdp`` import site; owns the
-   context, the dialect handles and the per-module state.
-4. ``emit_specs(b, specs)`` -- a recursive walk over the same spec tree,
+2. ``KtirBuilder.create()`` -- the single ``mlir_ktdp`` import site; owns the
+   context and the per-module state.
+3. ``emit_specs(b, specs)`` -- a recursive walk over the same spec tree,
    dispatching each ``OpSpec`` through the module-level ``REGISTRY``.
 
 Adding a pointwise op is one ``REGISTRY`` entry.  Enabling counted loops is
@@ -54,6 +52,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import enum
 from collections.abc import Callable, Iterator, Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -137,8 +136,8 @@ _MLIR_ELT_TYPE_NAMES: dict[DataFormats, str] = {
 # BufferTable: the one record the walk needs up front
 # ---------------------------------------------------------------------------
 #
-# The func signature must be known before the body is emitted, and the address
-# source needs the buffer list to choose zero-arg versus N-arg, so the buffers
+# The func signature must be known before the body is emitted, and its parameter
+# count depends on the address form, so the buffers
 # are collected by the validation walk into a flat table keyed by ``_buf_id``.
 # Everything else (strides, block shapes, coordinate bounds) is a pure function
 # of ``sizes`` and is recomputed per access by a single helper apiece, rather
@@ -292,7 +291,7 @@ def _validate_list(specs, table: BufferTable) -> None:
         if entry.op not in REGISTRY:
             raise NotImplementedError(
                 f"OpSpec->KTIR: op {entry.op!r} is not supported yet "
-                "(only pointwise 'add')"
+                f"(registered: {sorted(REGISTRY)})"
             )
         _validate_op(entry, table)
 
@@ -346,43 +345,68 @@ def validated_roles(spec: OpSpec) -> tuple[TensorArg, list[TensorArg]]:
 
 
 # ---------------------------------------------------------------------------
-# Op registration: one module-level map
+# Op registration
 # ---------------------------------------------------------------------------
+#
+# A recipe is pure declaration: how many inputs an op takes, which family of
+# emission it belongs to, and which dialect builder implements it.  It holds no
+# emission code -- the family method on ``KtirBuilder`` does that -- so adding an
+# op is one ``@register`` block.
+#
+# ``binding`` is a callable returning the builder rather than the builder itself,
+# because a dialect reference evaluated at module scope would import mlir_ktdp at
+# import time and cost us the dialect-free ``validate``.  Written as a literal
+# inside the body, it stays greppable and the type checker resolves it -- neither
+# of which is true of a name looked up with getattr.
 
 
-def _emit_add(b: KtirBuilder, spec: OpSpec) -> None:
-    """Load / compute / store for one pointwise ``OpSpec``."""
-    out, inputs = validated_roles(spec)
-    loaded = [b.operand(a) for a in inputs]
-    result = b.pointwise(spec.op, loaded, out)
-    b.store_to(out, result)
+class Family(enum.Enum):
+    """The emission shape an op needs. Which one a spec wants is read off the
+    spec, not the op name: ``sum`` reducing and ``sum`` not reducing are
+    different shapes over the same binding."""
+
+    ELEMENTWISE = enum.auto()
+    REDUCTION = enum.auto()
 
 
 @dataclasses.dataclass(frozen=True)
-class OpEntry:
-    """Everything the emitter knows about one supported op name.
-
-    One record per op, so adding an op is one ``REGISTRY`` entry rather than an
-    entry in each of several maps keyed by the same op name.
-
-    ``arith_builder`` / ``linalg_builder`` are the two compute spellings the two
-    address forms need (see ``AddressSource``); they are builder *names*, not
-    references, so this table needs no dialect import.
-    """
-
-    emit: Callable[[KtirBuilder, OpSpec], None]
+class Recipe:
+    name: str
     arity: int
-    arith_builder: str  # ``arith`` op class, for the symbolic form
-    linalg_builder: str  # ``linalg`` named op, for the baked form
+    family: Family
+    binding: Callable[[], Any]
 
 
-# A map, not a decorator: registration is explicit, greppable, has no
-# import-order dependency, and is enumerable by ``validate`` and by tests.
-REGISTRY: dict[str, OpEntry] = {
-    "add": OpEntry(
-        emit=_emit_add, arity=2, arith_builder="AddFOp", linalg_builder="add"
-    ),
-}
+REGISTRY: dict[str, Recipe] = {}
+
+
+def register(name: str, *, arity: int, family: Family):
+    """Declare op ``name``. Decorates the thunk that names its dialect builder."""
+
+    def wrap(binding: Callable[[], Any]) -> Callable[[], Any]:
+        if name in REGISTRY:
+            raise ValueError(f"OpSpec->KTIR: {name!r} is already registered")
+        if arity < 1:
+            raise ValueError(f"OpSpec->KTIR: {name!r} needs arity >= 1")
+        REGISTRY[name] = Recipe(name=name, arity=arity, family=family, binding=binding)
+        return binding
+
+    return wrap
+
+
+def family_of(spec: OpSpec) -> Family:
+    """The emission family this *spec* asks for, read from the spec itself."""
+    return Family.REDUCTION if spec.is_reduction else Family.ELEMENTWISE
+
+
+@register("add", arity=2, family=Family.ELEMENTWISE)
+def _add():
+    return linalg.add
+
+
+@register("mul", arity=2, family=Family.ELEMENTWISE)
+def _mul():
+    return linalg.mul
 
 
 # ---------------------------------------------------------------------------
@@ -396,7 +420,7 @@ def emit_specs(b: KtirBuilder, specs) -> None:
         if isinstance(entry, LoopSpec):
             emit_loop(b, entry)
         elif isinstance(entry, OpSpec):
-            REGISTRY[entry.op].emit(b, entry)
+            _emit_op(b, entry)
         else:
             # validate() already rejected UnimplementedOp and anything else, so
             # reaching here is a validation bug, not an unsupported request.
@@ -404,6 +428,18 @@ def emit_specs(b: KtirBuilder, specs) -> None:
             raise AssertionError(  # noqa: TRY004
                 f"unvalidated spec entry {type(entry).__name__}"
             )
+
+
+def _emit_op(b: KtirBuilder, spec: OpSpec) -> None:
+    """Dispatch one ``OpSpec`` to the builder method for its family."""
+    recipe = REGISTRY[spec.op]
+    family = family_of(spec)
+    if family is Family.ELEMENTWISE:
+        b.elementwise(spec, recipe)
+    else:
+        # validate() rejects every family without a builder method, so reaching
+        # here is a validation bug rather than an unsupported request.
+        raise AssertionError(f"no emission for family {family} of {spec.op!r}")
 
 
 def emit_loop(b: KtirBuilder, loop: LoopSpec) -> None:
@@ -477,8 +513,7 @@ class KtirBuilder:
     sites.
     """
 
-    def __init__(self, addrs, stack):
-        self.addrs = addrs
+    def __init__(self, stack):
         self._stack = stack
         self.env = ScopeStack()
         # Requires the live context entered by create().
@@ -489,15 +524,15 @@ class KtirBuilder:
         self._text: str | None = None
 
     @classmethod
-    def create(cls, addrs: AddressSource) -> KtirBuilder:
+    def create(cls) -> KtirBuilder:
         """THE single lazy-import site, and the owner of the MLIR context.
 
         Module level stays ``mlir_ktdp``-free, so ``import ktir`` -- and
         therefore ``validate`` -- works where the dialect build is absent.
 
         The context is entered here rather than in ``module()`` because
-        ``AddressSource.func_param_types`` builds ``ir`` types and is called
-        before the module is opened; ``module()`` closes it on the way out.
+        ``_func_param_types`` builds ``ir`` types and is called before the module
+        is opened; ``module()`` closes it on the way out.
         """
         _load_dialects()
 
@@ -506,7 +541,7 @@ class KtirBuilder:
             ctx = stack.enter_context(ir.Context())
             stack.enter_context(ir.Location.unknown())
             ktdp.register_dialects(ctx)
-            return cls(addrs, stack)
+            return cls(stack)
         except BaseException:
             stack.close()
             raise
@@ -640,9 +675,38 @@ class KtirBuilder:
         tile = self.access_tile(self.view(arg), sizes, self.zero_offsets(len(sizes)))
         ktdp.store(value, tile)
 
-    def pointwise(self, op: str, ins, out: TensorArg):
-        """The compute op for ``op``. Spelled by the address form (see #65)."""
-        return self.addrs.pointwise(self, op, ins, out)
+    # -- compute -----------------------------------------------------------
+    #
+    # One method per emission family, not per op: the op contributes only its
+    # dialect builder, via ``recipe.binding()``.
+    #
+    # Compute is always a ``linalg`` named op over a destination tensor.  There is
+    # no second spelling -- ``arith`` on tensors was emission-only, no backend
+    # accepted it, and which dialect expresses a computation has nothing to do
+    # with where its base addresses come from.
+    #
+    # Bindings are the dialects' *functions*, not their OpView classes:
+    # ``linalg.AddOp`` cannot be used directly -- the tablegen OpView leaves the
+    # named op's body region empty and the module fails verification, while the
+    # OpDSL function generates that body.
+
+    def elementwise(self, spec: OpSpec, recipe: Recipe) -> None:
+        """Load the operands, apply ``recipe``'s builder, store the result.
+
+        Every operand and the result share the output's extents, which is what
+        makes this one method rather than one per op.
+        """
+        out, inputs = validated_roles(spec)
+        ins = [self.operand(a) for a in inputs]
+        extents = [int(x) for x in out.device_size]
+        elt_t = self.elt_type(out.device_dtype)
+        dest = self.val(tensor.EmptyOp(extents, elt_t))
+        result = recipe.binding()(
+            *ins,
+            outs=[dest],
+            result_tensors=[ir.RankedTensorType.get(extents, elt_t)],
+        )
+        self.store_to(out, result)
 
     # -- attributes --------------------------------------------------------
 
@@ -672,67 +736,34 @@ class KtirBuilder:
 
 
 # ---------------------------------------------------------------------------
-# AddressSource: the one seam for dataflow-scheduler#65
+# The two bundle_symbolic_args forms
 # ---------------------------------------------------------------------------
 #
-# Two members, not four: constant addresses and ``linalg`` named compute must
-# revert together.  ``ktdp.load`` needs a *static* memref offset; ``offset: ?``
-# persists even with an ``arith.constant`` base and folds to static only when the
-# consumer is a ``linalg`` op, and ``linalg`` alone cannot help while the base is
-# a func argument.  Splitting the halves would admit configurations that do not
-# work, so ``pointwise`` lives here with the address spelling rather than on the
-# op registry.
+# ``config.bundle_symbolic_args`` is a pre-existing flag the SDSC path honours
+# too; it selects where a buffer's base address comes from.  Symbolic: a func
+# argument.  Baked: an ``arith.constant`` in elements.
+#
+# The baked form also uses ``linalg`` named compute, because ``ktdp.load`` needs a
+# static memref offset -- ``offset: ?`` persists even with an ``arith.constant``
+# base and folds only when the consumer is a ``linalg`` op, while ``linalg`` alone
+# cannot help when the base is a func argument.  So the two travel together and
+# the flag is read in three places: the two below and ``OpEntry.build``.  Reverting dataflow-scheduler#65 means
+# deleting the baked arm of each.
 
 
-class BakedConstants:
-    """TENTATIVE: dataflow-scheduler#65. Zero-arg func, ``arith.constant`` bases
-    in elements, ``linalg`` named compute. Delete this class to revert."""
-
-    def __init__(self, table: BufferTable) -> None:
-        self.table = table
-
-    def func_param_types(self, b: KtirBuilder) -> list:
+def _func_param_types(b: KtirBuilder, table: BufferTable) -> list:
+    """Baked bases need no func arguments; symbolic ones need an index each."""
+    if _addresses_are_baked():
         return []
-
-    def bind_views(self, b: KtirBuilder, table: BufferTable) -> None:
-        for entry in table.param_entries:
-            base = b.icst_index(entry.base_elements)
-            b.bind_view(entry.buf_id, b.memory_view(base, entry))
-
-    def pointwise(self, b: KtirBuilder, op: str, ins, out: TensorArg):
-        """``linalg`` named op over an uninitialised ``tensor.empty`` out."""
-        out_extents = [int(s) for s in out.device_size]
-        elt_t = b.elt_type(out.device_dtype)
-        tensor_t = ir.RankedTensorType.get(out_extents, elt_t)
-        empty = b.val(tensor.EmptyOp(out_extents, elt_t))
-        builder = getattr(linalg, REGISTRY[op].linalg_builder)
-        return b.val(builder(*ins, outs=[empty], result_tensors=[tensor_t]))
+    return [b.index_t] * len(table.param_entries)
 
 
-class FuncArgAddresses:
-    """The revert target: one ``index`` func arg per buffer, ``arith`` compute."""
-
-    def __init__(self, table: BufferTable) -> None:
-        self.table = table
-
-    def func_param_types(self, b: KtirBuilder) -> list:
-        return [b.index_t] * len(self.table.param_entries)
-
-    def bind_views(self, b: KtirBuilder, table: BufferTable) -> None:
-        for position, entry in enumerate(table.param_entries):
-            base = b.block_args[position]
-            b.bind_view(entry.buf_id, b.memory_view(base, entry))
-
-    def pointwise(self, b: KtirBuilder, op: str, ins, out: TensorArg):
-        return b.val(getattr(arith, REGISTRY[op].arith_builder)(*ins))
-
-
-AddressSource = BakedConstants | FuncArgAddresses
-
-
-def address_source(table: BufferTable) -> AddressSource:
-    """The address form for this kernel: the single #65 revert seam."""
-    return BakedConstants(table) if _addresses_are_baked() else FuncArgAddresses(table)
+def _bind_views(b: KtirBuilder, table: BufferTable) -> None:
+    """One memory view per buffer, based on a constant or on a func argument."""
+    baked = _addresses_are_baked()
+    for position, entry in enumerate(table.param_entries):
+        base = b.icst_index(entry.base_elements) if baked else b.block_args[position]
+        b.bind_view(entry.buf_id, b.memory_view(base, entry))
 
 
 # ---------------------------------------------------------------------------
@@ -756,10 +787,9 @@ def generate_ktir(
     # KtirBuilder.create(), so an unsupported request fails fast -- and is
     # testable -- whether or not mlir_ktdp is installed.
     table = validate(specs)
-    addrs = address_source(table)
-    b = KtirBuilder.create(addrs)
+    b = KtirBuilder.create()
     # Single-core (SENCORES=1) grid; work-division scaling is future work.
-    with b.module(kernel_name, grid=[1], params=addrs.func_param_types(b)):
-        addrs.bind_views(b, table)
+    with b.module(kernel_name, grid=[1], params=_func_param_types(b, table)):
+        _bind_views(b, table)
         emit_specs(b, specs)
     return b.finish()

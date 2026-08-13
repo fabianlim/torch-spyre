@@ -26,6 +26,7 @@ do need the dialect build and are skipped without it.  It imports the shared
 """
 
 import ast
+import dataclasses
 import inspect
 import unittest
 from unittest import mock
@@ -130,10 +131,11 @@ class TestValidateRejections(unittest.TestCase):
         self._rejects(specs, "reductions are not supported")
 
     def test_unregistered_op_rejected(self):
+        """An op with no recipe is rejected, and the message names what exists."""
         specs = _add_op_specs()
-        specs[0].op = "mul"
-        self.assertNotIn("mul", ktir.REGISTRY)
-        self._rejects(specs, "op 'mul' is not supported yet")
+        specs[0].op = "atan2"
+        self.assertNotIn("atan2", ktir.REGISTRY)
+        self._rejects(specs, "op 'atan2' is not supported yet")
 
     # -- per-op roles ------------------------------------------------------
 
@@ -199,11 +201,11 @@ class TestRejectionsThroughGenerateKtir(unittest.TestCase):
         with self.assertRaises(NotImplementedError):
             ktir.generate_ktir("ktir_fused_add_0", specs)
 
-    def test_non_add_unsupported(self):
+    def test_unregistered_op_unsupported(self):
         specs = _add_op_specs()
-        specs[0].op = "mul"
+        specs[0].op = "atan2"
         with self.assertRaises(NotImplementedError):
-            ktir.generate_ktir("ktir_fused_mul_0", specs)
+            ktir.generate_ktir("ktir_fused_atan2_0", specs)
 
     def test_multicore_unsupported(self):
         with (
@@ -277,16 +279,40 @@ class TestBaseAddressElements(unittest.TestCase):
 
 
 class TestRegistry(unittest.TestCase):
-    """The op registry is one record per op, and the walk dispatches through it."""
+    """One recipe per op, and every recipe is emittable by some family method."""
 
-    def test_every_entry_is_complete(self):
+    def test_every_recipe_is_complete(self):
         self.assertTrue(ktir.REGISTRY)
-        for op, entry in ktir.REGISTRY.items():
+        for op, recipe in ktir.REGISTRY.items():
             with self.subTest(op=op):
-                self.assertTrue(callable(entry.emit))
-                self.assertGreaterEqual(entry.arity, 1)
-                self.assertTrue(entry.arith_builder)
-                self.assertTrue(entry.linalg_builder)
+                self.assertEqual(recipe.name, op)
+                self.assertGreaterEqual(recipe.arity, 1)
+                self.assertIsInstance(recipe.family, ktir.Family)
+                # A thunk, not the builder itself: resolving it here would need
+                # the dialect, which this module deliberately does not require.
+                self.assertTrue(callable(recipe.binding))
+                # The family it declares must be one the builder can emit,
+                # otherwise the walk fails at emit time rather than here.
+                self.assertTrue(
+                    callable(
+                        getattr(ktir.KtirBuilder, recipe.family.name.lower(), None)
+                    ),
+                    f"KtirBuilder has no {recipe.family.name.lower()}() for {op!r}",
+                )
+
+    def test_register_rejects_a_duplicate_name(self):
+        """Registration is the one place an op is declared, so it must be unique."""
+        with self.assertRaises(ValueError):
+            ktir.register("add", arity=2, family=ktir.Family.ELEMENTWISE)(lambda: None)
+
+    def test_family_comes_from_the_spec_not_the_name(self):
+        """A reducing spec asks for REDUCTION even when the op is registered
+        elementwise -- which is why validate rejects it rather than the walk
+        silently emitting the wrong shape."""
+        spec = _add_op_specs()[0]
+        self.assertIs(ktir.family_of(spec), ktir.Family.ELEMENTWISE)
+        reducing = dataclasses.replace(spec, is_reduction=True)
+        self.assertIs(ktir.family_of(reducing), ktir.Family.REDUCTION)
 
     def test_emit_specs_asserts_on_unvalidated_entries(self):
         """The emitter's only remaining ``raise`` is this validation-bug guard."""

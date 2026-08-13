@@ -59,9 +59,10 @@ module {
     %4 = ktdp.load %3 : <16x512x64xindex> -> tensor<16x512x64xf16>
     %5 = ktdp.construct_access_tile %1[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
     %6 = ktdp.load %5 : <16x512x64xindex> -> tensor<16x512x64xf16>
-    %7 = arith.addf %4, %6 : tensor<16x512x64xf16>
-    %8 = ktdp.construct_access_tile %2[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
-    ktdp.store %7, %8 : tensor<16x512x64xf16>, <16x512x64xindex>
+    %7 = tensor.empty() : tensor<16x512x64xf16>
+    %8 = linalg.add ins(%4, %6 : tensor<16x512x64xf16>, tensor<16x512x64xf16>) outs(%7 : tensor<16x512x64xf16>) -> tensor<16x512x64xf16>
+    %9 = ktdp.construct_access_tile %2[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
+    ktdp.store %8, %9 : tensor<16x512x64xf16>, <16x512x64xindex>
     return
   }
 }
@@ -86,6 +87,28 @@ class TestKtirEmitter(unittest.TestCase):
         emitted = generate_ktir("ktir_fused_add_0", _add_op_specs())
         self.assertEqual(emitted, _EXPECTED_ADD_KTIR)
 
+    def test_registered_ops_reach_their_own_binding(self):
+        """A second op costs one recipe: same shape, different linalg builder.
+
+        Asserted as a delta against the golden rather than a second copy of it --
+        only the compute line differs.
+        """
+        import dataclasses
+
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        specs = [dataclasses.replace(_add_op_specs()[0], op="mul")]
+        emitted = generate_ktir("ktir_fused_mul_0", specs)
+        self.assertIn("linalg.mul ins(", emitted)
+        self.assertNotIn("linalg.add", emitted)
+        # Everything either side of the compute op is unchanged by the op name.
+        self.assertEqual(
+            emitted.replace("linalg.mul", "linalg.add").replace(
+                "@ktir_fused_mul_0", "@ktir_fused_add_0"
+            ),
+            _EXPECTED_ADD_KTIR,
+        )
+
 
 @mock.patch(f"{_CONFIG}.bundle_symbolic_args", False)
 @mock.patch(f"{_CONFIG}.sencores", 1)
@@ -97,11 +120,10 @@ class TestKtirBakedAddresses(unittest.TestCase):
     def test_baked_form_deltas(self):
         """The baked form (dataflow-scheduler#65) vs ``_EXPECTED_ADD_KTIR``.
 
-        Asserted as deltas rather than a second golden: the two texts differ in
-        5 of 24 lines, so a full copy would be 19 lines of duplication that churn
-        together, and this form is deleted outright when #65 is fixed.  The
-        loads / tiles / views the two share are already pinned by
-        ``_EXPECTED_ADD_KTIR``.
+        Asserted as deltas rather than a second golden: the two texts differ
+        only in how base addresses are spelled, so a full copy would duplicate
+        every line that churns together.  Reverting #65 deletes the baked arm of
+        the two address helpers; the compute form does not move.
         """
         from torch_spyre._inductor.codegen.ktir import generate_ktir
 
@@ -115,11 +137,9 @@ class TestKtirBakedAddresses(unittest.TestCase):
             with self.subTest(arg_index=arg_index):
                 base = (arg_index << 34) // 2
                 self.assertIn(f"arith.constant {base} : index", emitted)
-        # 3. linalg over tensor.empty, never arith on tensors -- required for the
-        #    memref offset to fold to static, which ktdp.load's verifier needs.
-        self.assertIn("tensor.empty()", emitted)
-        self.assertIn("linalg.add ins(", emitted)
-        self.assertNotIn("arith.addf", emitted)
+        # Compute is deliberately NOT asserted here: both forms emit the same
+        # linalg.add over a tensor.empty, so it is pinned by _EXPECTED_ADD_KTIR
+        # and is not a delta.  The two texts now differ only in addressing.
 
 
 if __name__ == "__main__":

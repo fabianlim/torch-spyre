@@ -34,20 +34,21 @@ Structure
 
 ``generate_ktir`` is three steps, in this order:
 
-1. ``build_buffer_plan(specs)`` -- a **pure** recursive walk that raises every
-   ``NotImplementedError`` the emitter can raise, runs the derivations, and
-   returns a ``BufferPlan`` of what they produced.  It imports nothing from
-   ``mlir_ktdp``, so every rejection is reachable and testable where the dialect
-   build is absent.
+1. ``build_kernel_plan(specs)`` -- a **pure** recursive walk of the spec tree
+   that runs every derivation, raises every ``NotImplementedError`` the emitter
+   can raise, and returns a ``KernelPlan``: the grid, the buffers, and a tree of
+   ``Step`` records for the body.  It imports nothing from ``mlir_ktdp``, so
+   every rejection is reachable and testable where the dialect build is absent.
 2. ``KtirBuilder.create(plan)`` -- the single ``mlir_ktdp`` import site; owns
    the context and the per-module state.
-3. ``emit_specs(b, specs)`` -- a recursive walk over the same spec tree,
-   dispatching each ``OpSpec`` through ``KtirBuilder.RECIPES``.
+3. ``b.emit(plan.steps)`` -- a recursive walk of the step tree.  It reads no
+   spec and derives nothing, so emission cannot refuse a request the plan
+   accepted.
 
 Adding a pointwise op is one ``RECIPES`` entry.  Enabling counted loops is
 making ``counted_loops='walk'`` the only mode: the plan walk, the derivations,
-``emit_loop`` and the per-level access indices are in place, and ``STATUS_TABLE``
-says which parts of them a consumer accepts.
+``LoopStep`` and its emission are in place, and ``STATUS_TABLE`` says which parts
+of them a consumer accepts.
 """
 
 from __future__ import annotations
@@ -328,17 +329,16 @@ class ElemTypes:
 
 @dataclasses.dataclass(frozen=True)
 class Level:
-    """One enclosing loop level.
+    """One enclosing loop level, as the derivations see it.
 
     ``symbols`` is that level's entry of ``OpSpec.tiled_symbols`` (possibly
-    empty: a level that does not tile this op), ``trip`` its trip count, ``iv``
-    the ``scf.for`` induction variable once one exists (``None`` while the level
-    is being reasoned about outside an emission).
+    empty: a level that does not tile this op) and ``trip`` is its trip count.
+    No induction variable: levels are planned before any SSA value exists, and
+    the builder supplies the variable of the loop it has open.
     """
 
     symbols: tuple[Any, ...]
     trip: int
-    iv: Any | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -372,13 +372,15 @@ class Access:
     extent is what tiling already baked into ``device_size``, while the
     *buffer* extent grows back out of it in ``_layout``.
 
-    ``index_coeffs[i][l]`` is the step level ``l`` takes along view dim ``i``,
-    so the index handed to the access tile for dim ``i`` is
-    ``sum_l index_coeffs[i][l] * indices[l]``.  This is the design's ``base_map``
-    as a matrix; the builder spells it the way the committed loop fixtures do --
-    an identity ``base_map`` with one index expression per view dim -- rather
-    than as a non-identity map over the induction variables.  The matrix is the
-    same either way, so the spelling is one builder function.
+    ``index_coeffs[i][l]`` is the step level ``l`` takes along view dim ``i``, so
+    the index for dim ``i`` is ``sum_l index_coeffs[i][l] * iv_l``, where ``iv_l``
+    is the induction variable of the ``l``-th enclosing loop.  The record holds
+    the coefficients only -- the variables exist during emission, not during
+    planning -- and the builder zips them against the loops it has open.  This is
+    the design's ``base_map`` as a matrix; the builder spells it the way the
+    committed loop fixtures do, an identity ``base_map`` with one index
+    expression per view dim, rather than a non-identity map over the induction
+    variables.  The matrix is the same either way.
 
     ``elems`` is the access's own element type pair: a tile of an internal buffer
     has no ``Buffer`` to read one from, and a load that reinterprets would differ
@@ -390,10 +392,50 @@ class Access:
     """
 
     extent: tuple[int, ...]
-    index_coeffs: tuple[tuple[int, ...], ...]
-    indices: tuple[Any, ...]  # per level, outermost-first
+    index_coeffs: tuple[tuple[int, ...], ...]  # [view dim][level]
     elems: ElemTypes
     buffer: Buffer | None = None  # None for an internal (threaded) buffer
+
+
+# ---------------------------------------------------------------------------
+# Steps: the plan's instructions, which is all the builder is given
+# ---------------------------------------------------------------------------
+#
+# A step is one thing to emit, resolved: no ``OpSpec``, no ``TensorArg``, no
+# sympy, no SSA values.  ``KernelPlan.steps`` is a tree of them, and
+# ``KtirBuilder.emit`` walks it, so everything the emitter needs to decide has
+# been decided -- and every rejection has already been raised -- before emission
+# begins.  The tree mirrors the spec tree's nesting because that nesting is what
+# the loops are; what it does not carry is anything the emitter would have to
+# interpret.
+
+
+@dataclasses.dataclass(frozen=True)
+class ComputeStep:
+    """One compute op: what to read, what to apply, what to do with the result.
+
+    ``ins`` is one ``(buf_id, Access)`` per operand, in the op's operand order.
+    ``store`` is ``False`` for an internal result, which is bound in scope for a
+    later step instead of being stored through ``out``.
+    """
+
+    op: str  # a KtirBuilder.RECIPES key
+    family: Family
+    ins: tuple[tuple[str, Access], ...]
+    out: Access
+    out_buf_id: str
+    store: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class LoopStep:
+    """A counted loop, with the steps that go in its body."""
+
+    trip: int
+    body: tuple[Step, ...]
+
+
+Step = ComputeStep | LoopStep
 
 
 # ---------------------------------------------------------------------------
@@ -429,16 +471,34 @@ def _elem_types(arg: TensorArg) -> ElemTypes:
     return ElemTypes(storage=name, value=name)
 
 
-def _levels(spec: OpSpec, loops: Sequence[tuple[LoopSpec, Any]] = ()) -> list[Level]:
+def _trip(loop: LoopSpec) -> int:
+    """``loop``'s trip count as a whole number of iterations.
+
+    The only reader of ``LoopSpec.count``, so the symbolic-count guard is here
+    and both the level derivation and the loop step get the same answer.
+
+    Label: ``symbolic-loop-count``.
+    """
+    trip = _static(loop.count)
+    if not isinstance(trip, int):
+        _downstream_unsupported(
+            "symbolic-loop-count",
+            f"loop trip count {loop.count} is symbolic; trip counts must be "
+            "integers to be emitted today",
+        )
+    return trip
+
+
+def _levels(spec: OpSpec, loops: Sequence[LoopSpec] = ()) -> list[Level]:
     """The enclosing loop levels for ``spec``, outermost-first.
 
-    ``loops`` is the enclosing ``(LoopSpec, induction variable)`` chain the walk
-    is inside, outermost-first; ``()`` at function level.  ``OpSpec.tiled_symbols``
-    is innermost-first with one entry per enclosing level, so this is that list
+    ``loops`` is the enclosing ``LoopSpec`` chain the walk is inside,
+    outermost-first; ``()`` at function level.  ``OpSpec.tiled_symbols`` is
+    innermost-first with one entry per enclosing level, so this is that list
     reversed and zipped against the loops -- the one place the two orderings
     meet, and therefore the place a mismatch between them is reported.
 
-    Labels: ``loop-levels``, ``symbolic-loop-count``.
+    Label: ``loop-levels``.
 
     With no enclosing loops the result is ``[]`` because ``tiled_symbols`` is
     empty and there is nothing to zip -- the general answer for a nest of depth
@@ -452,14 +512,8 @@ def _levels(spec: OpSpec, loops: Sequence[tuple[LoopSpec, Any]] = ()) -> list[Le
             "level must have an entry, even an empty one"
         )
     levels: list[Level] = []
-    for (loop, iv), symbols in zip(loops, by_level, strict=True):
-        trip = _static(loop.count)
-        if not isinstance(trip, int):
-            _downstream_unsupported(
-                "symbolic-loop-count",
-                f"loop trip count {loop.count} is symbolic; trip counts must be "
-                "integers to be emitted today",
-            )
+    for loop, symbols in zip(loops, by_level, strict=True):
+        trip = _trip(loop)
         for symbol in symbols:
             declared = _static(spec.tiled_symbol_trip_counts.get(symbol, trip))
             if declared != trip:
@@ -467,7 +521,7 @@ def _levels(spec: OpSpec, loops: Sequence[tuple[LoopSpec, Any]] = ()) -> list[Le
                     f"OpSpec->KTIR: symbol {symbol} is declared with trip count "
                     f"{declared} but its loop level runs {trip} times"
                 )
-        levels.append(Level(symbols=tuple(symbols), trip=trip, iv=iv))
+        levels.append(Level(symbols=tuple(symbols), trip=trip))
     return levels
 
 
@@ -722,8 +776,8 @@ def _access(
     """The access record for one ``(OpSpec, TensorArg)``.
 
     The tile extent is ``device_size`` (tiling is already baked into it), and
-    the per-dim index expression is level ``l``'s step along dim ``i`` times
-    that level's induction variable, summed over levels.
+    the per-dim index coefficient is level ``l``'s step along dim ``i``, which the
+    builder multiplies by that level's induction variable at emit time.
 
     Label: ``access-tile-offsets``.
 
@@ -747,39 +801,20 @@ def _access(
     return Access(
         extent=extent,
         index_coeffs=index_coeffs,
-        indices=tuple(level.iv for level in levels),
         elems=_elem_types(arg),
         buffer=buffer,
     )
 
 
-def _solve_access(
-    arg: TensorArg, levels: Sequence[Level], plan: BufferPlan | None = None
-) -> Access:
-    """``arg``'s access record at nest depth ``levels``: the derivations, in order.
-
-    The one composite the walk calls per operand.  ``_solve_layout`` settles the
-    view the tile indexes and the per-level steps together, and ``_access`` turns
-    those steps into per-dim index expressions; ``plan`` supplies the ``Buffer``
-    the access is a tile of, which is how the record carries its own way back to
-    the emitted view.  Named like ``_solve_layout`` because it is the same kind of
-    thing: several derivations whose results depend on each other.
-    """
-    layout, q = _solve_layout(arg, levels)
-    buffer = plan.buffers.get(_buf_id(arg)) if plan is not None else None
-    return _access(arg, levels, q, layout, buffer)
-
-
 # ---------------------------------------------------------------------------
-# BufferPlan: the one record the walk needs up front
+# KernelPlan: everything the builder is given
 # ---------------------------------------------------------------------------
 #
-# The func signature must be known before the body is emitted, and its parameter
-# count depends on the address form, so the buffers -- the ``Buffer`` records the
-# derivations produce -- are collected by the validation walk into a flat plan
-# keyed by ``_buf_id``.  The per-access ``Access`` records are not in the plan:
-# they depend on the enclosing loop levels, so they are derived where the walk
-# knows them, from the same pure derivations the plan was built with.
+# The plan is the whole instruction list: the grid, the buffers whose views and
+# func parameters the kernel opens with, and the step tree that goes in its body.
+# It is built by one walk of the spec tree, which is where the derivations run
+# and therefore where every rejection is raised.  Emission consumes the plan and
+# reads no spec, so it cannot discover a reason to refuse half-way through.
 
 
 def is_internal(arg: TensorArg) -> bool:
@@ -892,23 +927,24 @@ def _grid(cores: int) -> tuple[int, ...]:
     return (1,)
 
 
-class BufferPlan:
-    """Unique ``Buffer`` records in first-seen order, keyed by ``buf_id``.
+class KernelPlan:
+    """One kernel, resolved: its grid, its buffers, and the steps for its body.
 
-    Fills itself from a spec tree: ``add_specs`` is the walk, so the buffers, the
-    options and the walk that produces them are one object rather than a dict
-    threaded through free functions.  Filling it is what runs the derivations, so
-    it is also where every ``NotImplementedError`` the emitter can raise comes
-    from.
+    Fills itself from a spec tree -- ``add_specs`` is the walk -- so the options,
+    the buffers, the steps and the walk that produces them are one object rather
+    than a dict threaded through free functions.  Filling it is what runs the
+    derivations, so it is also where every ``NotImplementedError`` the emitter can
+    raise comes from, and a plan that exists is a kernel that can be emitted.
 
-    ``grid`` is resolved here rather than at emit time: the builder emits the
-    grid it is given and does not know what a core is.
+    ``grid`` is resolved here rather than at emit time: the builder emits the grid
+    it is given and does not know what a core is.
     """
 
     def __init__(self, options: PlanOptions | None = None) -> None:
         self.options = options or PlanOptions()
         self.grid = _grid(self.options.cores)
         self.buffers: dict[str, Buffer] = {}
+        self.steps: tuple[Step, ...] = ()
 
     @property
     def parameters(self) -> list[Buffer]:
@@ -923,15 +959,19 @@ class BufferPlan:
             key=lambda e: e.arg_index,
         )
 
-    def add_specs(self, specs, loops: Sequence = ()) -> None:
-        """Recursive: plan one spec list.  Mirrors ``emit_specs``' structure.
+    def add_specs(self, specs: Sequence[OpSpec | LoopSpec | UnimplementedOp]) -> None:
+        """Plan ``specs`` into this plan's buffers and steps."""
+        self.steps = self._steps(specs, ())
 
-        ``loops`` is the enclosing ``(LoopSpec, induction variable)`` chain, the
-        same value ``emit_specs`` reaches an op with, except that no induction
-        variable exists outside an emission and every entry's is ``None``.  The
-        derivations read only ``LoopSpec.count`` and the level ordering, so they
-        answer the same here as they do at emit time.
+    def _steps(self, specs, loops: Sequence[LoopSpec]) -> tuple[Step, ...]:
+        """Recursive: the steps for one spec list, inside the ``loops`` chain.
+
+        ``loops`` is the enclosing ``LoopSpec`` chain, outermost-first, which is
+        what ``_levels`` zips ``OpSpec.tiled_symbols`` against.  A nested list
+        becomes a nested ``LoopStep.body``, so the step tree's nesting is the
+        spec tree's nesting and the emitter never has to work out the depth.
         """
+        steps: list[Step] = []
         for entry in specs:
             if isinstance(entry, UnimplementedOp):
                 raise NotImplementedError(
@@ -942,7 +982,12 @@ class BufferPlan:
                     raise NotImplementedError(
                         "OpSpec->KTIR: counted loops (LoopSpec) are not supported yet"
                     )
-                self.add_specs(entry.body, [*loops, (entry, None)])
+                steps.append(
+                    LoopStep(
+                        trip=_trip(entry),
+                        body=self._steps(entry.body, [*loops, entry]),
+                    )
+                )
                 continue
             if not isinstance(entry, OpSpec):
                 raise NotImplementedError(
@@ -957,15 +1002,16 @@ class BufferPlan:
                     f"OpSpec->KTIR: op {entry.op!r} is not supported yet "
                     f"(registered: {sorted(KtirBuilder.RECIPES)})"
                 )
-            self._add_op(entry, loops)
+            steps.append(self._compute_step(entry, loops))
+        return tuple(steps)
 
-    def _add_op(self, spec: OpSpec, loops: Sequence) -> None:
-        """One op: roles/arity, in-place aliasing, operand alignment, buffers.
+    def _compute_step(self, spec: OpSpec, loops: Sequence[LoopSpec]) -> ComputeStep:
+        """One op: roles/arity, aliasing, alignment, its buffers and its accesses.
 
-        The buffer records are built by the same derivations the emission path
-        calls, so every raise those derivations own is reached before the dialect
-        is imported, and the plan cannot describe a buffer differently from the
-        view that gets emitted for it.
+        Every derivation for this op runs here, once: the layout and per-level
+        steps solved for an arg are the ones its buffer records and the ones its
+        access is built from, so a view and the tiles into it cannot disagree, and
+        emission has nothing left to derive.
         """
         out, inputs = validated_roles(spec)
         out_extents = [int(s) for s in out.device_size]
@@ -990,18 +1036,35 @@ class BufferPlan:
                     "OpSpec->KTIR: broadcast / reshape operands not supported yet"
                 )
         levels = _levels(spec, loops)
-        for arg in spec.args:
-            layout, _ = _solve_layout(arg, levels)
-            elems = _elem_types(arg)
-            # An internal buffer never reaches memory: no func parameter, no
-            # memory view, no address.  It is threaded as a value instead, so it
-            # gets no entry here.
-            if is_internal(arg):
-                continue
-            buffer = _buffer(
-                arg, layout, elems, bake_addresses=self.options.bake_addresses
+        accesses = {_buf_id(arg): self._access_of(arg, levels) for arg in spec.args}
+        return ComputeStep(
+            op=spec.op,
+            family=Family.of(spec),
+            ins=tuple((_buf_id(arg), accesses[_buf_id(arg)]) for arg in inputs),
+            out=accesses[_buf_id(out)],
+            out_buf_id=_buf_id(out),
+            # An internal buffer never reaches memory: it is threaded as a value,
+            # so it gets no store, no func parameter, no view and no address.
+            store=not is_internal(out),
+        )
+
+    def _access_of(self, arg: TensorArg, levels: Sequence[Level]) -> Access:
+        """``arg``'s access at this depth, registering its buffer on the way.
+
+        The buffer is registered first and handed to the access, so the record
+        carries its own way back to the view the builder will bind for it.  The
+        first record seen for a ``buf_id`` wins, which is the one every later
+        access to that buffer points at.
+        """
+        layout, q = _solve_layout(arg, levels)
+        elems = _elem_types(arg)
+        buffer = None
+        if not is_internal(arg):
+            buffer = self.buffers.setdefault(
+                _buf_id(arg),
+                _buffer(arg, layout, elems, bake_addresses=self.options.bake_addresses),
             )
-            self.buffers.setdefault(buffer.buf_id, buffer)
+        return _access(arg, levels, q, layout, buffer)
 
 
 def _base_address_elements(arg: TensorArg) -> int:
@@ -1033,23 +1096,23 @@ def _base_address_elements(arg: TensorArg) -> int:
 
 
 # ---------------------------------------------------------------------------
-# build_buffer_plan: every rejection, with no mlir_ktdp
+# build_kernel_plan: every rejection, with no mlir_ktdp
 # ---------------------------------------------------------------------------
 
 
-def build_buffer_plan(
+def build_kernel_plan(
     specs: Sequence[OpSpec | LoopSpec | UnimplementedOp],
     options: PlanOptions | None = None,
-) -> BufferPlan:
-    """The kernel's ``BufferPlan``, and every rejection on the way to it.  Pure.
+) -> KernelPlan:
+    """The kernel's ``KernelPlan``, and every rejection on the way to it.  Pure.
 
-    The whole-request checks are the grid (in ``BufferPlan.__init__``) and the
-    empty-kernel check below; everything per-spec is ``BufferPlan.add_specs``.
+    The whole-request checks are the grid (in ``KernelPlan.__init__``) and the
+    empty-kernel check below; everything per-spec is ``KernelPlan.add_specs``.
     Imports nothing from ``mlir_ktdp`` (the dialect import is lazy, inside
     ``KtirBuilder.create``), so it is usable wherever ``import ktir`` works --
     which is everywhere.
     """
-    plan = BufferPlan(options)
+    plan = KernelPlan(options)
     plan.add_specs(specs)
     if not plan.buffers:
         raise NotImplementedError("OpSpec->KTIR: no OpSpec to emit")
@@ -1115,121 +1178,48 @@ class Recipe:
 
 
 # ---------------------------------------------------------------------------
-# The walk
-# ---------------------------------------------------------------------------
-
-
-def emit_specs(b: KtirBuilder, specs) -> None:
-    """Emit a spec list into the current insertion point. Recursive."""
-    for entry in specs:
-        if isinstance(entry, LoopSpec):
-            emit_loop(b, entry)
-        elif isinstance(entry, OpSpec):
-            _emit_op(b, entry)
-        else:
-            # build_buffer_plan() already rejected UnimplementedOp and anything
-            # else, so
-            # reaching here is a validation bug, not an unsupported request.
-            # AssertionError (not TypeError) says exactly that.
-            raise AssertionError(  # noqa: TRY004
-                f"unvalidated spec entry {type(entry).__name__}"
-            )
-
-
-def _emit_op(b: KtirBuilder, spec: OpSpec) -> None:
-    """Translate one ``OpSpec`` into records, then emit it.
-
-    THE boundary between the spec tree and the builder.  Reading the iteration
-    space needs the enclosing loop nest, which only the walk knows, so the walk
-    derives every ``Access`` here -- against the nest the insertion point is
-    inside, taken from the builder's own scope stack -- and hands the builder
-    records, values and primitives.  Nothing below this line sees an ``OpSpec``.
-    """
-    recipe = KtirBuilder.RECIPES[spec.op]
-    family = Family.of(spec)
-    if family is not Family.ELEMENTWISE:
-        # build_buffer_plan() rejects every family without a builder method, so
-        # reaching
-        # here is a validation bug rather than an unsupported request.
-        raise AssertionError(f"no emission for family {family} of {spec.op!r}")
-    out, inputs = validated_roles(spec)
-    levels = _levels(spec, b.env.loops())
-    ins = [
-        b.operand(_buf_id(arg), _solve_access(arg, levels, b.plan)) for arg in inputs
-    ]
-    out_access = _solve_access(out, levels, b.plan)
-    value = b.elementwise(recipe, ins, out_access)
-    # An internal buffer is threaded rather than stored, so it is handed no
-    # access to store through.  The extent and element type the compute needed
-    # still come from its own access record.
-    b.result(_buf_id(out), None if is_internal(out) else out_access, value)
-
-
-def emit_loop(b: KtirBuilder, loop: LoopSpec) -> None:
-    """One counted loop: the builder's loop, with ``loop.body`` emitted inside it.
-
-    ``generate_ktir`` cannot reach this, because its ``counted_loops='reject'``
-    plan walk refuses the nest first.  The walk contributes the trip count and
-    the recursion; where the emitted ops go is ``b.counted_loop``'s business, and
-    the level the derivations see is ``b.env.scope``'s.  Both are scoped by
-    ``with``, so the walk needs no parallel structure to know where it is.
-    """
-    with (
-        b.counted_loop(loop.count) as iv,  # int today; sympy later
-        b.env.scope(iv=iv, loop=loop),
-    ):
-        emit_specs(b, loop.body)  # the recursion point
-
-
-# ---------------------------------------------------------------------------
-# What the walk carries in scope
+# What the builder carries in scope
 # ---------------------------------------------------------------------------
 
 
 class ScopeStack:
-    """Builder-owned lexical scope: loop levels and live values.
+    """Builder-owned lexical scope: open loops and live values.
 
-    Pushed and popped by the walk via ``with``.  A base frame is always present
-    so values produced at function level have somewhere to live.  A frame that
-    carries a ``LoopSpec`` and its induction variable is a loop level; the base
-    frame carries neither.
+    Pushed and popped by ``KtirBuilder.emit`` via ``with``.  A base frame is
+    always present so values produced at function level have somewhere to live.
+    A frame that carries an induction variable is an open loop; the base frame
+    does not.
     """
 
     def __init__(self) -> None:
-        # (LoopSpec or None, induction variable or None, {buf_id: Value}),
-        # innermost last.
-        self._frames: list[tuple[Any, Any, dict[str, Any]]] = [(None, None, {})]
+        # (induction variable or None, {buf_id: Value}), innermost last.
+        self._frames: list[tuple[Any, dict[str, Any]]] = [(None, {})]
 
     @contextlib.contextmanager
-    def scope(self, iv: Any = None, loop: Any = None) -> Iterator[None]:
-        self._frames.append((loop, iv, {}))
+    def scope(self, iv: Any = None) -> Iterator[None]:
+        self._frames.append((iv, {}))
         try:
             yield
         finally:
             self._frames.pop()
 
     def produced(self, buf_id: str):
-        """The ``Value`` a live node produced for ``buf_id``, else ``None``."""
-        for *_, produced in reversed(self._frames):
+        """The ``Value`` a live step produced for ``buf_id``, else ``None``."""
+        for _, produced in reversed(self._frames):
             if buf_id in produced:
                 return produced[buf_id]
         return None
 
     def bind_produced(self, buf_id: str, value) -> None:
-        self._frames[-1][2][buf_id] = value
+        self._frames[-1][1][buf_id] = value
 
     def ivs(self) -> list:
-        """Enclosing induction variables, innermost last."""
-        return [iv for _, iv, _ in self._frames if iv is not None]
+        """The induction variables of the open loops, outermost-first.
 
-    def loops(self) -> list[tuple[Any, Any]]:
-        """Enclosing ``(LoopSpec, induction variable)`` levels, outermost-first.
-
-        The value ``_levels`` zips ``OpSpec.tiled_symbols`` against, so the loop
-        nest the walk is physically inside is the one the derivations reason
-        about -- there is no second record of the nesting to fall out of step.
+        What ``Access.index_coeffs`` is zipped against: one coefficient per
+        enclosing level, in the same order the plan derived them.
         """
-        return [(loop, iv) for loop, iv, _ in self._frames if loop is not None]
+        return [iv for iv, _ in self._frames if iv is not None]
 
 
 # ---------------------------------------------------------------------------
@@ -1240,18 +1230,17 @@ class ScopeStack:
 class KtirBuilder:
     """Owns the MLIR context, the dialect handles and per-module state.
 
-    No method takes an ``OpSpec`` or a ``TensorArg``: the arguments are records
-    (``Buffer``, ``Layout``, ``ElemTypes``, ``Access``), SSA values and
-    primitives.  Deriving an access needs the enclosing loop nest, so that
-    reading of the iteration space is the walk's (``_emit_op``'s) job and the
-    builder receives the answer.  The builder does hold the ``BufferPlan``,
-    which is a container of records, so the walk can reach it through ``b``.
+    No method takes an ``OpSpec`` or a ``TensorArg``: the arguments are the
+    plan's records (``Buffer``, ``Layout``, ``ElemTypes``, ``Access``, ``Step``),
+    SSA values and primitives.  ``emit`` walks the plan's steps, so the builder
+    is the only thing that touches the dialect and the plan is the only thing it
+    reads -- there is no spec tree on this side of the boundary.
 
     Every ktdp shape method returns an SSA ``Value``, so ``val()`` does not
     appear at call sites.
     """
 
-    def __init__(self, stack, plan: BufferPlan):
+    def __init__(self, stack, plan: KernelPlan):
         self._stack = stack
         self.plan = plan
         self.env = ScopeStack()
@@ -1263,11 +1252,11 @@ class KtirBuilder:
         self._text: str | None = None
 
     @classmethod
-    def create(cls, plan: BufferPlan) -> KtirBuilder:
+    def create(cls, plan: KernelPlan) -> KtirBuilder:
         """THE single lazy-import site, and the owner of the MLIR context.
 
         Module level stays ``mlir_ktdp``-free, so ``import ktir`` -- and
-        therefore ``build_buffer_plan`` -- works where the dialect build is absent.
+        therefore ``build_kernel_plan`` -- works where the dialect build is absent.
 
         The context is entered here rather than in ``module()`` because
         ``_func_param_types`` builds ``ir`` types and is called before the module
@@ -1366,11 +1355,46 @@ class KtirBuilder:
         because every value the body produces is stored to memory inside it.
         """
         lo, step = self.icst_index(0), self.icst_index(1)
-        hi = self.icst_index(int(trip))  # int today; sympy later
+        hi = self.icst_index(int(trip))
         for_op = scf.ForOp(lo, hi, step)
         with ir.InsertionPoint(for_op.body):
             yield for_op.induction_variable
             scf.YieldOp([])
+
+    # -- the walk ----------------------------------------------------------
+
+    def emit(self, steps: Sequence[Step]) -> None:
+        """Emit a step list at the current insertion point.  Recursive.
+
+        The whole emission: a loop opens a loop and recurses, anything else is a
+        compute step.  There is no third case and nothing to decide -- the plan
+        decided it -- so this walk raises nothing but the assertion that says the
+        plan is malformed.
+        """
+        for step in steps:
+            if isinstance(step, LoopStep):
+                with self.counted_loop(step.trip) as iv, self.env.scope(iv=iv):
+                    self.emit(step.body)
+            elif isinstance(step, ComputeStep):
+                self.compute(step)
+            else:
+                # Every step a plan can hold is handled above, so reaching here
+                # is a plan bug, not an unsupported request.  AssertionError (not
+                # TypeError) says exactly that.
+                raise AssertionError(  # noqa: TRY004
+                    f"unplanned step {type(step).__name__}"
+                )
+
+    def compute(self, step: ComputeStep) -> None:
+        """Read the operands, apply the op's builder, dispose of the result."""
+        recipe = self.RECIPES[step.op]
+        if step.family is not Family.ELEMENTWISE:
+            # The plan rejects every family without a method here, so reaching
+            # this is a plan bug rather than an unsupported request.
+            raise AssertionError(f"no emission for family {step.family} of {step.op!r}")
+        ins = [self.operand(buf_id, access) for buf_id, access in step.ins]
+        value = self.elementwise(recipe, ins, step.out)
+        self.result(step.out_buf_id, step.out if step.store else None, value)
 
     # -- ktdp shapes -------------------------------------------------------
 
@@ -1407,16 +1431,20 @@ class KtirBuilder:
     def access_tile(self, access: Access):
         """``ktdp.construct_access_tile`` for ``access``, into its buffer's view.
 
-        The per-dim index is ``sum_l coeffs[i][l] * indices[l]``: a ``* 1`` is not
-        emitted, and an empty sum is the function-entry ``%c0`` rather than a
-        fresh zero, so a dim no level walks indexes the view with the one zero.
+        The per-dim index is ``sum_l coeffs[i][l] * iv_l`` over the induction
+        variables of the loops this builder has open -- the record holds the
+        coefficients, the open loops supply the variables, and the two line up
+        because the plan derived one coefficient per enclosing level.  A ``* 1``
+        is not emitted, and an empty sum is the function-entry ``%c0`` rather than
+        a fresh zero, so a dim no level walks indexes the view with the one zero.
         """
         sizes = list(access.extent)
+        ivs = self.env.ivs()
         indices = []
         for coeffs in access.index_coeffs:
             terms = [
                 iv if coeff == 1 else self.val(arith.MulIOp(iv, self.icst_index(coeff)))
-                for coeff, iv in zip(coeffs, access.indices, strict=True)
+                for coeff, iv in zip(coeffs, ivs, strict=True)
                 if coeff
             ]
             indices.append(
@@ -1551,10 +1579,11 @@ def generate_ktir(
     signature matches that positional binding (or, in the baked form, no
     parameters at all and one ``arith.constant`` base address per buffer).
 
-    Three steps: plan the buffers (which raises every rejection), open the
-    kernel, walk the specs into it.  The plan completes before
-    ``KtirBuilder.create``, so an unsupported request fails fast -- and is
-    testable -- whether or not ``mlir_ktdp`` is installed.
+    Three steps: plan the kernel (which raises every rejection), open it, emit
+    its steps.  The plan completes before ``KtirBuilder.create``, so an
+    unsupported request fails fast -- and is testable -- whether or not
+    ``mlir_ktdp`` is installed; and the emission consumes only the plan, so a
+    request that got that far cannot be refused half-emitted.
 
     ``options`` are ``PlanOptions`` fields, spelled as keywords so a caller
     passes only what it chooses and the defaults live in one place.
@@ -1563,8 +1592,8 @@ def generate_ktir(
     if unknown := sorted(set(options) - known):
         raise TypeError(f"generate_ktir: unknown option(s) {unknown}")
 
-    plan = build_buffer_plan(specs, PlanOptions(**options))
+    plan = build_kernel_plan(specs, PlanOptions(**options))
     b = KtirBuilder.create(plan)
     with b.open_kernel(kernel_name):
-        emit_specs(b, specs)
+        b.emit(plan.steps)
     return b.finish()

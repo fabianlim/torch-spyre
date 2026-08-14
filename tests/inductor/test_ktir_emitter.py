@@ -283,13 +283,15 @@ module {
         from torch_spyre._inductor.codegen import ktir
 
         nest = self._tiled_nest()
-        # The plan walk descends the nest and plans each buffer at the depth its
-        # op sits at: the extents below are what the two levels walk over.
-        plan = ktir.build_buffer_plan([nest], _WALK_ONE_CORE)
+        # The plan walk descends the nest, planning each buffer at the depth its
+        # op sits at and turning the nest into LoopSteps: the extents below are
+        # what the two levels walk over.
+        plan = ktir.build_kernel_plan([nest], _WALK_ONE_CORE)
         b = ktir.KtirBuilder.create(plan)
-        # The builder already has the plan; opening the kernel needs only a name.
+        # The builder already has the plan; opening the kernel needs only a name,
+        # and the body is the plan's own steps -- the nest is not walked again.
         with b.open_kernel("ktir_tiled_add_0"):
-            ktir.emit_specs(b, [nest])
+            b.emit(plan.steps)
         # Pretty (non-generic) MLIR: the module verifies, terminators included.
         self.assertEqual(b.finish(), self.EXPECTED_TILED_ADD_KTIR)
 
@@ -297,7 +299,7 @@ module {
         """The buffer extents in the golden, read off the plan the walk built."""
         from torch_spyre._inductor.codegen import ktir
 
-        plan = ktir.build_buffer_plan([self._tiled_nest()], _WALK_ONE_CORE)
+        plan = ktir.build_kernel_plan([self._tiled_nest()], _WALK_ONE_CORE)
         self.assertEqual([b.buf_id for b in plan.parameters], ["arg0", "arg1", "buf0"])
         for buffer in plan.parameters:
             with self.subTest(buf_id=buffer.buf_id):
@@ -314,7 +316,7 @@ module {
         self.assertIn("counted loops", str(ctx.exception))
         # Same refusal from the plan walk itself, at its default mode.
         with self.assertRaises(NotImplementedError):
-            ktir.build_buffer_plan([nest], ktir.PlanOptions(sencores=1))
+            ktir.build_kernel_plan([nest], ktir.PlanOptions(sencores=1))
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@
 """Dialect-free tests for the OpSpec->KTIR emitter's *rejections*.
 
 **Nothing in this file imports ``mlir_ktdp``, directly or transitively, and
-nothing in it is skipped.**  That is the property ``ktir.build_buffer_plan``
+nothing in it is skipped.**  That is the property ``ktir.build_kernel_plan``
 exists to provide: every ``NotImplementedError`` the emitter can raise is raised
 by a pure walk over the spec tree, before the lazy dialect import, so the whole rejection
 surface is covered wherever ``import torch_spyre`` works.
@@ -94,7 +94,7 @@ def _baked_add_op_specs() -> list:
 
 
 class TestValidateRejections(unittest.TestCase):
-    """One test per rejection ``build_buffer_plan`` is responsible for.
+    """One test per rejection ``build_kernel_plan`` is responsible for.
 
     Each asserts the exception type and a distinguishing fragment of the
     message, so a rejection cannot silently turn into a different rejection.
@@ -108,7 +108,7 @@ class TestValidateRejections(unittest.TestCase):
     def _rejects(self, specs, fragment, **options):
         options.setdefault("sencores", 1)
         with self.assertRaises(NotImplementedError) as ctx:
-            ktir.build_buffer_plan(specs, ktir.PlanOptions(**options))
+            ktir.build_kernel_plan(specs, ktir.PlanOptions(**options))
         self.assertIn(fragment, str(ctx.exception))
 
     # -- whole-request capability ------------------------------------------
@@ -246,21 +246,21 @@ class TestPlanOptions(unittest.TestCase):
         self.assertIn("counted_loops", str(ctx.exception))
 
     def test_grid_comes_from_the_core_count(self):
-        self.assertEqual(ktir.BufferPlan(_ONE_CORE).grid, (1,))
+        self.assertEqual(ktir.KernelPlan(_ONE_CORE).grid, (1,))
         with self.assertRaises(NotImplementedError) as ctx:
-            ktir.BufferPlan(ktir.PlanOptions(sencores=2))
+            ktir.KernelPlan(ktir.PlanOptions(sencores=2))
         self.assertIn("multi-core work division", str(ctx.exception))
 
 
-class TestBufferPlan(unittest.TestCase):
-    """What ``build_buffer_plan`` returns: the func signature, before any emission."""
+class TestKernelPlan(unittest.TestCase):
+    """What ``build_kernel_plan`` returns: the func signature, before any emission."""
 
     def test_param_entries_are_ordered_by_arg_index(self):
         specs = _add_op_specs()
         # Registration order (spec.args) is 0, 1, 2; shuffle it so the sort is
         # doing the work rather than agreeing with insertion order by luck.
         specs[0].args = [specs[0].args[2], specs[0].args[0], specs[0].args[1]]
-        plan = ktir.build_buffer_plan(specs, _ONE_CORE)
+        plan = ktir.build_kernel_plan(specs, _ONE_CORE)
         self.assertEqual([e.arg_index for e in plan.parameters], [0, 1, 2])
         self.assertEqual([e.buf_id for e in plan.parameters], ["arg0", "arg1", "buf0"])
         # The plan holds the derived records, so the buffer's extent and its
@@ -269,13 +269,13 @@ class TestBufferPlan(unittest.TestCase):
         self.assertEqual(plan.parameters[0].layout.strides, (32768, 64, 1))
 
     def test_symbolic_form_resolves_no_base_addresses(self):
-        plan = ktir.build_buffer_plan(_add_op_specs(), _ONE_CORE)
+        plan = ktir.build_kernel_plan(_add_op_specs(), _ONE_CORE)
         # Every 'hbm' address in the fixture is None and never read: the bases
         # are func arguments.
         self.assertEqual([e.base_elements for e in plan.parameters], [None] * 3)
 
     def test_baked_form_resolves_bases_in_elements(self):
-        plan = ktir.build_buffer_plan(
+        plan = ktir.build_kernel_plan(
             _baked_add_op_specs(),
             ktir.PlanOptions(sencores=1, bake_addresses=True),
         )
@@ -287,7 +287,7 @@ class TestBufferPlan(unittest.TestCase):
 
     def test_repeated_buffer_is_registered_once(self):
         specs = _add_op_specs() + _add_op_specs()
-        plan = ktir.build_buffer_plan(specs, _ONE_CORE)
+        plan = ktir.build_kernel_plan(specs, _ONE_CORE)
         self.assertEqual(len(plan.buffers), 3)
 
 
@@ -366,10 +366,16 @@ class TestRecipes(unittest.TestCase):
         reducing = dataclasses.replace(spec, is_reduction=True)
         self.assertIs(ktir.Family.of(reducing), ktir.Family.REDUCTION)
 
-    def test_emit_specs_asserts_on_unvalidated_entries(self):
-        """The emitter's only remaining ``raise`` is this validation-bug guard."""
+    def test_emit_asserts_on_an_unplanned_step(self):
+        """The emitter's only remaining ``raise`` is this plan-bug guard.
+
+        Called unbound with ``self=None``: the type check happens before any
+        builder state is touched, which is why this needs no dialect build.
+        ``UnimplementedOp`` cannot reach emission at all now -- a step tree holds
+        only steps -- so the guard is about a malformed plan, not a rejected op.
+        """
         with self.assertRaises(AssertionError):
-            ktir.emit_specs(None, [UnimplementedOp(op="atan2")])
+            ktir.KtirBuilder.emit(None, [UnimplementedOp(op="atan2")])
 
 
 def _tiled_reduction_specs() -> tuple:
@@ -383,10 +389,9 @@ def _tiled_reduction_specs() -> tuple:
 
         a: 16384*n_stick + 64*m     c: 64*n_stick
 
-    Returns ``(spec, loops)``: the op, and the ``(LoopSpec, induction variable)``
-    chain the walk would reach it with.  The chain is read off one real nest, so
-    the trip counts the derivations see are the nest's own; the induction
-    variables stand in for SSA values, which the derivations only pass through.
+    Returns ``(spec, loops)``: the op, and the ``LoopSpec`` chain the plan walk
+    would reach it with, read off one real nest so the trip counts the derivations
+    see are the nest's own.
     """
     n_stick, m = sympy.symbols("n_stick m")
 
@@ -416,7 +421,7 @@ def _tiled_reduction_specs() -> tuple:
         tiled_symbol_trip_counts={m: 256, n_stick: 2},
     )
     nest = LoopSpec(count=2, body=[LoopSpec(count=256, body=[spec])])
-    return spec, [(nest, "%n_stick"), (nest.body[0], "%m")]
+    return spec, [nest, nest.body[0]]
 
 
 class TestLoopDerivations(unittest.TestCase):
@@ -436,7 +441,6 @@ class TestLoopDerivations(unittest.TestCase):
         self.assertEqual(
             [str(s) for lvl in levels for s in lvl.symbols], ["n_stick", "m"]
         )
-        self.assertEqual([lvl.iv for lvl in levels], ["%n_stick", "%m"])
 
     def test_levels_must_match_the_enclosing_nest(self):
         spec, loops = _tiled_reduction_specs()
@@ -483,7 +487,6 @@ class TestLoopDerivations(unittest.TestCase):
         # Per view dim, the step each level takes: dim 0 <- n_stick, dim 1 <- m,
         # dim 2 <- nothing, i.e. the constant zero the fixture spells as %c0.
         self.assertEqual(a_access.index_coeffs, ((1, 0), (0, 1), (0, 0)))
-        self.assertEqual(a_access.indices, ("%n_stick", "%m"))
 
         c_layout, c_q = ktir._solve_layout(c, levels)
         c_access = ktir._access(c, levels, c_q, c_layout)
@@ -499,7 +502,6 @@ class TestLoopDerivations(unittest.TestCase):
         access = ktir._access(arg, [], q, layout)
         # One empty sum per dim: every index expression is zero.
         self.assertEqual(access.index_coeffs, ((), (), ()))
-        self.assertEqual(access.indices, ())
 
     def test_advance_no_dim_divides_is_reported(self):
         spec, loops = _tiled_reduction_specs()
@@ -695,18 +697,14 @@ class TestScopeStack(unittest.TestCase):
             self.assertEqual(env.produced("buf0"), "inner")
         self.assertEqual(env.produced("buf0"), "outer")
 
-    def test_loops_are_outermost_first(self):
-        """What ``_levels`` zips against: only frames that carry a LoopSpec."""
+    def test_value_only_scopes_are_not_loops(self):
+        """A frame with no induction variable adds no level to zip against."""
         env = ktir.ScopeStack()
-        self.assertEqual(env.loops(), [])
-        outer, inner = LoopSpec(count=2, body=[]), LoopSpec(count=256, body=[])
-        with env.scope(iv="i", loop=outer):
-            # A frame with no loop (a plain value scope) is not a level.
-            with env.scope():
-                self.assertEqual(env.loops(), [(outer, "i")])
-            with env.scope(iv="j", loop=inner):
-                self.assertEqual(env.loops(), [(outer, "i"), (inner, "j")])
-        self.assertEqual(env.loops(), [])
+        with env.scope(iv="i"):
+            with env.scope():  # a plain value scope
+                self.assertEqual(env.ivs(), ["i"])
+            with env.scope(iv="j"):
+                self.assertEqual(env.ivs(), ["i", "j"])
 
     def test_ivs_are_innermost_last(self):
         env = ktir.ScopeStack()
@@ -716,6 +714,70 @@ class TestScopeStack(unittest.TestCase):
                 self.assertEqual(env.ivs(), ["i", "j"])
             self.assertEqual(env.ivs(), ["i"])
         self.assertEqual(env.ivs(), [])
+
+
+class TestEmissionCannotRefuse(unittest.TestCase):
+    """Nothing reachable from ``KtirBuilder.emit`` can raise a rejection.
+
+    This is the property the step tree buys: the plan runs every derivation and
+    every guard, and emission consumes only the plan's records, so a request the
+    plan accepted cannot be refused half-emitted.  Asserted over the call graph
+    rather than trusted, because the failure mode is silent -- a derivation called
+    from the emission path would keep working right up to the input that trips its
+    guard, with a half-built module already in hand.
+    """
+
+    def test_only_plan_bug_assertions_are_reachable_from_emit(self):
+        tree = ast.parse(inspect.getsource(ktir))
+        builder = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "KtirBuilder"
+        )
+        methods = {
+            node.name: node
+            for node in builder.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        functions = {
+            node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)
+        }
+
+        seen: set[str] = set()
+        pending = ["emit"]
+        raised: list[tuple[str, str]] = []
+        while pending:
+            name = pending.pop()
+            if name in seen:
+                continue
+            seen.add(name)
+            node = methods.get(name) or functions.get(name)
+            if node is None:  # a dialect builder, not ours
+                continue
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Raise):
+                    called = getattr(sub.exc, "func", sub.exc)
+                    raised.append(
+                        (
+                            name,
+                            getattr(called, "id", None) or getattr(called, "attr", ""),
+                        )
+                    )
+                if isinstance(sub, ast.Call):
+                    callee = getattr(sub.func, "id", None) or getattr(
+                        sub.func, "attr", None
+                    )
+                    if callee in methods or callee in functions:
+                        pending.append(callee)
+
+        # Every raise on the emission path is a malformed-plan assertion.  In
+        # particular no guard (_downstream_unsupported / _unspecified) and no
+        # derivation that can raise is reachable.
+        self.assertTrue(raised, "expected the plan-bug assertions to be found")
+        self.assertEqual({kind for _, kind in raised}, {"AssertionError"})
+        for guard in ("_downstream_unsupported", "_unspecified", "_levels", "_access"):
+            with self.subTest(unreachable=guard):
+                self.assertNotIn(guard, seen)
 
 
 class TestNoModuleLevelDialectImport(unittest.TestCase):

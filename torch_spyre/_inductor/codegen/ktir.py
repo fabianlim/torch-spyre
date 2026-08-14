@@ -45,9 +45,8 @@ Structure
    spec and derives nothing, so emission cannot refuse a request the plan
    accepted.
 
-Adding a pointwise op is one ``RECIPES`` entry.  Enabling counted loops is
-making ``counted_loops='walk'`` the only mode: the plan walk, the derivations,
-``LoopStep`` and its emission are in place.
+Adding an op is one ``RECIPES`` entry; adding an emission *shape* is one method
+on ``KtirBuilder``, named for its ``Family``.
 """
 
 from __future__ import annotations
@@ -60,11 +59,13 @@ from collections.abc import Callable, Iterator, Sequence
 from typing import TYPE_CHECKING, Any, ClassVar, NoReturn
 
 from torch_spyre._C import DataFormats, ElementArrangement
-from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.codegen.compute_ops import num_bytes
 from torch_spyre._inductor.codegen.opspec_utils import (
     align_reshape_plan,
     buf_id,
+    core_divisions,
+    per_core_extent,
+    reduced_axes,
     row_major_strides,
     symbolic_dim_max,
 )
@@ -125,12 +126,11 @@ def dialect_available() -> bool:
 # message says what is missing here, in this emitter, and what to pass instead
 # when there is an alternative.
 #
-# A message never claims a consumer is the blocker.  This repository cannot run
-# dbo-opt or the scheduler, so it cannot observe what they accept: any such claim
-# would be hearsay, and the two that used to be here were both wrong -- the
-# blockage was in this file. If a genuine downstream refusal is ever observed
-# (something emitted here that a consumer rejects), it belongs in a table of its
-# own, recorded as our policy rather than as their behaviour.
+# A message never claims a consumer is the blocker, because a consumer's answer
+# is not a property of this file: the same emitted text is accepted or rejected
+# depending on which dbo-opt build and which device.mlir it meets (``verify.py``
+# is where that is observed, against a real one).  A refusal here says what this
+# emitter does not build.
 #
 # Derivations that reject a specific *value* of their own input -- an unsupported
 # dtype, a tile advance that is not a lattice point of its view -- raise about
@@ -214,6 +214,26 @@ class Level:
 
 
 @dataclasses.dataclass(frozen=True)
+class Division:
+    """One work-divided iteration symbol: a level the *cores* walk in parallel.
+
+    A division is the outermost kind of level there is.  Where a ``Level``'s
+    index comes from an ``scf.for``, a division's comes from this core's place in
+    the grid -- ``(compute_tile_id // inner) % div`` -- so the two differ only in
+    where the index value is read, and the plan carries them in one ordered list
+    (divisions first, outermost) whose coefficients ``Access.index_coeffs``
+    holds.
+
+    ``symbol`` is the iteration symbol's name, kept for messages only: emission
+    needs the two numbers.
+    """
+
+    symbol: str
+    div: int  # how many cores share this symbol's range
+    inner: int  # the grid stride of one step of this symbol
+
+
+@dataclasses.dataclass(frozen=True)
 class Layout:
     """A buffer's device extent and strides, in elements.
 
@@ -240,17 +260,20 @@ class Buffer:
 class Access:
     """One (OpSpec, TensorArg) access; sole input to an access tile.
 
-    ``extent`` is the tile's own extent, which is ``device_size``: the tile
-    extent is what tiling already baked into ``device_size``, while the
-    *buffer* extent grows back out of it in ``_layout``.
+    ``extent`` is the tile's own extent: ``device_size``, divided by whatever
+    work division splits an axis across cores.  The *buffer* extent grows back
+    out of it in ``_layout``.
 
     ``index_coeffs[i][l]`` is the step level ``l`` takes along view dim ``i``, so
     the index for dim ``i`` is ``sum_l index_coeffs[i][l] * iv_l``, where ``iv_l``
-    is the induction variable of the ``l``-th enclosing loop.  The record holds
+    is the index of the ``l``-th enclosing level -- this core's portion of a
+    ``Division`` for the outermost ones, the induction variable of an enclosing
+    ``scf.for`` for the rest.  A division and a loop differ only in where that
+    index comes from, so one matrix covers both.  The record holds
     the coefficients only -- the variables exist during emission, not during
     planning -- and the builder zips them against the loops it has open.  This is
-    the design's ``base_map`` as a matrix; the builder spells it the way the
-    committed loop fixtures do, an identity ``base_map`` with one index
+    the design's ``base_map`` as a matrix; the builder spells it the way
+    hand-written loop kernels do, an identity ``base_map`` with one index
     expression per view dim, rather than a non-identity map over the induction
     variables.  The matrix is the same either way.
 
@@ -288,7 +311,8 @@ class ComputeStep:
 
     ``ins`` is one ``(buf_id, Access)`` per operand, in the op's operand order.
     ``store`` is ``False`` for an internal result, which is bound in scope for a
-    later step instead of being stored through ``out``.
+    later step instead of being stored through ``out``.  ``reduce_dims`` is the
+    input tile axes a REDUCTION consumes, and empty for every other family.
     """
 
     op: str  # a KtirBuilder.RECIPES key
@@ -297,6 +321,7 @@ class ComputeStep:
     out: Access
     out_buf_id: str
     store: bool
+    reduce_dims: tuple[int, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -599,23 +624,68 @@ def _solve_layout(
     )
 
 
+def _divide(
+    arg: TensorArg, symbols: Sequence[Any], divisors: dict
+) -> tuple[tuple[int, ...], list[tuple[int, ...]]]:
+    """``arg``'s per-core tile extent, and each division's step along each dim.
+
+    The one place work division touches an access.  A division walks the axis
+    its symbol addresses one per-core extent at a time, so its step along that
+    axis *is* that extent, and the cores between them cover ``device_size``
+    exactly (``A * D``).  The view is unaffected -- ``_solve_layout`` builds it
+    from the whole ``device_size``, because every core addresses the same buffer
+    -- so nothing else in the emitter has to know that cores exist.
+
+    ``symbols`` is outermost-first, matching the plan's division order; the rows
+    come back in that order so they prepend to the loop levels' rows.
+    """
+    if not symbols:
+        return tuple(_static(s) for s in arg.device_size), []
+    per_core, axis_symbol = per_core_extent(arg, divisors)
+    rows = [
+        tuple(
+            per_core[axis] if axis_symbol[axis] == symbol else 0
+            for axis in range(len(per_core))
+        )
+        for symbol in symbols
+    ]
+    return tuple(per_core), rows
+
+
+def _squeezed(arg: TensorArg, axes: Sequence[int]) -> TensorArg:
+    """``arg`` without ``axes``: same buffer, same bytes, fewer device axes.
+
+    Dropping a unit axis renames nothing and moves nothing -- it contributes no
+    elements and no stride -- so every later derivation sees an arg of the rank
+    the emitted tile actually has, and ``buf_id`` still identifies one buffer.
+    """
+    drop = set(axes)
+    keep = [axis for axis in range(len(arg.device_size)) if axis not in drop]
+    return dataclasses.replace(
+        arg,
+        device_size=[arg.device_size[axis] for axis in keep],
+        device_coordinates=[arg.device_coordinates[axis] for axis in keep],
+    )
+
+
 def _access(
     arg: TensorArg,
-    levels: Sequence[Level],
-    q: Sequence[Sequence[int]],
+    extent: Sequence[Any],
+    rows: Sequence[Sequence[int]],
     layout: Layout,
     buffer: Buffer | None = None,
 ) -> Access:
     """The access record for one ``(OpSpec, TensorArg)``.
 
-    The tile extent is ``device_size`` (tiling is already baked into it), and
-    the per-dim index coefficient is level ``l``'s step along dim ``i``, which the
-    builder multiplies by that level's induction variable at emit time.
+    ``extent`` is the per-core tile extent and ``rows`` is one step vector per
+    enclosing level, outermost-first (divisions, then loops) -- which the builder
+    multiplies by that level's index at emit time.
 
     With no levels every row is empty, so every index expression is the empty
-    sum -- zero -- which is why an untiled access sits at the view's origin.
+    sum -- zero -- which is why an undivided, untiled access sits at the view's
+    origin.
     """
-    extent = tuple(_static(s) for s in arg.device_size)
+    extent = tuple(_static(s) for s in extent)
     for value in extent:
         if not isinstance(value, int):
             raise NotImplementedError(
@@ -626,9 +696,7 @@ def _access(
         raise AssertionError(
             f"access rank {len(extent)} != buffer rank {len(layout.extent)}"
         )
-    index_coeffs = tuple(
-        tuple(int(q[l][i]) for l in range(len(levels))) for i in range(len(extent))
-    )
+    index_coeffs = tuple(tuple(int(row[i]) for row in rows) for i in range(len(extent)))
     return Access(
         extent=extent,
         index_coeffs=index_coeffs,
@@ -648,19 +716,31 @@ def _access(
 # reads no spec, so it cannot discover a reason to refuse half-way through.
 
 
+# The ``allocation`` keys memory planning uses for a buffer the kernel owns.
+INTERNAL_SPACES: tuple[str, ...] = ("lx", "hbm_pool")
+
+
 def is_internal(arg: TensorArg) -> bool:
-    """Whether the kernel produces this buffer only for its own later ops.
+    """Whether this buffer is one the kernel owns rather than one it is passed.
 
-    An internal buffer is threaded as an SSA value: not stored, and read back as
-    a value rather than loaded.  SDSC says the same thing by giving the buffer an
-    LX or HBM-pool allocation, which KTIR does not want -- the scheduler owns
-    buffering -- so the KTIR form needs a spec-level flag instead.
+    Read from ``allocation``, which is where the contract already says it:
+    ``"hbm"`` is a graph input or output, addressed directly, while ``"lx"`` and
+    ``"hbm_pool"`` are intermediates that memory planning placed on the kernel's
+    behalf.  ``create_tensor_arg`` uses that same distinction to decide what
+    becomes a kernel argument at all (``spyre_kernel.py``: an ``lx`` /
+    ``hbm_pool`` tensor is left out of ``spyre_kernel_args``, which is why those
+    args carry ``arg_index == -1``) -- so this is that rule read back, not a
+    second convention, and not the sentinel index, which says only "not passed".
 
-    OpSpec does not carry one yet, so this reads a field that does not exist and
-    nothing is internal.  When ``TensorArg`` grows the flag, the body becomes
-    ``return arg.is_internal`` and no caller changes.
+    The two emitters answer differently because their granularity differs: one
+    ``sdsc_execute`` per OpSpec forces SDSC to materialise the intermediate into
+    the allocation it was given, while one KTIR func for the whole kernel lets it
+    stay an SSA value -- no store, no view, no parameter, and no address for the
+    scheduler to honour, which is what "the scheduler owns buffering" means here.
     """
-    return bool(getattr(arg, "is_internal", False))
+    # Named positively: an allocation this emitter does not recognise at all is
+    # not silently threaded, it reaches ``_buffer`` and is refused there.
+    return any(space in (arg.allocation or {}) for space in INTERNAL_SPACES)
 
 
 def _buffer(
@@ -702,19 +782,10 @@ def _buffer(
 class PlanOptions:
     """Everything the caller chooses about one emission, in one value.
 
-    ``sencores`` is the core count the kernel is emitted for; ``None`` means
-    "whatever this build is configured for", which is what a production caller
-    wants and what makes the choice explicit for everyone else.  It is here
-    rather than read from the config at the point of use so that the three
-    choices an emission depends on are one argument, not one argument and two
-    globals.
-
-    ``counted_loops`` selects what a ``LoopSpec`` does, the way ``_layout``'s
-    ``symbolic_extent`` selects an extent mode: ``'reject'`` (the default, and
-    what ``generate_ktir`` asks for) refuses the nest, ``'walk'`` descends into
-    it and plans each buffer at its real depth.  The walk, the derivations and
-    the builders behind the refusal are complete; ``'walk'`` is what an emission
-    of a nest is planned with while loops are not enabled end to end.
+    Two choices, and neither is a capability switch: what the kernel *does* comes
+    from the OpSpec contract (the grid from its work divisions, the loops from its
+    ``LoopSpec``s), so it is not the caller's to pick.  What is left is how to
+    spell two things the contract does not decide.
 
     ``symbolic_extent`` says what to do with a device size that is a sympy
     expression: ``'static'`` refuses it, ``'dynamic'`` takes it as a func argument
@@ -729,45 +800,60 @@ class PlanOptions:
     ``config.bundle_symbolic_args``.
     """
 
-    COUNTED_LOOPS: ClassVar[tuple[str, ...]] = ("reject", "walk")
     SYMBOLIC_EXTENTS: ClassVar[tuple[str, ...]] = ("static", "dynamic", "max")
 
-    sencores: int | None = None
     bake_addresses: bool = False
-    counted_loops: str = "reject"
     symbolic_extent: str = "static"
 
     def __post_init__(self) -> None:
-        if self.counted_loops not in self.COUNTED_LOOPS:
-            raise ValueError(
-                f"OpSpec->KTIR: unknown counted_loops mode {self.counted_loops!r}; "
-                f"expected one of {self.COUNTED_LOOPS}"
-            )
         if self.symbolic_extent not in self.SYMBOLIC_EXTENTS:
             raise ValueError(
                 f"OpSpec->KTIR: unknown symbolic_extent mode "
                 f"{self.symbolic_extent!r}; expected one of {self.SYMBOLIC_EXTENTS}"
             )
 
-    @property
-    def cores(self) -> int:
-        """The core count to emit for: the configured one unless overridden."""
-        return _spyre_config.sencores if self.sencores is None else int(self.sencores)
 
+def _divisions(specs: Sequence[Any]) -> tuple[list[Any], tuple[Division, ...]]:
+    """``(symbols, divisions)``: the core grid the spec tree asks for.
 
-def _grid(cores: int) -> tuple[int, ...]:
-    """The ``grid`` attribute for ``cores``, which is ``(1,)`` or a rejection.
+    Read from ``OpSpec.iteration_space``, whose per-symbol work division is what
+    ``work_division.py`` decided from ``config.sencores`` -- so the grid is a fact
+    of the contract, the same one the SDSC path reads as its work slices, rather
+    than a core count this emitter takes on the side.  Nothing else here reads
+    ``config``.
 
-    The only reader of the core count, so the multi-core rejection lives here.
-    Multi-core work division is future work: rather than silently emitting a
-    single-core grid on a multi-core request, there is no grid to emit for one.
+    Every op in one kernel must ask for the same division: they share one grid,
+    and one core runs one instance of the whole body.  The symbols come back
+    outermost-first, so a division's coefficients prepend to the loop levels'.
     """
-    if cores != 1:
-        raise NotImplementedError(
-            "OpSpec->KTIR: multi-core work division is not supported yet "
-            f"(SENCORES={cores}, only 1 is supported)"
-        )
-    return (1,)
+    spaces = [spec.iteration_space for spec in _op_specs(specs)]
+    if not spaces:
+        return [], ()
+    divided, total = core_divisions(spaces[0])
+    for space in spaces[1:]:
+        if core_divisions(space)[0] != divided:
+            raise NotImplementedError(
+                "OpSpec->KTIR: the ops in this kernel ask for different work "
+                "divisions, so they cannot share one grid; mixed work division "
+                "within a kernel is not supported"
+            )
+    divided = list(reversed(divided))  # outermost-first
+    symbols = [symbol for symbol, _div, _inner in divided]
+    divisions = tuple(
+        Division(symbol=str(symbol), div=div, inner=inner)
+        for symbol, div, inner in divided
+    )
+    assert total == functools.reduce(lambda a, d: a * d.div, divisions, 1)
+    return symbols, divisions
+
+
+def _op_specs(specs: Sequence[Any]) -> Iterator[OpSpec]:
+    """Every ``OpSpec`` in a spec tree, loop bodies included."""
+    for entry in specs:
+        if isinstance(entry, LoopSpec):
+            yield from _op_specs(entry.body)
+        elif isinstance(entry, OpSpec):
+            yield entry
 
 
 class KernelPlan:
@@ -790,7 +876,10 @@ class KernelPlan:
 
     def __init__(self, options: PlanOptions | None = None) -> None:
         self.options = options or PlanOptions()
-        self.grid = _grid(self.options.cores)
+        self.grid: tuple[int, ...] = (1,)
+        self.divisions: tuple[Division, ...] = ()
+        self._symbols: list[Any] = []  # the divided symbols, outermost-first
+        self._divisors: dict = {}
         self.buffers: dict[str, Buffer] = {}
         self.steps: tuple[Step, ...] = ()
         self._dims: dict[str, None] = {}  # ordered set of symbol names
@@ -833,8 +922,62 @@ class KernelPlan:
         )
 
     def add_specs(self, specs: Sequence[OpSpec | LoopSpec | UnimplementedOp]) -> None:
-        """Plan ``specs`` into this plan's buffers and steps."""
+        """Plan ``specs`` into this plan's grid, buffers and steps."""
+        self._symbols, self.divisions = _divisions(specs)
+        self._divisors = {
+            symbol: division.div
+            for symbol, division in zip(self._symbols, self.divisions, strict=True)
+        }
+        cores = 1
+        for division in self.divisions:
+            cores *= division.div
+        self.grid = (cores,)
         self.steps = self._steps(specs, ())
+        self._check_internal_buffers(self.steps)
+
+    def _check_internal_buffers(self, steps: Sequence[Step]) -> None:
+        """A threaded buffer must be produced before it is read, and then read.
+
+        A threaded value has no memory behind it, so the kernel has to contain
+        both ends of it.  Either end missing means the intermediate reached this
+        kernel without the op on the other side of it -- the fusion decision and
+        the kernel boundary disagree -- and the buffer needs materialising
+        instead.  Refused here rather than emitted: an unread producer would
+        silently write nowhere, and an unproduced consumer has no value to read.
+        """
+        unread: dict[str, None] = {}  # threaded, produced, not yet read
+        produced: set[str] = set()
+
+        def walk(steps: Sequence[Step]) -> None:
+            for step in steps:
+                if isinstance(step, LoopStep):
+                    walk(step.body)
+                    continue
+                for read_id, access in step.ins:
+                    if access.buffer is not None:  # loaded from its own view
+                        continue
+                    if read_id not in produced:
+                        raise NotImplementedError(
+                            f"OpSpec->KTIR: buffer {read_id!r} is an intermediate "
+                            "this kernel owns (its allocation is lx / hbm_pool, so "
+                            "it is threaded as a value rather than loaded) but no "
+                            "op in this kernel produces it; its producer is in "
+                            "another kernel, which needs the buffer materialised"
+                        )
+                    unread.pop(read_id, None)
+                if not step.store:
+                    produced.add(step.out_buf_id)
+                    unread[step.out_buf_id] = None
+
+        walk(steps)
+        for unread_id in unread:
+            raise NotImplementedError(
+                f"OpSpec->KTIR: buffer {unread_id!r} is an intermediate this kernel "
+                "owns (its allocation is lx / hbm_pool, so it is threaded as a "
+                "value rather than stored) but nothing in this kernel reads it; "
+                "its consumer is in another kernel, which needs the buffer "
+                "materialised"
+            )
 
     def _steps(self, specs, loops: Sequence[LoopSpec]) -> tuple[Step, ...]:
         """Recursive: the steps for one spec list, inside the ``loops`` chain.
@@ -851,10 +994,6 @@ class KernelPlan:
                     f"OpSpec->KTIR: unimplemented op {entry.op!r}"
                 )
             if isinstance(entry, LoopSpec):
-                if self.options.counted_loops == "reject":
-                    raise NotImplementedError(
-                        "OpSpec->KTIR: counted loops (LoopSpec) are not supported yet"
-                    )
                 trip = _trip(entry)
                 if not isinstance(trip, int):
                     if self.options.symbolic_extent != "dynamic":
@@ -876,14 +1015,21 @@ class KernelPlan:
                 raise NotImplementedError(
                     f"OpSpec->KTIR: unexpected spec entry {type(entry).__name__}"
                 )
-            if entry.is_reduction:
-                raise NotImplementedError(
-                    "OpSpec->KTIR: reductions are not supported yet"
-                )
             if entry.op not in KtirBuilder.RECIPES:
                 raise NotImplementedError(
                     f"OpSpec->KTIR: op {entry.op!r} is not supported yet "
                     f"(registered: {sorted(KtirBuilder.RECIPES)})"
+                )
+            family = Family.of(entry)
+            if family is not KtirBuilder.RECIPES[entry.op].family:
+                # The spec asks for a shape this op's recipe does not implement
+                # (an 'add' as a reduction, a 'sum' as elementwise).  The recipe
+                # is what has an emission behind it, so the request is refused
+                # rather than emitted in the shape that happens to exist.
+                raise NotImplementedError(
+                    f"OpSpec->KTIR: op {entry.op!r} is registered as "
+                    f"{KtirBuilder.RECIPES[entry.op].family.name} but this spec "
+                    f"asks for {family.name}"
                 )
             steps.append(self._compute_step(entry, loops))
         return tuple(steps)
@@ -898,37 +1044,78 @@ class KernelPlan:
         """
         out, inputs = validated_roles(spec)
         out_extents = [int(s) for s in out.device_size]
+        family = Family.of(spec)
         for arg in inputs:
             # In-place (input buffer aliases the output) is not supported yet.
             if buf_id(arg) == buf_id(out):
                 raise NotImplementedError(
                     "OpSpec->KTIR: in-place ops (input aliases output) not supported"
                 )
-            # Reject broadcast / transpose operands: only operands whose device
-            # axes already match the output tile exactly are supported.
-            if (
-                align_reshape_plan(
-                    list(arg.device_coordinates),
-                    [int(s) for s in arg.device_size],
-                    list(out.device_coordinates),
-                    out_extents,
-                )
-                is not None
-            ):
-                raise NotImplementedError(
-                    "OpSpec->KTIR: broadcast / reshape operands not supported yet"
-                )
+        reduce_dims: tuple[int, ...] = ()
+        args = list(spec.args)
+        if family is Family.REDUCTION:
+            # Which axes a reduction consumes is a fact about its operands, so it
+            # is derived here (once) and carried on the step, not re-derived from
+            # the op name at emit time.
+            [source] = inputs
+            reduce_dims, placeholder = reduced_axes(
+                source.device_coordinates,
+                [int(s) for s in source.device_size],
+                out.device_coordinates,
+                out_extents,
+            )
+            if placeholder:
+                # The projection leaves each reduced axis in the output as a unit
+                # extent; the reduced tile does not have it at all.  Squeezing the
+                # arg here, once, is what keeps every derivation after this point
+                # unaware that a reduction is different: the output's view, tile
+                # and stored tensor are all the same (lower) rank.
+                squeezed = _squeezed(out, placeholder)
+                args = [squeezed if arg is out else arg for arg in args]
+                out = squeezed
+        else:
+            for arg in inputs:
+                # Reject broadcast / transpose operands: only operands whose
+                # device axes already match the output tile exactly are supported.
+                if (
+                    align_reshape_plan(
+                        list(arg.device_coordinates),
+                        [int(s) for s in arg.device_size],
+                        list(out.device_coordinates),
+                        out_extents,
+                    )
+                    is not None
+                ):
+                    raise NotImplementedError(
+                        "OpSpec->KTIR: broadcast / reshape operands not supported yet"
+                    )
         levels = _levels(spec, loops)
         accesses = {
             buf_id(arg): self._access_of(arg, levels, spec.symbolic_dim_bounds)
-            for arg in spec.args
+            for arg in args
         }
+        # Every division must move this op's output: cores divide work by writing
+        # different elements, so a division no output axis follows is cores
+        # duplicating each other rather than sharing.  An *input* may legitimately
+        # not follow one (every core reads the same operand), which is why this
+        # asks the output only.
+        out_coeffs = accesses[buf_id(out)].index_coeffs
+        for level, division in enumerate(self.divisions):
+            if not any(row[level] for row in out_coeffs):
+                raise NotImplementedError(
+                    f"OpSpec->KTIR: work division splits {division.symbol} across "
+                    f"{division.div} cores, but no device axis of the output "
+                    f"{out.name!r} follows it, so every core would compute the "
+                    "same elements; dividing the within-stick axis or a reduced "
+                    "axis (which needs a cross-core combine) reads like this"
+                )
         return ComputeStep(
             op=spec.op,
-            family=Family.of(spec),
+            family=family,
             ins=tuple((buf_id(arg), accesses[buf_id(arg)]) for arg in inputs),
             out=accesses[buf_id(out)],
             out_buf_id=buf_id(out),
+            reduce_dims=reduce_dims,
             # An internal buffer never reaches memory: it is threaded as a value,
             # so it gets no store, no func parameter, no view and no address.
             store=not is_internal(out),
@@ -971,7 +1158,9 @@ class KernelPlan:
                 buf_id(arg),
                 _buffer(arg, layout, elems, bake_addresses=self.options.bake_addresses),
             )
-        return _access(arg, levels, q, layout, buffer)
+        # The divisions are the outermost levels, so their steps come first.
+        extent, rows = _divide(arg, self._symbols, self._divisors)
+        return _access(arg, extent, [*rows, *q], layout, buffer)
 
 
 def _base_address_elements(arg: TensorArg) -> int:
@@ -1094,17 +1283,23 @@ class ScopeStack:
 
     Pushed and popped by ``KtirBuilder.emit`` via ``with``.  A base frame is
     always present so values produced at function level have somewhere to live.
-    A frame that carries an induction variable is an open loop; the base frame
-    does not.
+    It carries the core portions, if the kernel is work-divided: those are the
+    outermost levels, in scope for the whole body and not tied to any loop.
     """
 
     def __init__(self) -> None:
-        # (induction variable or None, {buf_id: Value}), innermost last.
-        self._frames: list[tuple[Any, dict[str, Any]]] = [(None, {})]
+        # ([index values], {buf_id: Value}), innermost last.  A frame's list is
+        # the levels it opens: one iv for a loop, the core portions for the base
+        # frame, none for a plain value scope.
+        self._frames: list[tuple[list, dict[str, Any]]] = [([], {})]
+
+    def bind_ivs(self, ivs: Sequence) -> None:
+        """Give the current frame these level indices (the base frame's cores)."""
+        self._frames[-1][0].extend(ivs)
 
     @contextlib.contextmanager
     def scope(self, iv: Any = None) -> Iterator[None]:
-        self._frames.append((iv, {}))
+        self._frames.append(([] if iv is None else [iv], {}))
         try:
             yield
         finally:
@@ -1121,12 +1316,14 @@ class ScopeStack:
         self._frames[-1][1][buf_id] = value
 
     def ivs(self) -> list:
-        """The induction variables of the open loops, outermost-first.
+        """The index of every open level, outermost-first.
 
         What ``Access.index_coeffs`` is zipped against: one coefficient per
-        enclosing level, in the same order the plan derived them.
+        enclosing level, in the same order the plan derived them -- the core
+        portions of the work divisions first, then one induction variable per
+        enclosing loop.
         """
-        return [iv for iv, _ in self._frames if iv is not None]
+        return [iv for ivs, _ in self._frames for iv in ivs]
 
 
 # ---------------------------------------------------------------------------
@@ -1245,6 +1442,7 @@ class KtirBuilder:
                         )
                     )
                     self.c0 = self.icst_index(0)
+                    self.env.bind_ivs(self.core_portions())
                     for position, buffer in enumerate(buffers):
                         base = (
                             self.icst_index(buffer.base_elements)
@@ -1258,6 +1456,28 @@ class KtirBuilder:
             self._text = str(module)
         finally:
             self._stack.close()
+
+    def core_portions(self) -> list:
+        """This core's index along each division, outermost-first.
+
+        One ``ktdp.get_compute_tile_id`` -- the flat grid index -- read as the
+        mixed-radix number the plan's divisions describe: ``(id // inner) % div``.
+        A term whose factor is trivial is not emitted, so a single divided symbol
+        uses the id itself and the undivided case emits nothing at all.
+        """
+        if not self.plan.divisions:
+            return []
+        # A result *list*: the op is variadic in the bindings, single-result here.
+        tile_id = self.val(ktdp.get_compute_tile_id([self.index_t]))
+        portions = []
+        for division in self.plan.divisions:
+            index = tile_id
+            if division.inner > 1:
+                index = self.val(arith.DivUIOp(index, self.icst_index(division.inner)))
+            if division.inner * division.div != self.plan.grid[0]:
+                index = self.val(arith.RemUIOp(index, self.icst_index(division.div)))
+            portions.append(index)
+        return portions
 
     def finish(self) -> str:
         """The canonical MLIR text of the module built by ``open_kernel()``."""
@@ -1309,14 +1529,21 @@ class KtirBuilder:
                 )
 
     def compute(self, step: ComputeStep) -> None:
-        """Read the operands, apply the op's builder, dispose of the result."""
+        """Read the operands, apply the op's family builder, dispose of the result.
+
+        The family names its own method (``Family.ELEMENTWISE`` ->
+        ``elementwise``), so adding a family is adding a method rather than
+        editing a dispatch table; a recipe whose family has no method is caught by
+        a test, not discovered here.
+        """
         recipe = self.RECIPES[step.op]
-        if step.family is not Family.ELEMENTWISE:
-            # The plan rejects every family without a method here, so reaching
-            # this is a plan bug rather than an unsupported request.
+        emit = getattr(self, step.family.name.lower(), None)
+        if emit is None:
+            # The plan only accepts a family whose recipe declares it, and every
+            # declared family has a method, so this is a plan bug.
             raise AssertionError(f"no emission for family {step.family} of {step.op!r}")
         ins = [self.operand(buf_id, access) for buf_id, access in step.ins]
-        value = self.elementwise(recipe, ins, step.out)
+        value = emit(recipe, ins, step)
         self.result(step.out_buf_id, step.out if step.store else None, value)
 
     # -- ktdp shapes -------------------------------------------------------
@@ -1439,26 +1666,60 @@ class KtirBuilder:
     RECIPES: ClassVar[dict[str, Recipe]] = {
         "add": Recipe(arity=2, family=Family.ELEMENTWISE, binding=lambda: linalg.add),
         "mul": Recipe(arity=2, family=Family.ELEMENTWISE, binding=lambda: linalg.mul),
+        "sum": Recipe(arity=1, family=Family.REDUCTION, binding=lambda: arith.addf),
     }
 
-    def elementwise(self, recipe: Recipe, ins: Sequence, out: Access):
+    def elementwise(self, recipe: Recipe, ins: Sequence, step: ComputeStep):
         """Apply ``recipe``'s builder to ``ins``, shaped by the result's tile.
 
         Returns the result value; what becomes of it is the caller's decision.
         Every operand and the result share the result tile's extents.
 
         The destination is an uninitialised ``tensor.empty``, valid because an
-        elementwise op writes every element of it.  An accumulating op reads its
-        destination and needs it filled with an identity instead.
+        elementwise op writes every element of it.
         """
-        extents = list(out.extent)
-        elt_t = self.named_type(out.elems.value)
+        extents = list(step.out.extent)
+        elt_t = self.named_type(step.out.elems.value)
         dest = self.val(tensor.EmptyOp(extents, elt_t))
         return recipe.binding()(
             *ins,
             outs=[dest],
             result_tensors=[ir.RankedTensorType.get(extents, elt_t)],
         )
+
+    def reduction(self, recipe: Recipe, ins: Sequence, step: ComputeStep):
+        """``linalg.reduce`` over ``step.reduce_dims``, combining with ``recipe``.
+
+        The recipe contributes the *combiner* here rather than a whole-op builder
+        (``arith.addf`` for a sum), because ``linalg.reduce`` is one op for every
+        reduction and the payload is what differs between them.
+
+        The accumulator is a bare ``tensor.empty``, not a filled one: the identity
+        belongs to whoever materialises the accumulator, and on this path that is
+        the scheduler's reduction passes -- a ``linalg.fill`` here becomes a second
+        compute op they have to unpick.  Reducing in place also means no reshape:
+        keeping the surviving axes in the output tile makes the result the shape
+        the store's access tile already has.
+        """
+        [source] = ins
+        extents = list(step.out.extent)
+        elt_t = self.named_type(step.out.elems.value)
+        dest = self.val(tensor.EmptyOp(extents, elt_t))
+        combine = recipe.binding()
+
+        def body(accumulated, element):
+            return combine(accumulated, element)
+
+        # The region builder reads the block argument types off the annotations,
+        # and the element type is only known here, so they are set rather than
+        # written.
+        body.__annotations__ = {"accumulated": elt_t, "element": elt_t}
+        return linalg.reduce(
+            result=[ir.RankedTensorType.get(extents, elt_t)],
+            inputs=[source],
+            inits=[dest],
+            dimensions=list(step.reduce_dims),
+        )(body)
 
     # -- attributes --------------------------------------------------------
 

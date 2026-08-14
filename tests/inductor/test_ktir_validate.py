@@ -33,7 +33,6 @@ import inspect
 import re
 import sys
 import unittest
-from unittest import mock
 
 import sympy
 
@@ -41,12 +40,6 @@ from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor.codegen import ktir
 from torch_spyre._inductor.constants import STAGGERED_EAS
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
-
-_CONFIG = "torch_spyre._inductor.config"
-
-# The single core the emitted grid is the only supported one, pinned explicitly
-# so these tests do not depend on how this build is configured.
-_ONE_CORE = ktir.PlanOptions(sencores=1)
 
 
 def _add_op_specs() -> list:
@@ -100,41 +93,49 @@ class TestValidateRejections(unittest.TestCase):
     Each asserts the exception type and a distinguishing fragment of the
     message, so a rejection cannot silently turn into a different rejection.
 
-    ``_rejects`` pins two options rather than patching globals: one core, so a
-    per-op guard fires instead of the multi-core guard; and the symbolic address
-    form, which reads no ``allocation["hbm"]``, so the rejection under test is
-    the one the fixture is about.
+    ``_rejects`` defaults to the symbolic address form, which reads no
+    ``allocation["hbm"]``, so the rejection under test is the one the fixture is
+    about rather than a missing address.
     """
 
     def _rejects(self, specs, fragment, **options):
-        options.setdefault("sencores", 1)
         with self.assertRaises(NotImplementedError) as ctx:
             ktir.build_kernel_plan(specs, ktir.PlanOptions(**options))
         self.assertIn(fragment, str(ctx.exception))
 
     # -- whole-request capability ------------------------------------------
 
-    def test_multicore_rejected(self):
-        self._rejects(_add_op_specs(), "multi-core work division", sencores=2)
-
     def test_empty_spec_list_rejected(self):
         self._rejects([], "no OpSpec to emit")
+
+    def test_mixed_work_division_rejected(self):
+        """Two ops in one kernel, two grids: there is only one grid to emit."""
+        specs = _add_op_specs() + _add_op_specs()
+        d1 = next(s for s in specs[1].iteration_space if str(s) == "d1")
+        specs[1].iteration_space[d1] = (512, 2)
+        self._rejects(specs, "different work divisions")
+
+    def test_ragged_work_division_rejected(self):
+        """A division that does not divide the axis evenly has no per-core tile."""
+        specs = _add_op_specs()
+        d1 = next(s for s in specs[0].iteration_space if str(s) == "d1")
+        specs[0].iteration_space[d1] = (512, 7)  # 512 / 7 is not a whole tile
+        self._rejects(specs, "do not divide evenly")
 
     # -- spec-tree shape ---------------------------------------------------
 
     def test_unimplemented_op_rejected(self):
         self._rejects([UnimplementedOp(op="atan2")], "unimplemented op 'atan2'")
 
-    def test_counted_loop_rejected(self):
-        self._rejects([LoopSpec(count=4, body=_add_op_specs())], "counted loops")
-
     def test_unexpected_entry_rejected(self):
         self._rejects(["not a spec"], "unexpected spec entry str")
 
-    def test_reduction_rejected(self):
+    def test_family_mismatch_rejected(self):
+        """An ``add`` asked for as a reduction: the recipe is what has an
+        emission, so the request is refused rather than emitted elementwise."""
         specs = _add_op_specs()
         specs[0].is_reduction = True
-        self._rejects(specs, "reductions are not supported")
+        self._rejects(specs, "registered as ELEMENTWISE")
 
     def test_unregistered_op_rejected(self):
         """An op with no recipe is rejected, and the message names what exists."""
@@ -182,9 +183,18 @@ class TestValidateRejections(unittest.TestCase):
         self.assertNotIn(DataFormats.SENINT8, ktir.ElemTypes.NAMES)
 
     def test_baked_non_hbm_allocation_rejected(self):
+        """An allocation that is neither HBM nor one this emitter threads."""
         specs = _baked_add_op_specs()
-        specs[0].args[0].allocation = {"lx": 0x1000}
+        specs[0].args[0].allocation = {"somewhere_new": 0x1000}
         self._rejects(specs, "is not HBM-allocated", bake_addresses=True)
+
+    def test_threaded_input_without_a_producer_rejected(self):
+        """An lx buffer this kernel reads but does not produce: threading it has
+        no value to read, so it needs materialising."""
+        specs = _add_op_specs()
+        specs[0].args[0].allocation = {"lx": 0x1000}
+        specs[0].args[0].arg_index = -1
+        self._rejects(specs, "no op in this kernel produces it")
 
     def test_baked_unassigned_hbm_address_rejected(self):
         # _add_op_specs leaves every 'hbm' address None.
@@ -198,21 +208,24 @@ class TestRejectionsThroughGenerateKtir(unittest.TestCase):
     ``mlir_ktdp``; they run here precisely because it validates first.
     """
 
-    def test_reduction_unsupported(self):
+    def test_family_mismatch_unsupported(self):
         specs = _add_op_specs()
         specs[0].is_reduction = True
         with self.assertRaises(NotImplementedError):
-            ktir.generate_ktir("ktir_fused_add_0", specs, sencores=1)
+            ktir.generate_ktir("ktir_fused_add_0", specs)
 
     def test_unregistered_op_unsupported(self):
         specs = _add_op_specs()
         specs[0].op = "atan2"
         with self.assertRaises(NotImplementedError):
-            ktir.generate_ktir("ktir_fused_atan2_0", specs, sencores=1)
+            ktir.generate_ktir("ktir_fused_atan2_0", specs)
 
-    def test_multicore_unsupported(self):
+    def test_ragged_work_division_unsupported(self):
+        specs = _add_op_specs()
+        d1 = next(s for s in specs[0].iteration_space if str(s) == "d1")
+        specs[0].iteration_space[d1] = (512, 7)
         with self.assertRaises(NotImplementedError):
-            ktir.generate_ktir("ktir_fused_add_0", _add_op_specs(), sencores=2)
+            ktir.generate_ktir("ktir_fused_add_0", specs)
 
     def test_unknown_option_is_a_typeerror(self):
         """Options are PlanOptions fields; a typo is not silently ignored."""
@@ -222,35 +235,88 @@ class TestRejectionsThroughGenerateKtir(unittest.TestCase):
 
 
 class TestPlanOptions(unittest.TestCase):
-    """The caller's choices, including the one that defaults to the config.
+    """The caller's two choices -- both about spelling, neither a capability.
 
-    ``sencores=None`` is the production case: nothing passes a core count, so the
-    option has to resolve to whatever this build is configured for.  That default
-    is the reason to test the config read at all -- every other test pins the
-    value explicitly instead.
+    What the kernel does comes from the contract, so there is nothing here to
+    turn a feature on with: no core count (the iteration space states the grid)
+    and no loop mode (a ``LoopSpec`` is a loop).
     """
-
-    def test_core_count_defaults_to_the_configured_one(self):
-        with mock.patch(f"{_CONFIG}.sencores", 7):
-            self.assertEqual(ktir.PlanOptions().cores, 7)
-            # An explicit value wins over the configuration.
-            self.assertEqual(ktir.PlanOptions(sencores=1).cores, 1)
 
     def test_defaults_are_the_canonical_form(self):
         options = ktir.PlanOptions()
         self.assertFalse(options.bake_addresses)  # symbolic addresses
-        self.assertEqual(options.counted_loops, "reject")
+        self.assertEqual(options.symbolic_extent, "static")
 
-    def test_unknown_counted_loops_mode_rejected(self):
+    def test_options_are_only_about_spelling(self):
+        self.assertEqual(
+            sorted(f.name for f in dataclasses.fields(ktir.PlanOptions)),
+            ["bake_addresses", "symbolic_extent"],
+        )
+
+    def test_unknown_symbolic_extent_mode_rejected(self):
         with self.assertRaises(ValueError) as ctx:
-            ktir.PlanOptions(counted_loops="unroll")
-        self.assertIn("counted_loops", str(ctx.exception))
+            ktir.PlanOptions(symbolic_extent="guess")
+        self.assertIn("symbolic_extent", str(ctx.exception))
 
-    def test_grid_comes_from_the_core_count(self):
-        self.assertEqual(ktir.KernelPlan(_ONE_CORE).grid, (1,))
+
+class TestWorkDivision(unittest.TestCase):
+    """The grid, and the per-core tile, as ``iteration_space`` states them.
+
+    ``work_division.py`` has already turned ``config.sencores`` into a per-symbol
+    division by the time the emitter sees a spec, so the emitter reads the
+    contract and never the config -- the same source the SDSC path reads as its
+    work slices.
+    """
+
+    @staticmethod
+    def _divided(divisions):
+        """``_add_op_specs`` with ``{symbol name: division}`` applied."""
+        specs = _add_op_specs()
+        space = specs[0].iteration_space
+        for symbol, (extent, _div) in list(space.items()):
+            space[symbol] = (extent, divisions.get(str(symbol), 1))
+        return specs
+
+    def test_an_undivided_space_is_one_core(self):
+        plan = ktir.build_kernel_plan(_add_op_specs())
+        self.assertEqual(plan.grid, (1,))
+        self.assertEqual(plan.divisions, ())
+
+    def test_the_grid_is_the_product_of_the_divisions(self):
+        plan = ktir.build_kernel_plan(self._divided({"d1": 32}))
+        self.assertEqual(plan.grid, (32,))
+        self.assertEqual(plan.divisions, (ktir.Division(symbol="d1", div=32, inner=1),))
+
+    def test_two_divided_symbols_are_mixed_radix(self):
+        """Outermost-first, and ``inner`` is that symbol's stride in the grid."""
+        plan = ktir.build_kernel_plan(self._divided({"d0": 2, "d1": 4}))
+        self.assertEqual(plan.grid, (8,))
+        self.assertEqual(
+            plan.divisions,
+            (
+                ktir.Division(symbol="d0", div=2, inner=4),
+                ktir.Division(symbol="d1", div=4, inner=1),
+            ),
+        )
+
+    def test_the_tile_shrinks_and_the_view_does_not(self):
+        """One core's tile is its share; every core addresses the whole buffer."""
+        plan = ktir.build_kernel_plan(self._divided({"d1": 32}))
+        for buffer in plan.parameters:
+            with self.subTest(buf_id=buffer.buf_id):
+                self.assertEqual(buffer.layout.extent, (16, 512, 64))
+        step = plan.steps[0]
+        self.assertEqual(step.out.extent, (16, 16, 64))  # 512 / 32 rows
+        # The division walks dim 1 in per-core-extent steps, and nothing else.
+        self.assertEqual(step.out.index_coeffs, ((0,), (16,), (0,)))
+
+    def test_a_division_no_output_axis_follows_is_rejected(self):
+        """A stick is the unit of transfer, so the lane axis is never divided --
+        which leaves a division of the lane symbol with no axis to walk, and every
+        core writing the same elements.  Refused rather than silently duplicated."""
         with self.assertRaises(NotImplementedError) as ctx:
-            ktir.KernelPlan(ktir.PlanOptions(sencores=2))
-        self.assertIn("multi-core work division", str(ctx.exception))
+            ktir.build_kernel_plan(self._divided({"d2": 2}))
+        self.assertIn("no device axis of the output", str(ctx.exception))
 
 
 class TestKernelPlan(unittest.TestCase):
@@ -261,7 +327,7 @@ class TestKernelPlan(unittest.TestCase):
         # Registration order (spec.args) is 0, 1, 2; shuffle it so the sort is
         # doing the work rather than agreeing with insertion order by luck.
         specs[0].args = [specs[0].args[2], specs[0].args[0], specs[0].args[1]]
-        plan = ktir.build_kernel_plan(specs, _ONE_CORE)
+        plan = ktir.build_kernel_plan(specs)
         self.assertEqual([e.arg_index for e in plan.parameters], [0, 1, 2])
         self.assertEqual([e.buf_id for e in plan.parameters], ["arg0", "arg1", "buf0"])
         # The plan holds the derived records, so the buffer's extent and its
@@ -270,7 +336,7 @@ class TestKernelPlan(unittest.TestCase):
         self.assertEqual(plan.parameters[0].layout.strides, (32768, 64, 1))
 
     def test_symbolic_form_resolves_no_base_addresses(self):
-        plan = ktir.build_kernel_plan(_add_op_specs(), _ONE_CORE)
+        plan = ktir.build_kernel_plan(_add_op_specs())
         # Every 'hbm' address in the fixture is None and never read: the bases
         # are func arguments.
         self.assertEqual([e.base_elements for e in plan.parameters], [None] * 3)
@@ -278,7 +344,7 @@ class TestKernelPlan(unittest.TestCase):
     def test_baked_form_resolves_bases_in_elements(self):
         plan = ktir.build_kernel_plan(
             _baked_add_op_specs(),
-            ktir.PlanOptions(sencores=1, bake_addresses=True),
+            ktir.PlanOptions(bake_addresses=True),
         )
         # fp16: 2 bytes per element, so the byte slot halves.
         self.assertEqual(
@@ -288,7 +354,7 @@ class TestKernelPlan(unittest.TestCase):
 
     def test_repeated_buffer_is_registered_once(self):
         specs = _add_op_specs() + _add_op_specs()
-        plan = ktir.build_kernel_plan(specs, _ONE_CORE)
+        plan = ktir.build_kernel_plan(specs)
         self.assertEqual(len(plan.buffers), 3)
 
 
@@ -318,18 +384,40 @@ class TestBaseAddressElements(unittest.TestCase):
 
 
 class TestInternalBufferSignal(unittest.TestCase):
-    """``is_internal`` decides materialise-vs-thread. Nothing sets it yet."""
+    """``is_internal`` decides materialise-vs-thread, from ``allocation``.
 
-    def test_nothing_is_internal_today(self):
+    The same field ``create_tensor_arg`` uses to decide what becomes a kernel
+    argument at all, so the two cannot disagree about which buffers the kernel
+    owns.
+    """
+
+    def test_an_hbm_buffer_is_passed_in_not_owned(self):
         for arg in _add_op_specs()[0].args:
             self.assertFalse(ktir.is_internal(arg))
 
-    def test_reads_the_flag_when_a_spec_carries_one(self):
-        """The signal is a TensorArg field OpSpec does not have yet, so this
-        fakes it: when it appears, only ``is_internal``'s body changes."""
-        arg = _add_op_specs()[0].args[2]
-        arg.is_internal = True
-        self.assertTrue(ktir.is_internal(arg))
+    def test_planning_placed_it_means_the_kernel_owns_it(self):
+        for allocation in ({"lx": 0x1000}, {"hbm_pool": 0x2000}):
+            with self.subTest(allocation=allocation):
+                arg = _add_op_specs()[0].args[2]
+                arg.allocation = allocation
+                self.assertTrue(ktir.is_internal(arg))
+
+    def test_an_unrecognised_allocation_is_not_threaded(self):
+        """Threading is chosen on a positive signal, so an allocation this
+        emitter does not know reaches the buffer rejection instead."""
+        specs = _add_op_specs()
+        specs[0].args[2].allocation = {"somewhere_new": 0}
+        self.assertFalse(ktir.is_internal(specs[0].args[2]))
+
+    def test_a_threaded_buffer_nothing_reads_is_rejected(self):
+        """An intermediate whose consumer is in another kernel: not stored, and
+        not read here either, so the op that produced it would write nowhere."""
+        specs = _add_op_specs()
+        specs[0].args[2].allocation = {"lx": 0x1000}
+        specs[0].args[2].arg_index = -1
+        with self.assertRaises(NotImplementedError) as ctx:
+            ktir.build_kernel_plan(specs)
+        self.assertIn("nothing in this kernel", str(ctx.exception))
 
 
 class TestRecipes(unittest.TestCase):
@@ -380,7 +468,7 @@ class TestRecipes(unittest.TestCase):
 
 
 def _tiled_reduction_specs() -> tuple:
-    """The loop-nest shape of the committed ``sum`` 1-core KTIR fixture.
+    """The loop-nest shape of a hand-written 1-core KTIR ``sum`` kernel.
 
     Two ``scf.for`` levels over a [2, 256, 64] fp16 input reduced to a [2, 64]
     output: the outer level walks whole sticks (2 trips), the inner level walks
@@ -426,12 +514,10 @@ def _tiled_reduction_specs() -> tuple:
 
 
 class TestLoopDerivations(unittest.TestCase):
-    """``_levels`` / ``_solve_layout`` / ``_access`` against the ``sum`` fixture.
+    """``_levels`` / ``_solve_layout`` / ``_access`` against that ``sum`` nest.
 
-    ``generate_ktir`` still rejects a ``LoopSpec``, so no emission reaches these
-    numbers yet; they are pinned against a KTIR file that a scheduler already consumes,
-    so enabling loops is a matter of dropping that rejection rather than of
-    working out what the loop form should be.
+    The numbers are pinned against a KTIR kernel a scheduler already consumes, so
+    what the loop form should be is not this emitter's invention.
     """
 
     def test_levels_are_outermost_first_with_their_trip_counts(self):
@@ -457,7 +543,7 @@ class TestLoopDerivations(unittest.TestCase):
         self.assertEqual(ktir._trip(LoopSpec(count=s0, body=[])), s0)
 
     def test_buffer_extent_grows_out_of_the_tile_extent(self):
-        """``E_i = A_i + q[l][i] * (T_l - 1)``, matching the fixture's views."""
+        """``E_i = A_i + q[l][i] * (T_l - 1)``, matching that kernel's views."""
         spec, loops = _tiled_reduction_specs()
         levels = ktir._levels(spec, loops)
         a, c = spec.args
@@ -475,22 +561,22 @@ class TestLoopDerivations(unittest.TestCase):
         # The inner level does not move the output: it is the reduced dim.
         self.assertEqual(c_q, [(1, 0), (0, 0)])
 
-    def test_access_indices_are_the_fixture_subscripts(self):
+    def test_access_indices_are_the_kernel_subscripts(self):
         """``%a_view[%n_stick, %m, %c0]`` and ``%c_view[%n_stick, %c0]``."""
         spec, loops = _tiled_reduction_specs()
         levels = ktir._levels(spec, loops)
         a, c = spec.args
 
         a_layout, a_q = ktir._solve_layout(a, levels)
-        a_access = ktir._access(a, levels, a_q, a_layout)
+        a_access = ktir._access(a, a.device_size, a_q, a_layout)
         # The tile extent is device_size, which is what tiling already baked in.
         self.assertEqual(a_access.extent, (1, 1, 64))
         # Per view dim, the step each level takes: dim 0 <- n_stick, dim 1 <- m,
-        # dim 2 <- nothing, i.e. the constant zero the fixture spells as %c0.
+        # dim 2 <- nothing, i.e. the constant zero the kernel spells as %c0.
         self.assertEqual(a_access.index_coeffs, ((1, 0), (0, 1), (0, 0)))
 
         c_layout, c_q = ktir._solve_layout(c, levels)
-        c_access = ktir._access(c, levels, c_q, c_layout)
+        c_access = ktir._access(c, c.device_size, c_q, c_layout)
         self.assertEqual(c_access.extent, (1, 64))
         self.assertEqual(c_access.index_coeffs, ((1, 0), (0, 0)))
 
@@ -500,7 +586,7 @@ class TestLoopDerivations(unittest.TestCase):
         layout, q = ktir._solve_layout(arg, [])
         self.assertEqual(layout.extent, (16, 512, 64))
         self.assertEqual(q, [])
-        access = ktir._access(arg, [], q, layout)
+        access = ktir._access(arg, arg.device_size, q, layout)
         # One empty sum per dim: every index expression is zero.
         self.assertEqual(access.index_coeffs, ((), (), ()))
 
@@ -613,11 +699,7 @@ class TestDimensionArguments(unittest.TestCase):
 
     @staticmethod
     def _options(**overrides):
-        fields = {
-            "sencores": 1,
-            "counted_loops": "walk",
-            "symbolic_extent": "dynamic",
-        }
+        fields = {"symbolic_extent": "dynamic"}
         return ktir.PlanOptions(**(fields | overrides))
 
     def test_the_plan_names_the_dimension_it_needs(self):
@@ -798,8 +880,8 @@ class TestWithoutTheDialectBuild(unittest.TestCase):
             # A rejection, not an ImportError: the plan walk runs first and needs
             # nothing from the dialect.
             with self.assertRaises(NotImplementedError) as ctx:
-                fresh.generate_ktir("k", [LoopSpec(count=4, body=[])], sencores=1)
-            self.assertIn("counted loops", str(ctx.exception))
+                fresh.generate_ktir("k", [UnimplementedOp(op="atan2")])
+            self.assertIn("unimplemented op", str(ctx.exception))
             # And the derivations answer, dialect or no dialect.
             layout, _ = fresh._solve_layout(_add_op_specs()[0].args[0], [])
             self.assertEqual(layout.extent, (16, 512, 64))
@@ -807,7 +889,7 @@ class TestWithoutTheDialectBuild(unittest.TestCase):
     def test_emission_is_what_needs_the_dialect(self):
         # A *valid* request gets as far as the builder and no further.
         with self._blocked() as fresh, self.assertRaises(ImportError):
-            fresh.generate_ktir("k", _add_op_specs(), sencores=1)
+            fresh.generate_ktir("k", _add_op_specs())
 
 
 class TestScopeStack(unittest.TestCase):
@@ -876,7 +958,14 @@ class TestEmissionCannotRefuse(unittest.TestCase):
         }
 
         seen: set[str] = set()
-        pending = ["emit"]
+        # ``compute`` reaches a family's method by name (``Family.ELEMENTWISE`` ->
+        # ``elementwise``), which no call-graph walk can follow, so every family
+        # method is a root here: a new family cannot escape this check by being
+        # dispatched dynamically.
+        families = [family.name.lower() for family in ktir.Family]
+        for family in families:
+            self.assertIn(family, methods, f"KtirBuilder has no {family}()")
+        pending = ["emit", *families]
         raised: list[tuple[str, str]] = []
         while pending:
             name = pending.pop()

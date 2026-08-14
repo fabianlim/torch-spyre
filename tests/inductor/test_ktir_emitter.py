@@ -29,10 +29,14 @@ from torch_spyre._inductor.op_spec import OpSpec, TensorArg
 
 
 def _mlir_ktdp_available() -> bool:
-    """True when mlir_ktdp is built with the func/arith dialect Python bindings."""
+    """True when mlir_ktdp is built with the dialect bindings emission needs.
+
+    ``linalg``/``tensor`` are now required by *both* address forms, so a build
+    carrying only ``arith``/``func``/``ktdp`` must skip rather than error.
+    """
     try:
         from mlir_ktdp import ir  # noqa: F401
-        from mlir_ktdp.dialects import arith, func, ktdp  # noqa: F401
+        from mlir_ktdp.dialects import arith, func, ktdp, linalg, tensor  # noqa: F401
     except ImportError:
         return False
     return True
@@ -53,9 +57,10 @@ module {
     %4 = ktdp.load %3 : <16x512x64xindex> -> tensor<16x512x64xf16>
     %5 = ktdp.construct_access_tile %1[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
     %6 = ktdp.load %5 : <16x512x64xindex> -> tensor<16x512x64xf16>
-    %7 = arith.addf %4, %6 : tensor<16x512x64xf16>
-    %8 = ktdp.construct_access_tile %2[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
-    ktdp.store %7, %8 : tensor<16x512x64xf16>, <16x512x64xindex>
+    %7 = tensor.empty() : tensor<16x512x64xf16>
+    %8 = linalg.add ins(%4, %6 : tensor<16x512x64xf16>, tensor<16x512x64xf16>) outs(%7 : tensor<16x512x64xf16>) -> tensor<16x512x64xf16>
+    %9 = ktdp.construct_access_tile %2[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
+    ktdp.store %8, %9 : tensor<16x512x64xf16>, <16x512x64xindex>
     return
   }
 }
@@ -148,15 +153,6 @@ class TestKtirCapabilityGuards(unittest.TestCase):
             generate_ktir("ktir_fused_add_0", _add_op_specs())
 
 
-def _mlir_ktdp_linalg_available() -> bool:
-    # The baked form additionally needs the linalg/tensor bindings.
-    try:
-        from mlir_ktdp.dialects import linalg, tensor  # noqa: F401
-    except ImportError:
-        return False
-    return _mlir_ktdp_available()
-
-
 @mock.patch("torch_spyre._inductor.config.bundle_symbolic_args", False)
 @mock.patch("torch_spyre._inductor.config.sencores", 1)
 class TestKtirBakedAddresses(unittest.TestCase):
@@ -166,15 +162,13 @@ class TestKtirBakedAddresses(unittest.TestCase):
         arg.allocation = allocation
         return arg
 
-    @unittest.skipUnless(_mlir_ktdp_linalg_available(), "no mlir_ktdp linalg")
     def test_baked_form_deltas(self):
         """The baked form (dataflow-scheduler#65) vs ``_EXPECTED_ADD_KTIR``.
 
-        Asserted as deltas rather than a second golden: the two texts differ in
-        5 of 24 lines, so a full copy would be 19 lines of duplication that churn
-        together, and this form is deleted outright when #65 is fixed.  The
-        loads / tiles / views the two share are already pinned by
-        ``_EXPECTED_ADD_KTIR``.
+        Asserted as deltas rather than a second golden: the two texts now differ
+        only in how base addresses are spelled, so a full copy would duplicate
+        every line that churns together, and this form is deleted outright when
+        #65 is fixed.
         """
         from torch_spyre._inductor.codegen.ktir import generate_ktir
 
@@ -191,11 +185,9 @@ class TestKtirBakedAddresses(unittest.TestCase):
             with self.subTest(arg_index=arg_index):
                 base = (arg_index << 34) // 2
                 self.assertIn(f"arith.constant {base} : index", emitted)
-        # 3. linalg over tensor.empty, never arith on tensors -- required for the
-        #    memref offset to fold to static, which ktdp.load's verifier needs.
-        self.assertIn("tensor.empty()", emitted)
-        self.assertIn("linalg.add ins(", emitted)
-        self.assertNotIn("arith.addf", emitted)
+        # Compute is deliberately NOT asserted here: both forms emit the same
+        # linalg.add over a tensor.empty, so it is pinned by the symbolic golden
+        # above and is no longer a delta of this one.
 
     def test_addresses_resolved_without_the_dialect(self):
         from torch_spyre._inductor.codegen.ktir import _base_address_elements

@@ -44,10 +44,8 @@ from torch_spyre._inductor.codegen.opspec_utils import (
 )
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
 
-# Pointwise op name -> the ``arith`` float builder that implements it.  Only
+# Pointwise op name -> the ``linalg`` named-op builder that implements it.  Only
 # ``add`` is wired up so far; other ops raise before reaching here.
-_ARITH_FLOAT_OP = {"add": "AddFOp"}
-# The same ops as ``linalg`` named-op builders, for the baked form.
 _LINALG_FLOAT_OP = {"add": "add"}
 
 
@@ -83,9 +81,13 @@ def _mlir_elt_type(ir, device_dtype: DataFormats):
 def _emit_linalg_pointwise(ir, spec: OpSpec, loaded, out: TensorArg):
     """``linalg`` named op over an uninitialised ``tensor.empty`` out.
 
-    Required by the baked form, not an independent requirement: a memref offset
-    only folds to *static* when the ``ktdp.load``'s consumer is a linalg op, and
-    a constant base alone still yields ``offset: ?``, which ``ktdp.load`` rejects.
+    The one compute form, whichever way base addresses are spelled.  The baked
+    form *requires* it -- a memref offset only folds to static when the
+    ``ktdp.load``'s consumer is a linalg op, and a constant base alone still
+    yields ``offset: ?``, which ``ktdp.load`` rejects -- and the symbolic form
+    wants it too: ``arith.addf`` over tensors is not a form the KTIR consumer
+    recognises, so emitting one shape for both is what lets the address choice
+    stay a matter of spelling rather than of compute.
     """
     from mlir_ktdp.dialects import linalg, tensor
 
@@ -205,7 +207,7 @@ def generate_ktir(
                     memory_views[bid] = _emit_memory_view(ir, ktdp, arg, base)
 
                 for spec in op_specs:
-                    _emit_pointwise_op(ir, ktdp, arith, spec, memory_views, c0, baked)
+                    _emit_pointwise_op(ir, ktdp, spec, memory_views, c0)
 
                 func.ReturnOp([])
 
@@ -234,7 +236,7 @@ def _collect_pointwise_op_specs(
             )
         if entry.is_reduction:
             raise NotImplementedError("OpSpec->KTIR: reductions are not supported yet")
-        if entry.op not in _ARITH_FLOAT_OP:
+        if entry.op not in _LINALG_FLOAT_OP:
             raise NotImplementedError(
                 f"OpSpec->KTIR: op {entry.op!r} is not supported yet "
                 "(only pointwise 'add')"
@@ -268,7 +270,7 @@ def _emit_memory_view(ir, ktdp, arg: TensorArg, offset):
     )
 
 
-def _emit_pointwise_op(ir, ktdp, arith, spec: OpSpec, memory_views, c0, baked):
+def _emit_pointwise_op(ir, ktdp, spec: OpSpec, memory_views, c0):
     """Emit the load / compute / store sequence for one pointwise ``OpSpec``."""
     inputs = [a for a in spec.args if a.is_input]
     outputs = [a for a in spec.args if not a.is_input]
@@ -315,10 +317,7 @@ def _emit_pointwise_op(ir, ktdp, arith, spec: OpSpec, memory_views, c0, baked):
         _emit_load(ir, ktdp, arg, memory_views[_buf_id(arg)], c0) for arg in inputs
     ]
 
-    if baked:
-        result = _emit_linalg_pointwise(ir, spec, loaded, out)
-    else:
-        result = _val(getattr(arith, _ARITH_FLOAT_OP[spec.op])(loaded[0], loaded[1]))
+    result = _emit_linalg_pointwise(ir, spec, loaded, out)
 
     _emit_store(ir, ktdp, out, memory_views[_buf_id(out)], result, c0)
 

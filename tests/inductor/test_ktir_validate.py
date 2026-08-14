@@ -30,6 +30,7 @@ import contextlib
 import dataclasses
 import importlib
 import inspect
+import re
 import sys
 import unittest
 from unittest import mock
@@ -448,12 +449,12 @@ class TestLoopDerivations(unittest.TestCase):
             ktir._levels(spec, loops[:1])
         self.assertIn("tiled_symbols", str(ctx.exception))
 
-    def test_symbolic_trip_count_is_guarded(self):
-        spec, loops = _tiled_reduction_specs()
-        loops[0] = (LoopSpec(count=sympy.Symbol("s0"), body=[]), "%n_stick")
-        with self.assertRaises(ktir.DownstreamUnsupported) as ctx:
-            ktir._levels(spec, loops)
-        self.assertIn("symbolic-loop-count", str(ctx.exception))
+    def test_a_symbolic_trip_count_is_read_not_refused(self):
+        """``_trip`` reads the count; whether one can be emitted is the plan's
+        call, because only the plan knows the ``symbolic_extent`` mode."""
+        s0 = sympy.Symbol("s0")
+        self.assertEqual(ktir._trip(LoopSpec(count=4, body=[])), 4)
+        self.assertEqual(ktir._trip(LoopSpec(count=s0, body=[])), s0)
 
     def test_buffer_extent_grows_out_of_the_tile_extent(self):
         """``E_i = A_i + q[l][i] * (T_l - 1)``, matching the fixture's views."""
@@ -515,12 +516,19 @@ class TestLoopDerivations(unittest.TestCase):
         self.assertIn("not a whole number of steps", str(ctx.exception))
 
 
-class TestGuardedDerivationsStillProduceTheirAnswer(unittest.TestCase):
-    """A guarded capability's derivation is exercised with the guard bypassed.
+# ---------------------------------------------------------------------------
+# What we generate
+# ---------------------------------------------------------------------------
 
-    The guards are one call each in front of code that works, so dropping a guard
-    is all that enabling the capability takes.  These call the derivation
-    directly, which is what proves there is something behind the guard.
+
+class TestSymbolicExtentModes(unittest.TestCase):
+    """The three answers to "this device size is a sympy expression".
+
+    ``symbolic_extent`` picks one: refuse it, take it as a func argument, or bake
+    its upper bound.  The last is what the SDSC path does (``_resolve_sdsc_size``
+    reads the same ``symbolic_dim_bounds`` max), so 'max' is parity with the
+    bundle emitter and 'dynamic' is the form the KTDP lowering builds for a
+    non-constant descriptor dimension.
     """
 
     @staticmethod
@@ -530,16 +538,19 @@ class TestGuardedDerivationsStillProduceTheirAnswer(unittest.TestCase):
         arg.device_size = [sympy.Symbol("s0"), 512, 64]
         return arg
 
-    def test_default_mode_guards_the_symbolic_extent(self):
-        with self.assertRaises(ktir.DownstreamUnsupported) as ctx:
+    def test_static_mode_refuses_a_symbolic_extent(self):
+        with self.assertRaises(ktir.Unimplemented) as ctx:
             ktir._layout(self._symbolic_arg(), [], [])
-        self.assertIn("dynamic-view-extent", str(ctx.exception))
+        self.assertIn("static-view-extent", str(ctx.exception))
+        # The message points at the two modes that can express it.
+        self.assertIn("symbolic_extent='dynamic'", str(ctx.exception))
 
-    def test_dynamic_mode_derives_the_symbolic_view(self):
+    def test_dynamic_mode_keeps_the_symbol(self):
         s0 = sympy.Symbol("s0")
         layout = ktir._layout(self._symbolic_arg(), [], [], symbolic_extent="dynamic")
         # The extent stays symbolic and the strides are row-major over it: the
-        # trailing two dims are still integers, the outer stride is the product.
+        # trailing two dims are still integers, so the outer stride is a product
+        # of integers and no stride arithmetic is needed to emit this.
         self.assertEqual(layout.extent, (s0, 512, 64))
         self.assertEqual(layout.strides, (32768, 64, 1))
 
@@ -549,7 +560,7 @@ class TestGuardedDerivationsStillProduceTheirAnswer(unittest.TestCase):
             [],
             [],
             symbolic_extent="max",
-            bounds={"s0": (16, 1)},  # (max, granularity)
+            bounds={"s0": (16, 1)},  # (max, granularity), as SDSC reads it
         )
         self.assertEqual(layout.extent, (16, 512, 64))
         self.assertEqual(layout.strides, (32768, 64, 1))
@@ -559,44 +570,130 @@ class TestGuardedDerivationsStillProduceTheirAnswer(unittest.TestCase):
             ktir._layout(self._symbolic_arg(), [], [], symbolic_extent="max", bounds={})
         self.assertIn("no bound for 's0'", str(ctx.exception))
 
+    def test_unknown_mode_rejected(self):
+        with self.assertRaises(ValueError):
+            ktir.PlanOptions(symbolic_extent="guess")
 
-class TestStatusTable(unittest.TestCase):
-    """``STATUS_TABLE`` is the single record of what the emitter can emit."""
 
-    def test_labels_are_unique_and_resolvable(self):
-        labels = [row.label for row in ktir.STATUS_TABLE]
-        self.assertEqual(len(labels), len(set(labels)))
-        for label in labels:
-            self.assertIs(ktir.status_of(label), ktir.status_of(label))
-        with self.assertRaises(KeyError):
-            ktir.status_of("no-such-capability")
+class TestDimensionArguments(unittest.TestCase):
+    """A symbolic dimension becomes a func argument the plan names.
 
-    def test_every_guard_label_has_a_row(self):
-        """A guard raises with a label; the label must be in the status table."""
-        for label in ("dynamic-view-extent", "symbolic-loop-count"):
-            with self.subTest(label=label):
-                self.assertIs(
-                    ktir.status_of(label).status, ktir.Status.DOWNSTREAM_GUARDED
-                )
+    One argument does both jobs: it sizes the dynamic memref dim and bounds the
+    loop that walks it, which is why the two used to look like separate
+    unsupported capabilities.
+    """
 
-    def test_staggered_arrangement_is_the_only_unspecified_item(self):
+    @staticmethod
+    def _dynamic_nest():
+        """``a + b`` over a run-time number of sticks, one stick per iteration."""
+        s0, n = sympy.symbols("s0 n")
+
+        def arg(name, index, is_input):
+            return TensorArg(
+                is_input=is_input,
+                arg_index=index,
+                device_dtype=DataFormats.SEN169_FP16,
+                device_size=[1, 64],
+                device_coordinates=[],
+                allocation={"hbm": None},
+                name=name,
+                device_tile_advance_expr=64 * n,
+            )
+
+        spec = OpSpec(
+            op="add",
+            is_reduction=False,
+            iteration_space={},
+            args=[arg("arg0", 0, True), arg("arg1", 1, True), arg("buf0", 2, False)],
+            op_info={},
+            tiled_symbols=[[n]],
+            tiled_symbol_trip_counts={n: s0},
+        )
+        return LoopSpec(count=s0, body=[spec])
+
+    @staticmethod
+    def _options(**overrides):
+        fields = {
+            "sencores": 1,
+            "counted_loops": "walk",
+            "symbolic_extent": "dynamic",
+        }
+        return ktir.PlanOptions(**(fields | overrides))
+
+    def test_the_plan_names_the_dimension_it_needs(self):
+        plan = ktir.build_kernel_plan([self._dynamic_nest()], self._options())
+        self.assertEqual(plan.dims, ("s0",))
+        # The buffer grows to the symbol, and its strides stay integers.
+        for buffer in plan.parameters:
+            with self.subTest(buf_id=buffer.buf_id):
+                self.assertEqual(buffer.layout.extent, (sympy.Symbol("s0"), 64))
+                self.assertEqual(buffer.layout.strides, (64, 1))
+
+    def test_the_loop_bound_is_that_same_dimension(self):
+        plan = ktir.build_kernel_plan([self._dynamic_nest()], self._options())
+        self.assertEqual(plan.steps[0].trip, "s0")
+        self.assertIn(plan.steps[0].trip, plan.dims)
+
+    def test_static_mode_refuses_a_symbolic_trip_count(self):
+        """The loop's bound is planned before its body, so this is the refusal
+        that fires -- the symbolic extents inside it are never reached."""
+        with self.assertRaises(ktir.Unimplemented) as ctx:
+            ktir.build_kernel_plan(
+                [self._dynamic_nest()], self._options(symbolic_extent="static")
+            )
+        self.assertIn("symbolic-loop-count", str(ctx.exception))
+        self.assertIn("symbolic_extent='dynamic'", str(ctx.exception))
+
+    def test_a_computed_dimension_is_refused(self):
+        """Only a bare symbol can be an argument; an expression would have to be
+        computed from the arguments."""
+        nest = self._dynamic_nest()
+        nest.count = 2 * sympy.Symbol("s0")
+        for arg in nest.body[0].args:
+            arg.device_tile_advance_expr = None
+        with self.assertRaises(ktir.Unimplemented) as ctx:
+            ktir.build_kernel_plan([nest], self._options())
+        self.assertIn("computed-dimension", str(ctx.exception))
+
+    def test_a_symbolic_stride_is_refused(self):
+        """A symbolic dim that is not the outermost makes an outer stride an
+        expression, which would need arithmetic on the dimension arguments."""
+        nest = self._dynamic_nest()
+        spec = nest.body[0]
+        for arg in spec.args:
+            # [2, s0, 64]: the middle dim is the one that grows, so stride 0
+            # becomes s0*64 rather than an integer.
+            arg.device_size = [2, 1, 64]
+            arg.device_tile_advance_expr = 64 * sympy.Symbol("n")
+        with self.assertRaises(ktir.Unimplemented) as ctx:
+            ktir.build_kernel_plan([nest], self._options())
+        self.assertIn("computed-view-stride", str(ctx.exception))
+
+
+# ---------------------------------------------------------------------------
+# What we refuse, and why
+# ---------------------------------------------------------------------------
+
+
+class TestRefusals(unittest.TestCase):
+    """The labelled capabilities this emitter does not implement.
+
+    A label is a token shared by the raise and this test, so grepping it finds
+    both.  No message here claims a consumer is the blocker: this repository
+    cannot run dbo-opt or the scheduler, so what they accept is not observable
+    from these tests, and two labels that used to claim it were both wrong.
+    """
+
+    def test_staggered_arrangement_is_unimplemented(self):
         """FAILS ONCE THE STAGGERED LAYOUT IS IMPLEMENTED, deliberately.
 
-        There is one capability with no derivation behind it.  This test fails
-        the moment ``_arrangement_layout`` returns numbers for a staggered
-        arrangement instead of raising, so the ``STATUS_TABLE`` row must be moved
-        off ``UNSPECIFIED`` in the same commit that implements it -- the table
-        cannot go stale while the code moves on.
+        The permutation has never been written down as numbers, so unlike every
+        other refusal there is no derivation behind this one.  The test fails the
+        moment ``_arrangement_layout`` returns numbers instead of raising, which
+        is the prompt to delete it along with the label.
         """
-        unspecified = [
-            row.label
-            for row in ktir.STATUS_TABLE
-            if row.status is ktir.Status.UNSPECIFIED
-        ]
-        self.assertEqual(unspecified, ["staggered-element-arrangement"])
-
         arrangement = next(iter(STAGGERED_EAS))
-        with self.assertRaises(ktir.Unspecified) as ctx:
+        with self.assertRaises(ktir.Unimplemented) as ctx:
             ktir._arrangement_layout(arrangement, (16, 512, 64), (32768, 64, 1))
         self.assertIn("staggered-element-arrangement", str(ctx.exception))
 
@@ -613,11 +710,46 @@ class TestStatusTable(unittest.TestCase):
                     (extent, strides),
                 )
 
-    def test_coordinate_set_is_recorded_as_informational(self):
-        """It is emitted with no known reader; the row is why that is on purpose."""
-        self.assertIs(
-            ktir.status_of("coordinate-set").status, ktir.Status.INFORMATIONAL
+    def test_every_label_is_greppable_and_uniquely_owned(self):
+        """Each label is raised from exactly one site, so grepping it is exact."""
+        source = inspect.getsource(ktir)
+        labels = re.findall(r'_unimplemented\(\s*\n?\s*"([^"]+)"', source)
+        self.assertEqual(sorted(labels), sorted(set(labels)))
+        self.assertEqual(
+            sorted(labels),
+            [
+                "computed-dimension",
+                "computed-view-stride",
+                "staggered-element-arrangement",
+                "static-view-extent",
+                "symbolic-loop-count",
+            ],
         )
+
+    def test_no_refusal_message_blames_a_consumer(self):
+        """A refusal says what is missing here, not what someone else rejects.
+
+        Checked over the ``_unimplemented`` messages rather than the whole file:
+        naming dbo-opt is legitimate where it explains why an *option* exists
+        (baking addresses), but not as the reason a capability is refused, which
+        this repository cannot observe.
+        """
+        tree = ast.parse(inspect.getsource(ktir))
+        messages = [
+            " ".join(
+                part.value
+                for part in ast.walk(node.args[1])
+                if isinstance(part, ast.Constant) and isinstance(part.value, str)
+            )
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and getattr(node.func, "id", None) == "_unimplemented"
+        ]
+        self.assertEqual(len(messages), 5)
+        for message in messages:
+            with self.subTest(message=message[:40]):
+                for blame in ("dbo-opt", "no consumer", "nothing lowers", "scheduler"):
+                    self.assertNotIn(blame, message)
 
 
 class TestWithoutTheDialectBuild(unittest.TestCase):

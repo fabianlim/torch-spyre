@@ -47,8 +47,7 @@ Structure
 
 Adding a pointwise op is one ``RECIPES`` entry.  Enabling counted loops is
 making ``counted_loops='walk'`` the only mode: the plan walk, the derivations,
-``LoopStep`` and its emission are in place, and ``STATUS_TABLE`` says which parts
-of them a consumer accepts.
+``LoopStep`` and its emission are in place.
 """
 
 from __future__ import annotations
@@ -132,175 +131,34 @@ _MLIR_ELT_TYPE_NAMES: dict[DataFormats, str] = {
 
 
 # ---------------------------------------------------------------------------
-# Three kinds of "not supported", kept apart
+# What this emitter does not implement
 # ---------------------------------------------------------------------------
 #
-# 1. *dialect-illegal* -- the KTDP verifiers forbid the construct.  Permanent and
-#    structural; the emitter never tries.
-# 2. *downstream-guarded* -- KTDP expresses it and this emitter derives it, but a
-#    consumer of the emitted KTIR refuses it today.  Raised by
-#    ``_downstream_unsupported``: a thin guard in front of a working derivation,
-#    deletable on its own without touching the derivation behind it.
-# 3. *unspecified* -- nobody has yet defined what should be emitted, so there is
-#    no output to guard.  Raised by ``_unspecified``.  There is exactly one such
-#    item (see ``STATUS_TABLE``), and it is the only place in this module where a
-#    derivation is missing rather than merely fenced off.
+# One helper, one exception type, and a *label* per capability.  The label is a
+# stable token shared by the raise and its test, so grepping it finds both; the
+# message says what is missing here, in this emitter, and what to pass instead
+# when there is an alternative.
 #
-# Both helpers take a *label* -- a stable token that is also the join key between
-# the raise, its row in ``STATUS_TABLE`` and its test.  Grepping one label finds
-# all three.  Neither the label nor the message names a consumer, a compiler
-# pass, a file or a version: the guard says what the *value* is, and the status
-# table says what its state is.
-
-
-class DownstreamUnsupported(NotImplementedError):
-    """A derivation produced a KTIR-expressible answer a consumer refuses today."""
-
-
-class Unspecified(NotImplementedError):
-    """What to emit has never been defined, so no derivation exists yet."""
-
-
-def _downstream_unsupported(label: str, message: str) -> NoReturn:
-    """Refuse an emission that is legal KTDP but not accepted downstream today."""
-    raise DownstreamUnsupported(f"OpSpec->KTIR [{label}]: {message}")
-
-
-def _unspecified(label: str, message: str) -> NoReturn:
-    """Refuse an emission nobody has specified.  See ``STATUS_TABLE``."""
-    raise Unspecified(f"OpSpec->KTIR [{label}]: {message}")
-
-
-class Status(enum.Enum):
-    """The state of one labelled capability."""
-
-    COMPLETE = "complete"
-    DOWNSTREAM_GUARDED = "downstream-guarded"
-    UNSPECIFIED = "unspecified"
-    INFORMATIONAL = "informational"
-
-
-@dataclasses.dataclass(frozen=True)
-class StatusRow:
-    label: str
-    status: Status
-    derivation: str
-    note: str
-
-
-# THE status table.  One location: there are no "not supported yet" notes
-# scattered through the derivations, so what this emitter can and cannot do is
-# read here rather than reconstructed by grepping.
+# A message never claims a consumer is the blocker.  This repository cannot run
+# dbo-opt or the scheduler, so it cannot observe what they accept: any such claim
+# would be hearsay, and the two that used to be here were both wrong -- the
+# blockage was in this file. If a genuine downstream refusal is ever observed
+# (something emitted here that a consumer rejects), it belongs in a table of its
+# own, recorded as our policy rather than as their behaviour.
 #
-# It covers *labelled capabilities* only.  A derivation that rejects a specific
-# value of its own input -- an unsupported dtype, a tile advance that is not a
-# lattice point of its view -- raises about that value at its own site and needs
-# no row: the input is wrong (or absent), not the emitter.
-STATUS_TABLE: tuple[StatusRow, ...] = (
-    StatusRow(
-        label="static-view-extent",
-        status=Status.COMPLETE,
-        derivation="_layout",
-        note="integer buffer extents, row-major strides over the solved extent",
-    ),
-    StatusRow(
-        label="dynamic-view-extent",
-        status=Status.DOWNSTREAM_GUARDED,
-        derivation="_layout",
-        note=(
-            "a symbolic extent is legal KTDP (construct_memory_view takes dynamic "
-            "sizes and strides with matching SSA operands) and _layout derives it "
-            "under symbolic_extent='dynamic'; the default arm guards it because "
-            "no consumer lowers it yet"
-        ),
-    ),
-    StatusRow(
-        label="max-view-extent",
-        status=Status.COMPLETE,
-        derivation="_layout",
-        note=(
-            "symbolic_extent='max' bakes OpSpec.symbolic_dim_bounds' upper bound "
-            "into a static extent; opt-in because it over-allocates the view"
-        ),
-    ),
-    StatusRow(
-        label="standard-element-arrangement",
-        status=Status.COMPLETE,
-        derivation="_layout",
-        note="STANDARD and QFP8CH are plain row-major of the solved extent",
-    ),
-    StatusRow(
-        label="staggered-element-arrangement",
-        status=Status.UNSPECIFIED,
-        derivation="_layout",
-        note=(
-            "THE ONE UNSPECIFIED ITEM.  A staggered arrangement is an element "
-            "*order* within the stick, so it is a (rank, extent, strides) "
-            "selector like any other layout -- but the permutation it leaves "
-            "behind has never been written down as numbers, so there is nothing "
-            "to emit.  Not a guard in front of working code: the code is absent"
-        ),
-    ),
-    StatusRow(
-        label="loop-levels",
-        status=Status.COMPLETE,
-        derivation="_levels",
-        note=(
-            "integer loop counts, one level per entry of OpSpec.tiled_symbols; "
-            "derived, emitted and pinned by a golden, but reached only under "
-            "PlanOptions(counted_loops='walk') because generate_ktir's "
-            "default mode refuses a nest while loops are not enabled end to end"
-        ),
-    ),
-    StatusRow(
-        label="symbolic-loop-count",
-        status=Status.DOWNSTREAM_GUARDED,
-        derivation="_levels",
-        note=(
-            "a symbolic LoopSpec.count is expressible as an scf.for bound taken "
-            "from a runtime argument; guarded because no consumer accepts one yet"
-        ),
-    ),
-    StatusRow(
-        label="tile-advance-decomposition",
-        status=Status.COMPLETE,
-        derivation="_advance",
-        note=(
-            "inverts the linearized device_tile_advance_expr into per-dim steps "
-            "against the view's own strides; a coefficient that is not a lattice "
-            "point of the view, or two levels that cannot be told apart, is "
-            "reported at the raise site as the value it is"
-        ),
-    ),
-    StatusRow(
-        label="access-tile-offsets",
-        status=Status.COMPLETE,
-        derivation="_access",
-        note=(
-            "per-view-dim index expressions from the per-level steps; with no "
-            "enclosing levels every expression is the function-entry zero"
-        ),
-    ),
-    StatusRow(
-        label="coordinate-set",
-        status=Status.INFORMATIONAL,
-        derivation="_layout / _access (emitted by the builder)",
-        note=(
-            "the per-dim bounding integer set on construct_memory_view and "
-            "construct_access_tile.  No known reader, and it is in the committed "
-            "KTIR goldens, so it keeps being emitted; recorded here so that "
-            "'nothing reads it' is written down once instead of being rediscovered"
-        ),
-    ),
-)
+# Derivations that reject a specific *value* of their own input -- an unsupported
+# dtype, a tile advance that is not a lattice point of its view -- raise about
+# that value at their own site and need no label: the input is wrong, not the
+# emitter.
 
 
-def status_of(label: str) -> StatusRow:
-    """The one ``STATUS_TABLE`` row for ``label``, or raise."""
-    for row in STATUS_TABLE:
-        if row.label == label:
-            return row
-    raise KeyError(f"no STATUS_TABLE row for label {label!r}")
+class Unimplemented(NotImplementedError):
+    """A capability this emitter does not implement yet, named by its label."""
+
+
+def _unimplemented(label: str, message: str) -> NoReturn:
+    """Refuse a capability that is not implemented.  ``label`` joins raise+test."""
+    raise Unimplemented(f"OpSpec->KTIR [{label}]: {message}")
 
 
 # ---------------------------------------------------------------------------
@@ -429,9 +287,13 @@ class ComputeStep:
 
 @dataclasses.dataclass(frozen=True)
 class LoopStep:
-    """A counted loop, with the steps that go in its body."""
+    """A counted loop, with the steps that go in its body.
 
-    trip: int
+    ``trip`` is an ``int``, or the name of one of ``KernelPlan.dims`` when the
+    count is only known at run time.
+    """
+
+    trip: int | str
     body: tuple[Step, ...]
 
 
@@ -471,22 +333,14 @@ def _elem_types(arg: TensorArg) -> ElemTypes:
     return ElemTypes(storage=name, value=name)
 
 
-def _trip(loop: LoopSpec) -> int:
-    """``loop``'s trip count as a whole number of iterations.
+def _trip(loop: LoopSpec):
+    """``loop``'s trip count: an ``int``, or the symbol it runs to.
 
-    The only reader of ``LoopSpec.count``, so the symbolic-count guard is here
-    and both the level derivation and the loop step get the same answer.
-
-    Label: ``symbolic-loop-count``.
+    The only reader of ``LoopSpec.count``.  A symbolic count is returned as it
+    is; whether one can be emitted is a question about the plan's
+    ``symbolic_extent`` mode, so the plan decides it and this does the reading.
     """
-    trip = _static(loop.count)
-    if not isinstance(trip, int):
-        _downstream_unsupported(
-            "symbolic-loop-count",
-            f"loop trip count {loop.count} is symbolic; trip counts must be "
-            "integers to be emitted today",
-        )
-    return trip
+    return _static(loop.count)
 
 
 def _levels(spec: OpSpec, loops: Sequence[LoopSpec] = ()) -> list[Level]:
@@ -497,8 +351,6 @@ def _levels(spec: OpSpec, loops: Sequence[LoopSpec] = ()) -> list[Level]:
     innermost-first with one entry per enclosing level, so this is that list
     reversed and zipped against the loops -- the one place the two orderings
     meet, and therefore the place a mismatch between them is reported.
-
-    Label: ``loop-levels``.
 
     With no enclosing loops the result is ``[]`` because ``tiled_symbols`` is
     empty and there is nothing to zip -- the general answer for a nest of depth
@@ -568,8 +420,6 @@ def _advance(
     entries that are not ``int`` are dims whose stride is not solved yet and are
     skipped, which is what makes the joint inner-to-outer solve possible.
 
-    Label: ``tile-advance-decomposition``.
-
     With no levels the result is ``[]``: there is nothing to decompose.
     """
     coeffs = _advance_coeffs(arg, levels)
@@ -619,7 +469,11 @@ def _row_major(extent: Sequence[Any]) -> tuple[Any, ...]:
 def _resolve_extent(extent: Any, mode: str, bounds: dict | None) -> Any:
     """One extent under the requested ``symbolic_extent`` mode.
 
-    Labels: ``static-view-extent``, ``dynamic-view-extent``, ``max-view-extent``.
+    ``'static'`` demands an integer, ``'dynamic'`` keeps the symbol for the
+    builder to spell as a func-argument-sized memref dim, and ``'max'`` bakes the
+    upper bound from ``OpSpec.symbolic_dim_bounds``.
+
+    Label: ``static-view-extent``.
     """
     if isinstance(extent, int):
         return extent
@@ -642,16 +496,18 @@ def _resolve_extent(extent: Any, mode: str, bounds: dict | None) -> Any:
             )
         return resolved
     if mode == "dynamic":
-        # The dynamic form itself: the extent stays symbolic in the record and
-        # the builder spells it as a dynamic memref dim with an SSA size operand.
+        # The extent stays symbolic here; the builder spells it as a dynamic
+        # memref dim whose size is a func argument.  This is the same shape the
+        # Triton frontend produces for a non-constant descriptor dimension, so
+        # the KTDP lowering already accepts it.
         return extent
     if mode != "static":
         raise ValueError(f"OpSpec->KTIR: unknown symbolic_extent mode {mode!r}")
-    _downstream_unsupported(
-        "dynamic-view-extent",
-        f"view extent {extent} is symbolic; pass symbolic_extent='dynamic' to "
-        "emit the dynamic view (which nothing lowers today) or "
-        "symbolic_extent='max' to bake its upper bound",
+    _unimplemented(
+        "static-view-extent",
+        f"view extent {extent} is symbolic and symbolic_extent='static' asks for "
+        "a whole number of elements; pass symbolic_extent='dynamic' to take the "
+        "size as a func argument, or 'max' to bake its upper bound",
     )
 
 
@@ -664,12 +520,12 @@ def _arrangement_layout(
     ``device_dtype`` covers the data type), so it is a layout fact: a rank and
     stride selector, of the shape the SDSC path already uses for a stick split.
 
-    Labels: ``standard-element-arrangement``, ``staggered-element-arrangement``.
+    Label: ``staggered-element-arrangement``.
     """
     if arrangement in (None, ElementArrangement.STANDARD, ElementArrangement.QFP8CH):
         return extent, strides
     if arrangement in STAGGERED_EAS:
-        _unspecified(
+        _unimplemented(
             "staggered-element-arrangement",
             f"{arrangement!r} records a non-sequential element order inside the "
             "stick; the permutation has never been written down as numbers, so "
@@ -779,8 +635,6 @@ def _access(
     the per-dim index coefficient is level ``l``'s step along dim ``i``, which the
     builder multiplies by that level's induction variable at emit time.
 
-    Label: ``access-tile-offsets``.
-
     With no levels every row is empty, so every index expression is the empty
     sum -- zero -- which is why an untiled access sits at the view's origin.
     """
@@ -885,6 +739,11 @@ class PlanOptions:
     the builders behind the refusal are complete; ``'walk'`` is what an emission
     of a nest is planned with while loops are not enabled end to end.
 
+    ``symbolic_extent`` says what to do with a device size that is a sympy
+    expression: ``'static'`` refuses it, ``'dynamic'`` takes it as a func argument
+    and emits a dynamic memref dim, ``'max'`` bakes the upper bound from
+    ``OpSpec.symbolic_dim_bounds`` (which is what the SDSC path does).
+
     ``bake_addresses`` emits each base as an ``arith.constant`` in elements
     instead of a func argument, because ``ktdp.load`` requires a static memref
     offset, which a constant base gives only when the consumer is a ``linalg``
@@ -894,16 +753,23 @@ class PlanOptions:
     """
 
     COUNTED_LOOPS: ClassVar[tuple[str, ...]] = ("reject", "walk")
+    SYMBOLIC_EXTENTS: ClassVar[tuple[str, ...]] = ("static", "dynamic", "max")
 
     sencores: int | None = None
     bake_addresses: bool = False
     counted_loops: str = "reject"
+    symbolic_extent: str = "static"
 
     def __post_init__(self) -> None:
         if self.counted_loops not in self.COUNTED_LOOPS:
             raise ValueError(
                 f"OpSpec->KTIR: unknown counted_loops mode {self.counted_loops!r}; "
                 f"expected one of {self.COUNTED_LOOPS}"
+            )
+        if self.symbolic_extent not in self.SYMBOLIC_EXTENTS:
+            raise ValueError(
+                f"OpSpec->KTIR: unknown symbolic_extent mode "
+                f"{self.symbolic_extent!r}; expected one of {self.SYMBOLIC_EXTENTS}"
             )
 
     @property
@@ -938,6 +804,11 @@ class KernelPlan:
 
     ``grid`` is resolved here rather than at emit time: the builder emits the grid
     it is given and does not know what a core is.
+
+    ``dims`` is the symbolic device dimensions this kernel needs passed in, in
+    the order they become func arguments.  A symbol reaches the emitted IR twice
+    -- as a dynamic memref dim and as the bound of the loop that walks it -- and
+    both come from the one argument named here.
     """
 
     def __init__(self, options: PlanOptions | None = None) -> None:
@@ -945,6 +816,31 @@ class KernelPlan:
         self.grid = _grid(self.options.cores)
         self.buffers: dict[str, Buffer] = {}
         self.steps: tuple[Step, ...] = ()
+        self._dims: dict[str, None] = {}  # ordered set of symbol names
+
+    @property
+    def dims(self) -> tuple[str, ...]:
+        """The symbolic dimensions this kernel takes as arguments, in order."""
+        return tuple(self._dims)
+
+    def _needs_dim(self, value) -> str:
+        """Register ``value`` as a dimension argument and return its name.
+
+        Only a bare symbol can be an argument: a compound expression would have
+        to be computed from the arguments, and this emitter does not build that
+        arithmetic.
+        """
+        symbols = getattr(value, "free_symbols", ())
+        if len(symbols) != 1 or str(value) != str(next(iter(symbols))):
+            _unimplemented(
+                "computed-dimension",
+                f"{value} is an expression over {sorted(map(str, symbols))} rather "
+                "than a single symbol; emitting it would mean computing it from "
+                "the kernel's dimension arguments, which is not implemented",
+            )
+        name = str(value)
+        self._dims.setdefault(name, None)
+        return name
 
     @property
     def parameters(self) -> list[Buffer]:
@@ -982,11 +878,21 @@ class KernelPlan:
                     raise NotImplementedError(
                         "OpSpec->KTIR: counted loops (LoopSpec) are not supported yet"
                     )
+                trip = _trip(entry)
+                if not isinstance(trip, int):
+                    if self.options.symbolic_extent != "dynamic":
+                        _unimplemented(
+                            "symbolic-loop-count",
+                            f"loop trip count {entry.count} is symbolic and "
+                            f"symbolic_extent={self.options.symbolic_extent!r} asks "
+                            "for a whole number of iterations; pass "
+                            "symbolic_extent='dynamic' to take the count as a func "
+                            "argument",
+                        )
+                    # The bound is the same argument the view's dynamic dim uses.
+                    trip = self._needs_dim(trip)
                 steps.append(
-                    LoopStep(
-                        trip=_trip(entry),
-                        body=self._steps(entry.body, [*loops, entry]),
-                    )
+                    LoopStep(trip=trip, body=self._steps(entry.body, [*loops, entry]))
                 )
                 continue
             if not isinstance(entry, OpSpec):
@@ -1036,7 +942,10 @@ class KernelPlan:
                     "OpSpec->KTIR: broadcast / reshape operands not supported yet"
                 )
         levels = _levels(spec, loops)
-        accesses = {_buf_id(arg): self._access_of(arg, levels) for arg in spec.args}
+        accesses = {
+            _buf_id(arg): self._access_of(arg, levels, spec.symbolic_dim_bounds)
+            for arg in spec.args
+        }
         return ComputeStep(
             op=spec.op,
             family=Family.of(spec),
@@ -1048,7 +957,9 @@ class KernelPlan:
             store=not is_internal(out),
         )
 
-    def _access_of(self, arg: TensorArg, levels: Sequence[Level]) -> Access:
+    def _access_of(
+        self, arg: TensorArg, levels: Sequence[Level], spec_bounds: dict
+    ) -> Access:
         """``arg``'s access at this depth, registering its buffer on the way.
 
         The buffer is registered first and handed to the access, so the record
@@ -1056,7 +967,26 @@ class KernelPlan:
         first record seen for a ``buf_id`` wins, which is the one every later
         access to that buffer points at.
         """
-        layout, q = _solve_layout(arg, levels)
+        layout, q = _solve_layout(
+            arg,
+            levels,
+            symbolic_extent=self.options.symbolic_extent,
+            bounds=spec_bounds,
+        )
+        # A symbolic extent becomes a dimension argument; a symbolic stride would
+        # have to be computed from those arguments, which is not implemented.
+        for extent in layout.extent:
+            if not isinstance(extent, int):
+                self._needs_dim(extent)
+        for stride in layout.strides:
+            if not isinstance(stride, int):
+                _unimplemented(
+                    "computed-view-stride",
+                    f"view stride {stride} of {arg.name!r} depends on a symbolic "
+                    "extent, so it would have to be computed from the kernel's "
+                    "dimension arguments; only a symbolic outermost extent, whose "
+                    "strides stay integers, is implemented",
+                )
         elems = _elem_types(arg)
         buffer = None
         if not is_internal(arg):
@@ -1248,6 +1178,7 @@ class KtirBuilder:
         self.index_t = ir.IndexType.get()
         self.block_args: list = []
         self.views: dict[str, Any] = {}
+        self.dims: dict[str, Any] = {}  # symbol name -> its func argument
         self.c0 = None
         self._text: str | None = None
 
@@ -1309,7 +1240,12 @@ class KtirBuilder:
         """
         baked = self.plan.options.bake_addresses
         buffers = self.plan.parameters
-        params = [] if baked else [self.index_t] * len(buffers)
+        dims = self.plan.dims
+        # Base addresses first, then one size per symbolic dimension: the order
+        # the plan lists them in is the order a caller passes them.
+        params = ([] if baked else [self.index_t] * len(buffers)) + [
+            self.index_t
+        ] * len(dims)
         try:
             module = ir.Module.create()
             with ir.InsertionPoint(module.body):
@@ -1324,6 +1260,13 @@ class KtirBuilder:
                 block = fn.add_entry_block()
                 self.block_args = list(block.arguments)
                 with ir.InsertionPoint(block):
+                    self.dims = dict(
+                        zip(
+                            dims,
+                            self.block_args[len(params) - len(dims) :],
+                            strict=True,
+                        )
+                    )
                     self.c0 = self.icst_index(0)
                     for position, buffer in enumerate(buffers):
                         base = (
@@ -1346,8 +1289,11 @@ class KtirBuilder:
         return self._text
 
     @contextlib.contextmanager
-    def counted_loop(self, trip) -> Iterator[Any]:
-        """``scf.for`` from 0 to ``trip`` step 1, yielding its induction variable.
+    def counted_loop(self, trip: int | str) -> Iterator[Any]:
+        """``scf.for`` to ``trip`` step 1, yielding its induction variable.
+
+        ``trip`` is an iteration count, or the name of a dimension argument to
+        take the bound from.
 
         Everything emitted while the context is open goes in the loop body, and
         the terminator is closed on the way out: ``scf.for`` regions are not
@@ -1355,7 +1301,7 @@ class KtirBuilder:
         because every value the body produces is stored to memory inside it.
         """
         lo, step = self.icst_index(0), self.icst_index(1)
-        hi = self.icst_index(int(trip))
+        hi = self.dims[trip] if isinstance(trip, str) else self.icst_index(int(trip))
         for_op = scf.ForOp(lo, hi, step)
         with ir.InsertionPoint(for_op.body):
             yield for_op.induction_variable
@@ -1403,10 +1349,14 @@ class KtirBuilder:
 
         Extent and strides come from ``buffer.layout``, the record ``_layout``
         derived, so the view says what the plan says.  Both are whole element
-        counts: a symbolic extent reaches no view, because the extent mode that
-        would let one through is guarded in ``_resolve_extent``.
+        counts, except for a dimension the plan took as an argument, which is a
+        ``?`` in the memref type with that argument as its size operand.
         """
-        sizes = [int(e) for e in buffer.layout.extent]
+        dynamic = ir.ShapedType.get_dynamic_size()
+        sizes = [e if isinstance(e, int) else dynamic for e in buffer.layout.extent]
+        dyn_sizes = [
+            self.dims[str(e)] for e in buffer.layout.extent if not isinstance(e, int)
+        ]
         strides = [int(s) for s in buffer.layout.strides]
         memref_t = ir.MemRefType.get(sizes, self.named_type(buffer.elems.storage))
         # No Python builder is exposed for the ``spyre_memory_space`` enum
@@ -1417,9 +1367,9 @@ class KtirBuilder:
             ktdp.construct_memory_view(
                 result=memref_t,
                 offset=base,
-                # SSA operands for dynamic extents, of which there are none:
-                # every size and stride is a literal, passed as static_* below.
-                sizes=[],
+                # One SSA operand per dynamic size, in dim order; strides are
+                # always literals, so that operand list stays empty.
+                sizes=dyn_sizes,
                 strides=[],
                 static_sizes=sizes,
                 static_strides=strides,
@@ -1536,28 +1486,38 @@ class KtirBuilder:
     # -- attributes --------------------------------------------------------
 
     @staticmethod
-    def coord_set(sizes: list[int]):
+    def coord_set(sizes: Sequence[int]):
         """Per-dim bounding integer set ``(0 <= d_i <= size_i - 1)`` as an attribute.
 
         Built with ``ir.IntegerSet`` from ``AffineExpr`` constraints (no textual
         round-trip): for each dim ``i`` two inequalities ``d_i >= 0`` and
         ``-d_i + (size_i - 1) >= 0``, matching the ``affine_set`` MLIR prints.
+
+        A dynamic size has no constant to bound it, so its upper bound is an
+        integer-set *symbol* instead -- the same spelling the KTDP lowering builds
+        for a non-constant descriptor dimension.
         """
+        dynamic = ir.ShapedType.get_dynamic_size()
         exprs = []
         eq_flags: list[bool] = []
-        for i, s in enumerate(sizes):
+        symbols = 0
+        for i, size in enumerate(sizes):
             dim = ir.AffineExpr.get_dim(i)
             # d_i >= 0
             exprs.append(dim)
             eq_flags.append(False)
             # -d_i + (size_i - 1) >= 0
+            if size == dynamic:
+                bound = ir.AffineExpr.get_add(
+                    ir.AffineExpr.get_symbol(symbols), ir.AffineExpr.get_constant(-1)
+                )
+                symbols += 1
+            else:
+                bound = ir.AffineExpr.get_constant(int(size) - 1)
             neg_dim = ir.AffineExpr.get_mul(ir.AffineExpr.get_constant(-1), dim)
-            upper = ir.AffineExpr.get_add(
-                neg_dim, ir.AffineExpr.get_constant(int(s) - 1)
-            )
-            exprs.append(upper)
+            exprs.append(ir.AffineExpr.get_add(neg_dim, bound))
             eq_flags.append(False)
-        integer_set = ir.IntegerSet.get(len(sizes), 0, exprs, eq_flags)
+        integer_set = ir.IntegerSet.get(len(sizes), symbols, exprs, eq_flags)
         return ir.IntegerSetAttr.get(integer_set)
 
 

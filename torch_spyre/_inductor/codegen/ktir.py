@@ -67,6 +67,7 @@ from torch_spyre._inductor.codegen.opspec_utils import (
     per_core_extent,
     reduced_axes,
     row_major_strides,
+    symbolic_dim_max,
 )
 from torch_spyre._inductor.constants import STAGGERED_EAS
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
@@ -327,10 +328,11 @@ class ComputeStep:
 class LoopStep:
     """A counted loop, with the steps that go in its body.
 
-    ``trip`` is an iteration count.
+    ``trip`` is an ``int``, or the name of one of ``KernelPlan.dims`` when the
+    count is only known at run time.
     """
 
-    trip: int
+    trip: int | str
     body: tuple[Step, ...]
 
 
@@ -465,20 +467,6 @@ def _advance(
     return [tuple(row) for row in q]
 
 
-def _static_extent(arg: TensorArg, extent: Any) -> int:
-    """``extent`` as a whole number of elements, or a refusal.
-
-    A symbolic device size would have to reach the kernel as an argument (and
-    size a dynamic memref dim), which is not implemented.
-    """
-    if isinstance(extent, int):
-        return extent
-    raise NotImplementedError(
-        f"OpSpec->KTIR: view extent {extent} of {arg.name!r} is symbolic; a "
-        "symbolic device size is not supported yet"
-    )
-
-
 def _grown_extent(tile: Any, levels: Sequence[Level], steps: Sequence[int]) -> Any:
     """One dim's buffer extent: the tile extent plus what the levels walk over.
 
@@ -491,6 +479,37 @@ def _grown_extent(tile: Any, levels: Sequence[Level], steps: Sequence[int]) -> A
         if step:
             extent = extent + step * (level.trip - 1)
     return _static(extent)
+
+
+def _resolve_extent(extent: Any, mode: str, bounds: dict | None) -> Any:
+    """One extent under the requested ``symbolic_extent`` mode.
+
+    ``'static'`` demands an integer, ``'dynamic'`` keeps the symbol for the
+    builder to spell as a func-argument-sized memref dim, and ``'max'`` bakes the
+    upper bound from ``OpSpec.symbolic_dim_bounds``.
+
+    Label: ``static-view-extent``.
+    """
+    if isinstance(extent, int):
+        return extent
+    if mode == "max":
+        # The same reading of symbolic_dim_bounds the SDSC path uses, so 'max' is
+        # parity with the bundle emitter rather than a second convention.
+        return symbolic_dim_max(extent, bounds or {})
+    if mode == "dynamic":
+        # The extent stays symbolic here; the builder spells it as a dynamic
+        # memref dim whose size is a func argument.  This is the same shape the
+        # Triton frontend produces for a non-constant descriptor dimension, so
+        # the KTDP lowering already accepts it.
+        return extent
+    if mode != "static":
+        raise ValueError(f"OpSpec->KTIR: unknown symbolic_extent mode {mode!r}")
+    _unimplemented(
+        "static-view-extent",
+        f"view extent {extent} is symbolic and symbolic_extent='static' asks for "
+        "a whole number of elements; pass symbolic_extent='dynamic' to take the "
+        "size as a func argument, or 'max' to bake its upper bound",
+    )
 
 
 def _arrangement_layout(
@@ -522,19 +541,28 @@ def _layout(
     arg: TensorArg,
     levels: Sequence[Level],
     q: Sequence[Sequence[int]],
+    *,
+    symbolic_extent: str = "static",
+    bounds: dict | None = None,
 ) -> Layout:
     """``arg``'s buffer extent and strides, given the per-level steps ``q``.
 
     The buffer extent expands out of the tile extent by what the levels walk
     over (``_grown_extent``); strides are row-major of that extent.  The only
-    place an extent becomes a memref dim, so the element arrangement is decided
-    here -- and so is the demand that every extent be a whole number of elements,
-    because a memref dim is either that or a dynamic size this emitter does not
-    take yet.
+    place an extent becomes a memref dim, so the extent modes and the element
+    arrangement are decided here.
+
+    ``bounds`` is ``OpSpec.symbolic_dim_bounds`` (needed only by
+    ``symbolic_extent='max'``); it is a parameter rather than a field of ``arg``
+    because it lives on the OpSpec.
     """
     tile = [_static(s) for s in arg.device_size]
     extent = tuple(
-        _static_extent(arg, _grown_extent(tile[i], levels, [row[i] for row in q]))
+        _resolve_extent(
+            _grown_extent(tile[i], levels, [row[i] for row in q]),
+            symbolic_extent,
+            bounds,
+        )
         for i in range(len(tile))
     )
     extent, strides = _arrangement_layout(
@@ -548,6 +576,9 @@ def _layout(
 def _solve_layout(
     arg: TensorArg,
     levels: Sequence[Level],
+    *,
+    symbolic_extent: str = "static",
+    bounds: dict | None = None,
 ) -> tuple[Layout, list[tuple[int, ...]]]:
     """``(Layout, q)`` for ``arg``: extents and per-level steps, solved together.
 
@@ -588,7 +619,10 @@ def _solve_layout(
                 f"{level_index} of {arg.name!r}) is not a whole number of steps "
                 f"along any dim of a view with strides {tuple(strides)}"
             )
-    return _layout(arg, levels, q), q
+    return (
+        _layout(arg, levels, q, symbolic_extent=symbolic_extent, bounds=bounds),
+        q,
+    )
 
 
 def _divide(
@@ -749,10 +783,15 @@ def _buffer(
 class PlanOptions:
     """Everything the caller chooses about one emission, in one value.
 
-    One choice, and it is not a capability switch: what the kernel *does* comes
-    from the OpSpec contract (its ``LoopSpec``s are its loops), so it is not the
-    caller's to pick.  What is left is how to spell the one thing the contract
-    does not decide.
+    Two choices, and neither is a capability switch: what the kernel *does* comes
+    from the OpSpec contract (the grid from its work divisions, the loops from its
+    ``LoopSpec``s), so it is not the caller's to pick.  What is left is how to
+    spell two things the contract does not decide.
+
+    ``symbolic_extent`` says what to do with a device size that is a sympy
+    expression: ``'static'`` refuses it, ``'dynamic'`` takes it as a func argument
+    and emits a dynamic memref dim, ``'max'`` bakes the upper bound from
+    ``OpSpec.symbolic_dim_bounds`` (which is what the SDSC path does).
 
     ``bake_addresses`` emits each base as an ``arith.constant`` in elements
     instead of a func argument, because ``ktdp.load`` requires a static memref
@@ -762,7 +801,17 @@ class PlanOptions:
     ``config.bundle_symbolic_args``.
     """
 
+    SYMBOLIC_EXTENTS: ClassVar[tuple[str, ...]] = ("static", "dynamic", "max")
+
     bake_addresses: bool = False
+    symbolic_extent: str = "static"
+
+    def __post_init__(self) -> None:
+        if self.symbolic_extent not in self.SYMBOLIC_EXTENTS:
+            raise ValueError(
+                f"OpSpec->KTIR: unknown symbolic_extent mode "
+                f"{self.symbolic_extent!r}; expected one of {self.SYMBOLIC_EXTENTS}"
+            )
 
 
 def _divisions(specs: Sequence[Any]) -> tuple[list[Any], tuple[Division, ...]]:
@@ -820,6 +869,10 @@ class KernelPlan:
     ``grid`` is resolved here rather than at emit time: the builder emits the grid
     it is given and does not know what a core is.
 
+    ``dims`` is the symbolic device dimensions this kernel needs passed in, in
+    the order they become func arguments.  A symbol reaches the emitted IR twice
+    -- as a dynamic memref dim and as the bound of the loop that walks it -- and
+    both come from the one argument named here.
     """
 
     def __init__(self, options: PlanOptions | None = None) -> None:
@@ -830,6 +883,31 @@ class KernelPlan:
         self._divisors: dict = {}
         self.buffers: dict[str, Buffer] = {}
         self.steps: tuple[Step, ...] = ()
+        self._dims: dict[str, None] = {}  # ordered set of symbol names
+
+    @property
+    def dims(self) -> tuple[str, ...]:
+        """The symbolic dimensions this kernel takes as arguments, in order."""
+        return tuple(self._dims)
+
+    def _needs_dim(self, value) -> str:
+        """Register ``value`` as a dimension argument and return its name.
+
+        Only a bare symbol can be an argument: a compound expression would have
+        to be computed from the arguments, and this emitter does not build that
+        arithmetic.
+        """
+        symbols = getattr(value, "free_symbols", ())
+        if len(symbols) != 1 or str(value) != str(next(iter(symbols))):
+            _unimplemented(
+                "computed-dimension",
+                f"{value} is an expression over {sorted(map(str, symbols))} rather "
+                "than a single symbol; emitting it would mean computing it from "
+                "the kernel's dimension arguments, which is not implemented",
+            )
+        name = str(value)
+        self._dims.setdefault(name, None)
+        return name
 
     @property
     def parameters(self) -> list[Buffer]:
@@ -919,12 +997,17 @@ class KernelPlan:
             if isinstance(entry, LoopSpec):
                 trip = _trip(entry)
                 if not isinstance(trip, int):
-                    # A symbolic count would have to reach the kernel as an
-                    # argument, the same one a dynamic view dim needs.
-                    raise NotImplementedError(
-                        f"OpSpec->KTIR: loop trip count {entry.count} is symbolic; "
-                        "a symbolic trip count is not supported yet"
-                    )
+                    if self.options.symbolic_extent != "dynamic":
+                        _unimplemented(
+                            "symbolic-loop-count",
+                            f"loop trip count {entry.count} is symbolic and "
+                            f"symbolic_extent={self.options.symbolic_extent!r} asks "
+                            "for a whole number of iterations; pass "
+                            "symbolic_extent='dynamic' to take the count as a func "
+                            "argument",
+                        )
+                    # The bound is the same argument the view's dynamic dim uses.
+                    trip = self._needs_dim(trip)
                 steps.append(
                     LoopStep(trip=trip, body=self._steps(entry.body, [*loops, entry]))
                 )
@@ -1008,7 +1091,10 @@ class KernelPlan:
                         "OpSpec->KTIR: broadcast / reshape operands not supported yet"
                     )
         levels = _levels(spec, loops)
-        accesses = {buf_id(arg): self._access_of(arg, levels) for arg in args}
+        accesses = {
+            buf_id(arg): self._access_of(arg, levels, spec.symbolic_dim_bounds)
+            for arg in args
+        }
         # Every division must move this op's output: cores divide work by writing
         # different elements, so a division no output axis follows is cores
         # duplicating each other rather than sharing.  An *input* may legitimately
@@ -1036,7 +1122,9 @@ class KernelPlan:
             store=not is_internal(out),
         )
 
-    def _access_of(self, arg: TensorArg, levels: Sequence[Level]) -> Access:
+    def _access_of(
+        self, arg: TensorArg, levels: Sequence[Level], spec_bounds: dict
+    ) -> Access:
         """``arg``'s access at this depth, registering its buffer on the way.
 
         The buffer is registered first and handed to the access, so the record
@@ -1044,7 +1132,26 @@ class KernelPlan:
         first record seen for a ``buf_id`` wins, which is the one every later
         access to that buffer points at.
         """
-        layout, q = _solve_layout(arg, levels)
+        layout, q = _solve_layout(
+            arg,
+            levels,
+            symbolic_extent=self.options.symbolic_extent,
+            bounds=spec_bounds,
+        )
+        # A symbolic extent becomes a dimension argument; a symbolic stride would
+        # have to be computed from those arguments, which is not implemented.
+        for extent in layout.extent:
+            if not isinstance(extent, int):
+                self._needs_dim(extent)
+        for stride in layout.strides:
+            if not isinstance(stride, int):
+                _unimplemented(
+                    "computed-view-stride",
+                    f"view stride {stride} of {arg.name!r} depends on a symbolic "
+                    "extent, so it would have to be computed from the kernel's "
+                    "dimension arguments; only a symbolic outermost extent, whose "
+                    "strides stay integers, is implemented",
+                )
         elems = ElemTypes.of(arg.device_dtype)
         buffer = None
         if not is_internal(arg):
@@ -1246,6 +1353,7 @@ class KtirBuilder:
         self.index_t = ir.IndexType.get()
         self.block_args: list = []
         self.views: dict[str, Any] = {}
+        self.dims: dict[str, Any] = {}  # symbol name -> its func argument
         self.c0 = None
         self._text: str | None = None
 
@@ -1307,8 +1415,12 @@ class KtirBuilder:
         """
         baked = self.plan.options.bake_addresses
         buffers = self.plan.parameters
-        # One base address per buffer, in the plan's order, or none at all.
-        params = [] if baked else [self.index_t] * len(buffers)
+        dims = self.plan.dims
+        # Base addresses first, then one size per symbolic dimension: the order
+        # the plan lists them in is the order a caller passes them.
+        params = ([] if baked else [self.index_t] * len(buffers)) + [
+            self.index_t
+        ] * len(dims)
         try:
             module = ir.Module.create()
             with ir.InsertionPoint(module.body):
@@ -1323,6 +1435,13 @@ class KtirBuilder:
                 block = fn.add_entry_block()
                 self.block_args = list(block.arguments)
                 with ir.InsertionPoint(block):
+                    self.dims = dict(
+                        zip(
+                            dims,
+                            self.block_args[len(params) - len(dims) :],
+                            strict=True,
+                        )
+                    )
                     self.c0 = self.icst_index(0)
                     self.env.bind_ivs(self.core_portions())
                     for position, buffer in enumerate(buffers):
@@ -1372,8 +1491,11 @@ class KtirBuilder:
         return self._text
 
     @contextlib.contextmanager
-    def counted_loop(self, trip: int) -> Iterator[Any]:
+    def counted_loop(self, trip: int | str) -> Iterator[Any]:
         """``scf.for`` to ``trip`` step 1, yielding its induction variable.
+
+        ``trip`` is an iteration count, or the name of a dimension argument to
+        take the bound from.
 
         Everything emitted while the context is open goes in the loop body, and
         the terminator is closed on the way out: ``scf.for`` regions are not
@@ -1381,7 +1503,7 @@ class KtirBuilder:
         because every value the body produces is stored to memory inside it.
         """
         lo, step = self.icst_index(0), self.icst_index(1)
-        hi = self.icst_index(int(trip))
+        hi = self.dims[trip] if isinstance(trip, str) else self.icst_index(int(trip))
         for_op = scf.ForOp(lo, hi, step)
         with ir.InsertionPoint(for_op.body):
             yield for_op.induction_variable
@@ -1435,9 +1557,15 @@ class KtirBuilder:
         """``ktdp.construct_memory_view`` for one buffer, at base address ``base``.
 
         Extent and strides come from ``buffer.layout``, the record ``_layout``
-        derived, so the view says what the plan says, in whole element counts.
+        derived, so the view says what the plan says.  Both are whole element
+        counts, except for a dimension the plan took as an argument, which is a
+        ``?`` in the memref type with that argument as its size operand.
         """
-        sizes = [int(e) for e in buffer.layout.extent]
+        dynamic = ir.ShapedType.get_dynamic_size()
+        sizes = [e if isinstance(e, int) else dynamic for e in buffer.layout.extent]
+        dyn_sizes = [
+            self.dims[str(e)] for e in buffer.layout.extent if not isinstance(e, int)
+        ]
         strides = [int(s) for s in buffer.layout.strides]
         memref_t = ir.MemRefType.get(sizes, self.named_type(buffer.elems.storage))
         # No Python builder is exposed for the ``spyre_memory_space`` enum
@@ -1448,8 +1576,9 @@ class KtirBuilder:
             ktdp.construct_memory_view(
                 result=memref_t,
                 offset=base,
-                # Every size is a literal, so both operand lists stay empty.
-                sizes=[],
+                # One SSA operand per dynamic size, in dim order; strides are
+                # always literals, so that operand list stays empty.
+                sizes=dyn_sizes,
                 strides=[],
                 static_sizes=sizes,
                 static_strides=strides,
@@ -1610,21 +1739,31 @@ class KtirBuilder:
         round-trip): for each dim ``i`` two inequalities ``d_i >= 0`` and
         ``-d_i + (size_i - 1) >= 0``, matching the ``affine_set`` MLIR prints.
 
-        Every size is a constant here, so every bound is one too.
+        A dynamic size has no constant to bound it, so its upper bound is an
+        integer-set *symbol* instead -- the same spelling the KTDP lowering builds
+        for a non-constant descriptor dimension.
         """
+        dynamic = ir.ShapedType.get_dynamic_size()
         exprs = []
         eq_flags: list[bool] = []
+        symbols = 0
         for i, size in enumerate(sizes):
             dim = ir.AffineExpr.get_dim(i)
             # d_i >= 0
             exprs.append(dim)
             eq_flags.append(False)
             # -d_i + (size_i - 1) >= 0
-            bound = ir.AffineExpr.get_constant(int(size) - 1)
+            if size == dynamic:
+                bound = ir.AffineExpr.get_add(
+                    ir.AffineExpr.get_symbol(symbols), ir.AffineExpr.get_constant(-1)
+                )
+                symbols += 1
+            else:
+                bound = ir.AffineExpr.get_constant(int(size) - 1)
             neg_dim = ir.AffineExpr.get_mul(ir.AffineExpr.get_constant(-1), dim)
             exprs.append(ir.AffineExpr.get_add(neg_dim, bound))
             eq_flags.append(False)
-        integer_set = ir.IntegerSet.get(len(sizes), 0, exprs, eq_flags)
+        integer_set = ir.IntegerSet.get(len(sizes), symbols, exprs, eq_flags)
         return ir.IntegerSetAttr.get(integer_set)
 
 

@@ -303,10 +303,6 @@ class TestValidateRejections(unittest.TestCase):
         specs[0].args[0].arg_index = -1
         self._rejects(specs, "is not a kernel argument")
 
-    def test_symbolic_trip_count_rejected(self):
-        nest = LoopSpec(count=sympy.Symbol("s0"), body=[make_op_spec()])
-        self._rejects([nest], "trip count s0 is symbolic")
-
     def test_unsupported_dtype_rejected(self):
         self._rejects([make_op_spec(dtype=DataFormats.SENINT8)], "unsupported device")
         self.assertNotIn(DataFormats.SENINT8, ktir.ElemTypes.NAMES)
@@ -364,22 +360,28 @@ class TestRejectionsThroughGenerateKtir(unittest.TestCase):
 
 
 class TestPlanOptions(unittest.TestCase):
-    """The caller's one choice, and it is about spelling, not capability.
+    """The caller's two choices -- both about spelling, neither a capability.
 
     What the kernel does comes from the contract, so there is nothing here to
-    turn a feature on with: no core count and no loop mode (a ``LoopSpec`` is a
-    loop).
+    turn a feature on with: no core count (the iteration space states the grid)
+    and no loop mode (a ``LoopSpec`` is a loop).
     """
 
     def test_defaults_are_the_canonical_form(self):
         options = ktir.PlanOptions()
         self.assertFalse(options.bake_addresses)  # symbolic addresses
+        self.assertEqual(options.symbolic_extent, "static")
 
     def test_options_are_only_about_spelling(self):
         self.assertEqual(
             sorted(f.name for f in dataclasses.fields(ktir.PlanOptions)),
-            ["bake_addresses"],
+            ["bake_addresses", "symbolic_extent"],
         )
+
+    def test_unknown_symbolic_extent_mode_rejected(self):
+        with self.assertRaises(ValueError) as ctx:
+            ktir.PlanOptions(symbolic_extent="guess")
+        self.assertIn("symbolic_extent", str(ctx.exception))
 
 
 class TestWorkDivision(unittest.TestCase):
@@ -627,7 +629,7 @@ class TestLoopDerivations(unittest.TestCase):
 
     def test_a_symbolic_trip_count_is_read_not_refused(self):
         """``_trip`` reads the count; whether one can be emitted is the plan's
-        call, so this only checks the reading."""
+        call, because only the plan knows the ``symbolic_extent`` mode."""
         s0 = sympy.Symbol("s0")
         self.assertEqual(ktir._trip(LoopSpec(count=4, body=[])), 4)
         self.assertEqual(ktir._trip(LoopSpec(count=s0, body=[])), s0)
@@ -697,6 +699,138 @@ class TestLoopDerivations(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+class TestSymbolicExtentModes(unittest.TestCase):
+    """The three answers to "this device size is a sympy expression".
+
+    ``symbolic_extent`` picks one: refuse it, take it as a func argument, or bake
+    its upper bound.  The last is what the SDSC path does (``_resolve_sdsc_size``
+    reads the same ``symbolic_dim_bounds`` max), so 'max' is parity with the
+    bundle emitter and 'dynamic' is the form the KTDP lowering builds for a
+    non-constant descriptor dimension.
+    """
+
+    @staticmethod
+    def _symbolic_arg():
+        # A symbolic outer-stick count, as a dynamic batch dim produces.
+        return make_op_spec(size=[sympy.Symbol("s0"), 512, 64]).args[0]
+
+    def test_static_mode_refuses_a_symbolic_extent(self):
+        with self.assertRaises(ktir.Unimplemented) as ctx:
+            ktir._layout(self._symbolic_arg(), [], [])
+        self.assertIn("static-view-extent", str(ctx.exception))
+        # The message points at the two modes that can express it.
+        self.assertIn("symbolic_extent='dynamic'", str(ctx.exception))
+
+    def test_dynamic_mode_keeps_the_symbol(self):
+        s0 = sympy.Symbol("s0")
+        layout = ktir._layout(self._symbolic_arg(), [], [], symbolic_extent="dynamic")
+        # The extent stays symbolic and the strides are row-major over it: the
+        # trailing two dims are still integers, so the outer stride is a product
+        # of integers and no stride arithmetic is needed to emit this.
+        self.assertEqual(layout.extent, (s0, 512, 64))
+        self.assertEqual(layout.strides, (32768, 64, 1))
+
+    def test_max_mode_bakes_the_bound(self):
+        layout = ktir._layout(
+            self._symbolic_arg(),
+            [],
+            [],
+            symbolic_extent="max",
+            bounds={"s0": (16, 1)},  # (max, granularity), as SDSC reads it
+        )
+        self.assertEqual(layout.extent, (16, 512, 64))
+        self.assertEqual(layout.strides, (32768, 64, 1))
+
+    def test_max_mode_needs_a_bound(self):
+        with self.assertRaises(NotImplementedError) as ctx:
+            ktir._layout(self._symbolic_arg(), [], [], symbolic_extent="max", bounds={})
+        self.assertIn("no bound for 's0'", str(ctx.exception))
+
+    def test_unknown_mode_rejected(self):
+        with self.assertRaises(ValueError):
+            ktir.PlanOptions(symbolic_extent="guess")
+
+
+class TestDimensionArguments(unittest.TestCase):
+    """A symbolic dimension becomes a func argument the plan names.
+
+    One argument does both jobs: it sizes the dynamic memref dim and bounds the
+    loop that walks it, which is why the two used to look like separate
+    unsupported capabilities.
+    """
+
+    @staticmethod
+    def _dynamic_nest():
+        """``a + b`` over a run-time number of sticks, one stick per iteration."""
+        s0, n = sympy.symbols("s0 n")
+        # The trip count is the symbol itself: one level, walking s0 sticks.
+        nest, _spec, _loops = make_nested_op_spec(
+            levels=[(n, s0)],
+            size=[1, 64],
+            advances=[64 * n] * 3,
+        )
+        return nest
+
+    @staticmethod
+    def _options(**overrides):
+        fields = {"symbolic_extent": "dynamic"}
+        return ktir.PlanOptions(**(fields | overrides))
+
+    def test_the_plan_names_the_dimension_it_needs(self):
+        plan = ktir.build_kernel_plan([self._dynamic_nest()], self._options())
+        self.assertEqual(plan.dims, ("s0",))
+        # The buffer grows to the symbol, and its strides stay integers.
+        for buffer in plan.parameters:
+            with self.subTest(buf_id=buffer.buf_id):
+                self.assertEqual(buffer.layout.extent, (sympy.Symbol("s0"), 64))
+                self.assertEqual(buffer.layout.strides, (64, 1))
+
+    def test_the_loop_bound_is_that_same_dimension(self):
+        plan = ktir.build_kernel_plan([self._dynamic_nest()], self._options())
+        self.assertEqual(plan.steps[0].trip, "s0")
+        self.assertIn(plan.steps[0].trip, plan.dims)
+
+    def test_static_mode_refuses_a_symbolic_trip_count(self):
+        """The loop's bound is planned before its body, so this is the refusal
+        that fires -- the symbolic extents inside it are never reached."""
+        with self.assertRaises(ktir.Unimplemented) as ctx:
+            ktir.build_kernel_plan(
+                [self._dynamic_nest()], self._options(symbolic_extent="static")
+            )
+        self.assertIn("symbolic-loop-count", str(ctx.exception))
+        self.assertIn("symbolic_extent='dynamic'", str(ctx.exception))
+
+    def test_a_computed_dimension_is_refused(self):
+        """Only a bare symbol can be an argument; an expression would have to be
+        computed from the arguments."""
+        nest = self._dynamic_nest()
+        nest.count = 2 * sympy.Symbol("s0")
+        for arg in nest.body[0].args:
+            arg.device_tile_advance_expr = None
+        with self.assertRaises(ktir.Unimplemented) as ctx:
+            ktir.build_kernel_plan([nest], self._options())
+        self.assertIn("computed-dimension", str(ctx.exception))
+
+    def test_a_symbolic_stride_is_refused(self):
+        """A symbolic dim that is not the outermost makes an outer stride an
+        expression, which would need arithmetic on the dimension arguments."""
+        nest = self._dynamic_nest()
+        spec = nest.body[0]
+        for arg in spec.args:
+            # [2, s0, 64]: the middle dim is the one that grows, so stride 0
+            # becomes s0*64 rather than an integer.
+            arg.device_size = [2, 1, 64]
+            arg.device_tile_advance_expr = 64 * sympy.Symbol("n")
+        with self.assertRaises(ktir.Unimplemented) as ctx:
+            ktir.build_kernel_plan([nest], self._options())
+        self.assertIn("computed-view-stride", str(ctx.exception))
+
+
+# ---------------------------------------------------------------------------
+# What we refuse, and why
+# ---------------------------------------------------------------------------
+
+
 class TestRefusals(unittest.TestCase):
     """The labelled capabilities this emitter does not implement.
 
@@ -737,7 +871,16 @@ class TestRefusals(unittest.TestCase):
         source = inspect.getsource(ktir)
         labels = re.findall(r'_unimplemented\(\s*\n?\s*"([^"]+)"', source)
         self.assertEqual(sorted(labels), sorted(set(labels)))
-        self.assertEqual(sorted(labels), ["staggered-element-arrangement"])
+        self.assertEqual(
+            sorted(labels),
+            [
+                "computed-dimension",
+                "computed-view-stride",
+                "staggered-element-arrangement",
+                "static-view-extent",
+                "symbolic-loop-count",
+            ],
+        )
 
     def test_no_refusal_message_blames_a_consumer(self):
         """A refusal says what is missing here, not what someone else rejects.
@@ -758,7 +901,7 @@ class TestRefusals(unittest.TestCase):
             if isinstance(node, ast.Call)
             and getattr(node.func, "id", None) == "_unimplemented"
         ]
-        self.assertEqual(len(messages), 1)
+        self.assertEqual(len(messages), 5)
         for message in messages:
             with self.subTest(message=message[:40]):
                 for blame in ("dbo-opt", "no consumer", "nothing lowers", "scheduler"):

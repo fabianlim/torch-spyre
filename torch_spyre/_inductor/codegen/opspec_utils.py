@@ -35,11 +35,12 @@ something to build on.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Any
 
 import sympy
 from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 
-from torch_spyre._inductor.op_spec import OpSpec, TensorArg
+from torch_spyre._inductor.op_spec import Expr, OpSpec, TensorArg
 
 __all__ = [
     "align_reshape_plan",
@@ -48,16 +49,58 @@ __all__ = [
     "per_core_extent",
     "reduced_axes",
     "row_major_strides",
+    "symbolic_dim_max",
 ]
 
 
-def row_major_strides(device_size: Sequence[int]) -> list[int]:
-    """Row-major (C-contiguous) strides for a device-size list."""
+def row_major_strides(device_size: Sequence[Any]) -> list[Any]:
+    """Row-major (C-contiguous) strides for a device-size list.
+
+    A symbolic extent is carried through rather than rejected: a stride is the
+    product of the extents inside it, so a symbolic extent leaves every stride
+    *inside* it an integer and makes the ones outside it expressions.  An
+    all-integer size therefore still gets plain ``int`` strides.
+    """
     n = len(device_size)
-    strides = [1] * n
+    strides: list[Any] = [1] * n
     for i in range(n - 2, -1, -1):
-        strides[i] = strides[i + 1] * int(device_size[i + 1])
+        product = strides[i + 1] * device_size[i + 1]
+        try:
+            strides[i] = int(product)
+        except TypeError:  # a sympy expression over an unresolved dim
+            strides[i] = product
     return strides
+
+
+def symbolic_dim_max(expr: Expr, symbolic_dim_bounds: dict) -> int:
+    """``expr`` with every symbolic dim replaced by its maximum, as an int.
+
+    ``OpSpec.symbolic_dim_bounds`` maps a PyTorch symbol *name* to
+    ``(max, granularity)``, computed from the ShapeEnv at codegen time and
+    serialized as plain ints, so this works during the reload phase when the
+    ShapeEnv is gone.  Baking the max over-allocates but needs nothing at run
+    time, which is why both emitters offer it.
+
+    Note for anyone unifying this with ``superdsc._resolve_sdsc_size``: that one
+    returns the first symbol's max *directly* (so it answers ``s0`` for ``s0 + 1``)
+    and falls back to a live-ShapeEnv hint when the symbol is unbounded.  This one
+    substitutes into the whole expression and raises instead of guessing, so the
+    two are not interchangeable without deciding which behaviour is wanted.
+    """
+    resolved = expr
+    for symbol in {str(s) for s in getattr(expr, "free_symbols", ())}:
+        if symbol not in symbolic_dim_bounds:
+            raise NotImplementedError(
+                f"extent {expr} has no bound for {symbol!r} in symbolic_dim_bounds"
+            )
+        resolved = resolved.subs({symbol: int(symbolic_dim_bounds[symbol][0])})
+    try:
+        return int(resolved)
+    except TypeError:
+        raise NotImplementedError(
+            f"extent {expr} does not become an integer under its bounds "
+            f"{symbolic_dim_bounds!r}"
+        ) from None
 
 
 def buf_id(arg: TensorArg) -> str:

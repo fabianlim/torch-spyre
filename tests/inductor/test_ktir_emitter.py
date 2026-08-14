@@ -468,5 +468,80 @@ module {
         self.assertEqual(emitted, self.EXPECTED_TILED_ADD_KTIR)
 
 
+@unittest.skipUnless(
+    _mlir_ktdp_available(),
+    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
+)
+class TestSymbolicDimensionEmission(unittest.TestCase):
+    """A run-time number of sticks: one func argument, used twice.
+
+    ``%arg3`` sizes the dynamic memref dim *and* bounds the loop that walks it.
+    The shape is the one the KTDP lowering builds for a non-constant descriptor
+    dimension -- ``?`` in the memref type, the size as an SSA operand, and an
+    integer-set *symbol* for the coordinate bound -- so this is an existing form,
+    not a new dialect feature.
+    """
+
+    EXPECTED_DYNAMIC_ADD_KTIR = """\
+#map = affine_map<(d0, d1) -> (d0, d1)>
+#set = affine_set<(d0, d1)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0, d1 >= 0, -d1 + 63 >= 0)>
+#set1 = affine_set<(d0, d1) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 63 >= 0)>
+module {
+  func.func @ktir_dyn_add_0(%arg0: index, %arg1: index, %arg2: index, %arg3: index) attributes {grid = [1]} {
+    %c0 = arith.constant 0 : index
+    %0 = ktdp.construct_memory_view %arg0, sizes: [%arg3, 64], strides: [64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<?x64xf16>
+    %1 = ktdp.construct_memory_view %arg1, sizes: [%arg3, 64], strides: [64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<?x64xf16>
+    %2 = ktdp.construct_memory_view %arg2, sizes: [%arg3, 64], strides: [64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<?x64xf16>
+    %c0_0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    scf.for %arg4 = %c0_0 to %arg3 step %c1 {
+      %3 = ktdp.construct_access_tile %0[%arg4, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<?x64xf16> -> !ktdp.access_tile<1x64xindex>
+      %4 = ktdp.load %3 : <1x64xindex> -> tensor<1x64xf16>
+      %5 = ktdp.construct_access_tile %1[%arg4, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<?x64xf16> -> !ktdp.access_tile<1x64xindex>
+      %6 = ktdp.load %5 : <1x64xindex> -> tensor<1x64xf16>
+      %7 = tensor.empty() : tensor<1x64xf16>
+      %8 = linalg.add ins(%4, %6 : tensor<1x64xf16>, tensor<1x64xf16>) outs(%7 : tensor<1x64xf16>) -> tensor<1x64xf16>
+      %9 = ktdp.construct_access_tile %2[%arg4, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<?x64xf16> -> !ktdp.access_tile<1x64xindex>
+      ktdp.store %8, %9 : tensor<1x64xf16>, <1x64xindex>
+    }
+    return
+  }
+}
+"""
+
+    def test_dynamic_dimension_golden(self):
+        from test_ktir_validate import TestDimensionArguments
+
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir(
+            "ktir_dyn_add_0",
+            [TestDimensionArguments._dynamic_nest()],
+            symbolic_extent="dynamic",
+        )
+        self.assertEqual(emitted, self.EXPECTED_DYNAMIC_ADD_KTIR)
+
+    def test_the_dimension_argument_is_the_loop_bound(self):
+        """Asserted as a relationship rather than trusting the golden's text: the
+        view's size operand and the loop's upper bound are the same value."""
+        from test_ktir_validate import TestDimensionArguments
+
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir(
+            "ktir_dyn_add_0",
+            [TestDimensionArguments._dynamic_nest()],
+            symbolic_extent="dynamic",
+        )
+        [view] = [
+            ln for ln in emitted.splitlines() if "construct_memory_view %arg0" in ln
+        ]
+        [loop] = [ln for ln in emitted.splitlines() if "scf.for" in ln]
+        size = view.split("sizes: [")[1].split(",")[0]
+        bound = loop.split(" to ")[1].split(" step")[0]
+        self.assertTrue(size.startswith("%arg"), size)
+        self.assertEqual(size, bound)
+
+
 if __name__ == "__main__":
     unittest.main()

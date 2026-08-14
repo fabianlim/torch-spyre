@@ -452,7 +452,8 @@ def _advance(
     available = [
         i for i in range(rank - 2, -1, -1) if isinstance(strides[i], int)
     ]  # ascending stride
-    for coeff, level_index in sorted((c, l) for l, c in enumerate(coeffs) if c):
+    ordered = sorted((coeff, level) for level, coeff in enumerate(coeffs) if coeff)
+    for coeff, level_index in ordered:
         if coeff < 0:
             raise NotImplementedError(
                 f"OpSpec->KTIR: negative tile advance {coeff} for level "

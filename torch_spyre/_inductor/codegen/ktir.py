@@ -1444,11 +1444,15 @@ class KtirBuilder:
                     self.c0 = self.icst_index(0)
                     self.env.bind_ivs(self.core_portions())
                     for position, buffer in enumerate(buffers):
-                        base = (
-                            self.icst_index(buffer.base_elements)
-                            if baked
-                            else self.block_args[position]
-                        )
+                        if not baked:
+                            base = self.block_args[position]
+                        else:
+                            # ``_buffer`` resolves an address for every buffer
+                            # under this option, so a missing one is a plan bug.
+                            assert buffer.base_elements is not None, (
+                                f"baked plan without an address for {buffer.buf_id}"
+                            )
+                            base = self.icst_index(buffer.base_elements)
                         self.views[buffer.buf_id] = self.memory_view(base, buffer)
                     yield
                     func.ReturnOp([])  # no operands, matching the signature
@@ -1609,6 +1613,9 @@ class KtirBuilder:
                 else self.c0
             )
         identity = ir.AffineMapAttr.get(ir.AffineMap.get_identity(len(sizes)))
+        # A threaded buffer has no view, and the plan gives it no access to tile:
+        # reaching here without one is a plan bug, not an unsupported request.
+        assert access.buffer is not None, "access tile of a buffer with no view"
         return self.val(
             ktdp.construct_access_tile(
                 result=ktdp.AccessTileType.get(sizes, ir.IndexType.get()),

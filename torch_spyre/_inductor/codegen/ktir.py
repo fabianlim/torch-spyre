@@ -38,9 +38,9 @@ from torch_spyre._C import DataFormats
 from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.codegen.compute_ops import num_bytes
 from torch_spyre._inductor.codegen.opspec_utils import (
-    _align_reshape_plan,
-    _buf_id,
-    _row_major_strides,
+    align_reshape_plan,
+    buf_id,
+    row_major_strides,
 )
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
 
@@ -167,12 +167,12 @@ def generate_ktir(
     ordered_args: dict[object, TensorArg] = {}
     for spec in op_specs:
         for arg in spec.args:
-            ordered_args.setdefault(_buf_id(arg), arg)
+            ordered_args.setdefault(buf_id(arg), arg)
     param_args = sorted(
         (a for a in ordered_args.values() if a.arg_index >= 0),
         key=lambda a: a.arg_index,
     )
-    param_index = {_buf_id(a): i for i, a in enumerate(param_args)}
+    param_index = {buf_id(a): i for i, a in enumerate(param_args)}
     # TENTATIVE (dataflow-scheduler#65): bake constant base addresses, and use
     # linalg compute, because the backend rejects symbolic ones.
     baked = not _spyre_config.bundle_symbolic_args
@@ -198,7 +198,7 @@ def generate_ktir(
                 # One memory view per unique buffer, in param order.
                 memory_views: dict[object, ir.Value] = {}
                 for arg in param_args:
-                    bid = _buf_id(arg)
+                    bid = buf_id(arg)
                     base = (
                         _val(arith.ConstantOp(index_t, _base_address_elements(arg)))
                         if baked
@@ -250,7 +250,7 @@ def _collect_pointwise_op_specs(
 def _emit_memory_view(ir, ktdp, arg: TensorArg, offset):
     """Emit ``ktdp.construct_memory_view`` for one buffer, return its SSA value."""
     sizes = [int(s) for s in arg.device_size]
-    strides = _row_major_strides(sizes)
+    strides = row_major_strides(sizes)
     memref_t = ir.MemRefType.get(sizes, _mlir_elt_type(ir, arg.device_dtype))
     coord_set = _coordinate_set_attr(ir, sizes)
     # No Python builder is exposed for the ``spyre_memory_space`` enum attribute
@@ -287,13 +287,13 @@ def _emit_pointwise_op(ir, ktdp, spec: OpSpec, memory_views, c0):
     out_extents = [int(s) for s in out.device_size]
     for arg in inputs:
         # In-place (input buffer aliases the output) is not supported yet.
-        if _buf_id(arg) == _buf_id(out):
+        if buf_id(arg) == buf_id(out):
             raise NotImplementedError(
                 "OpSpec->KTIR: in-place ops (input aliases output) not supported"
             )
         # Reject broadcast / transpose operands: only operands whose device
         # axes already match the output tile exactly are supported.
-        plan = _align_reshape_plan(
+        plan = align_reshape_plan(
             list(arg.device_coordinates),
             [int(s) for s in arg.device_size],
             list(out.device_coordinates),
@@ -307,19 +307,19 @@ def _emit_pointwise_op(ir, ktdp, spec: OpSpec, memory_views, c0):
     # Every operand buffer must be a func parameter (register-threaded fused
     # intermediates are not supported yet).
     for arg in spec.args:
-        if _buf_id(arg) not in memory_views:
+        if buf_id(arg) not in memory_views:
             raise NotImplementedError(
                 "OpSpec->KTIR: fused intermediates (register threading) "
                 "not supported yet"
             )
 
     loaded = [
-        _emit_load(ir, ktdp, arg, memory_views[_buf_id(arg)], c0) for arg in inputs
+        _emit_load(ir, ktdp, arg, memory_views[buf_id(arg)], c0) for arg in inputs
     ]
 
     result = _emit_linalg_pointwise(ir, spec, loaded, out)
 
-    _emit_store(ir, ktdp, out, memory_views[_buf_id(out)], result, c0)
+    _emit_store(ir, ktdp, out, memory_views[buf_id(out)], result, c0)
 
 
 def _emit_access_tile(ir, ktdp, arg: TensorArg, memory_view, c0):

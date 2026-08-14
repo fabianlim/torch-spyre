@@ -179,7 +179,7 @@ class TestValidateRejections(unittest.TestCase):
         for arg in specs[0].args:
             arg.device_dtype = DataFormats.SENINT8
         self._rejects(specs, "unsupported device dtype")
-        self.assertNotIn(DataFormats.SENINT8, ktir._MLIR_ELT_TYPE_NAMES)
+        self.assertNotIn(DataFormats.SENINT8, ktir.ElemTypes.NAMES)
 
     def test_baked_non_hbm_allocation_rejected(self):
         specs = _baked_add_op_specs()

@@ -63,9 +63,10 @@ from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.codegen.compute_ops import num_bytes
 from torch_spyre._inductor.codegen.opspec_utils import (
-    _align_reshape_plan,
-    _buf_id,
-    _row_major_strides,
+    align_reshape_plan,
+    buf_id,
+    row_major_strides,
+    symbolic_dim_max,
 )
 from torch_spyre._inductor.constants import STAGGERED_EAS
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
@@ -113,21 +114,6 @@ def dialect_available() -> bool:
     except ImportError:
         return False
     return True
-
-
-# Supported device dtype -> the *name* of the ``mlir_ktdp.ir`` type builder for
-# it.  Names, not builder references, so this map stays importable without the
-# dialect: ``_elem_types`` reads it (making it the supported-dtype predicate) and
-# puts the name in an ``ElemTypes`` record, which is where the builder's
-# ``named_type`` resolves it against the imported ``ir``.  The two fp16 device
-# formats both map to ``f16``; extend this map (never fall through silently) as
-# new dtypes are supported.
-_MLIR_ELT_TYPE_NAMES: dict[DataFormats, str] = {
-    DataFormats.IEEE_FP16: "F16Type",
-    DataFormats.SEN169_FP16: "F16Type",
-    DataFormats.IEEE_FP32: "F32Type",
-    DataFormats.BFLOAT16: "BF16Type",
-}
 
 
 # ---------------------------------------------------------------------------
@@ -178,11 +164,39 @@ class ElemTypes:
     produces or a store consumes.  KTDP compares neither against the other --
     ``LoadOp``/``StoreOp`` verify shapes only -- so they are two fields rather
     than one, and today's derivation returns them equal.  Held as the *names* of
-    the ``mlir_ktdp.ir`` type builders, so the record stays dialect-free.
+    the ``mlir_ktdp.ir`` type builders, so the record stays dialect-free; the
+    builder's ``named_type`` is what resolves a name against the imported ``ir``.
+
+    ``NAMES`` is the supported-dtype table, and ``of`` the only way to get an
+    ``ElemTypes`` from a device dtype -- so the names this record can hold, the
+    dtypes that map to them, and the unsupported-dtype rejection are one place.
+    The two fp16 device formats both map to ``f16``; extend ``NAMES`` (never fall
+    through silently) as new dtypes are supported.
     """
+
+    NAMES: ClassVar[dict[DataFormats, str]] = {
+        DataFormats.IEEE_FP16: "F16Type",
+        DataFormats.SEN169_FP16: "F16Type",
+        DataFormats.IEEE_FP32: "F32Type",
+        DataFormats.BFLOAT16: "BF16Type",
+    }
 
     storage: str
     value: str
+
+    @classmethod
+    def of(cls, dtype: DataFormats) -> ElemTypes:
+        """The storage/value pair for a device dtype, or raise.
+
+        One ``device_dtype`` means one type on both sides today; a load that
+        reinterprets is why the record has two fields.
+        """
+        name = cls.NAMES.get(dtype)
+        if name is None:
+            raise NotImplementedError(
+                f"OpSpec->KTIR: unsupported device dtype {dtype!r}"
+            )
+        return cls(storage=name, value=name)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -214,7 +228,7 @@ class Layout:
 class Buffer:
     """One unique buffer referenced by the kernel; sole input to a memory view."""
 
-    buf_id: str  # opspec_utils._buf_id(arg)
+    buf_id: str  # opspec_utils.buf_id(arg)
     arg_index: int  # position in the kernel call; -1 => not a kernel argument
     elems: ElemTypes
     layout: Layout
@@ -316,21 +330,6 @@ def _static(value) -> Any:
 def _mul(lhs, rhs) -> Any:
     """``lhs * rhs``, an ``int`` when both are."""
     return _static(lhs * rhs)
-
-
-def _elem_types(arg: TensorArg) -> ElemTypes:
-    """The storage/value element type pair for ``arg``.
-
-    The only reader of ``device_dtype``, so the unsupported-dtype raise lives
-    here.  One ``device_dtype`` means one type on both sides today; a load that
-    reinterprets is why the record has two fields.
-    """
-    name = _MLIR_ELT_TYPE_NAMES.get(arg.device_dtype)
-    if name is None:
-        raise NotImplementedError(
-            f"OpSpec->KTIR: unsupported device dtype {arg.device_dtype!r}"
-        )
-    return ElemTypes(storage=name, value=name)
 
 
 def _trip(loop: LoopSpec):
@@ -456,16 +455,6 @@ def _grown_extent(tile: Any, levels: Sequence[Level], steps: Sequence[int]) -> A
     return _static(extent)
 
 
-def _row_major(extent: Sequence[Any]) -> tuple[Any, ...]:
-    """Row-major strides over ``extent``, symbolic entries carried through."""
-    if all(isinstance(e, int) for e in extent):
-        return tuple(_row_major_strides([int(e) for e in extent]))
-    strides: list[Any] = [1] * len(extent)
-    for i in range(len(extent) - 2, -1, -1):
-        strides[i] = _mul(extent[i + 1], strides[i + 1])
-    return tuple(strides)
-
-
 def _resolve_extent(extent: Any, mode: str, bounds: dict | None) -> Any:
     """One extent under the requested ``symbolic_extent`` mode.
 
@@ -478,23 +467,9 @@ def _resolve_extent(extent: Any, mode: str, bounds: dict | None) -> Any:
     if isinstance(extent, int):
         return extent
     if mode == "max":
-        bounds = bounds or {}
-        names = {str(s) for s in getattr(extent, "free_symbols", ())}
-        resolved = extent
-        for name in names:
-            if name not in bounds:
-                raise NotImplementedError(
-                    f"OpSpec->KTIR: extent {extent} has no bound for {name!r} in "
-                    "OpSpec.symbolic_dim_bounds"
-                )
-            resolved = resolved.subs({name: int(bounds[name][0])})
-        resolved = _static(resolved)
-        if not isinstance(resolved, int):
-            raise NotImplementedError(
-                f"OpSpec->KTIR: extent {extent} does not become an integer under "
-                f"its bounds {bounds!r}"
-            )
-        return resolved
+        # The same reading of symbolic_dim_bounds the SDSC path uses, so 'max' is
+        # parity with the bundle emitter rather than a second convention.
+        return symbolic_dim_max(extent, bounds or {})
     if mode == "dynamic":
         # The extent stays symbolic here; the builder spells it as a dynamic
         # memref dim whose size is a func argument.  This is the same shape the
@@ -565,7 +540,9 @@ def _layout(
         for i in range(len(tile))
     )
     extent, strides = _arrangement_layout(
-        getattr(arg, "element_arrangement", None), extent, _row_major(extent)
+        getattr(arg, "element_arrangement", None),
+        extent,
+        tuple(row_major_strides(extent)),
     )
     return Layout(extent=extent, strides=strides)
 
@@ -655,7 +632,7 @@ def _access(
     return Access(
         extent=extent,
         index_coeffs=index_coeffs,
-        elems=_elem_types(arg),
+        elems=ElemTypes.of(arg.device_dtype),
         buffer=buffer,
     )
 
@@ -709,7 +686,7 @@ def _buffer(
             f"(allocation={arg.allocation!r}); only HBM buffers are supported"
         )
     return Buffer(
-        buf_id=_buf_id(arg),
+        buf_id=buf_id(arg),
         arg_index=arg.arg_index,
         elems=elems,
         layout=layout,
@@ -923,14 +900,14 @@ class KernelPlan:
         out_extents = [int(s) for s in out.device_size]
         for arg in inputs:
             # In-place (input buffer aliases the output) is not supported yet.
-            if _buf_id(arg) == _buf_id(out):
+            if buf_id(arg) == buf_id(out):
                 raise NotImplementedError(
                     "OpSpec->KTIR: in-place ops (input aliases output) not supported"
                 )
             # Reject broadcast / transpose operands: only operands whose device
             # axes already match the output tile exactly are supported.
             if (
-                _align_reshape_plan(
+                align_reshape_plan(
                     list(arg.device_coordinates),
                     [int(s) for s in arg.device_size],
                     list(out.device_coordinates),
@@ -943,15 +920,15 @@ class KernelPlan:
                 )
         levels = _levels(spec, loops)
         accesses = {
-            _buf_id(arg): self._access_of(arg, levels, spec.symbolic_dim_bounds)
+            buf_id(arg): self._access_of(arg, levels, spec.symbolic_dim_bounds)
             for arg in spec.args
         }
         return ComputeStep(
             op=spec.op,
             family=Family.of(spec),
-            ins=tuple((_buf_id(arg), accesses[_buf_id(arg)]) for arg in inputs),
-            out=accesses[_buf_id(out)],
-            out_buf_id=_buf_id(out),
+            ins=tuple((buf_id(arg), accesses[buf_id(arg)]) for arg in inputs),
+            out=accesses[buf_id(out)],
+            out_buf_id=buf_id(out),
             # An internal buffer never reaches memory: it is threaded as a value,
             # so it gets no store, no func parameter, no view and no address.
             store=not is_internal(out),
@@ -987,11 +964,11 @@ class KernelPlan:
                     "dimension arguments; only a symbolic outermost extent, whose "
                     "strides stay integers, is implemented",
                 )
-        elems = _elem_types(arg)
+        elems = ElemTypes.of(arg.device_dtype)
         buffer = None
         if not is_internal(arg):
             buffer = self.buffers.setdefault(
-                _buf_id(arg),
+                buf_id(arg),
                 _buffer(arg, layout, elems, bake_addresses=self.options.bake_addresses),
             )
         return _access(arg, levels, q, layout, buffer)

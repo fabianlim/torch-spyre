@@ -17,15 +17,15 @@
 **Everything in this file needs the ``mlir_ktdp`` dialect build and is skipped
 without it.**  The emitter's *rejections* need no dialect -- the plan walk
 raises them all before the lazy import -- so they live in
-``test_ktir_validate.py``, which is never skipped and which owns the shared
-``_add_op_specs`` fixture.
+``test_ktir_validate.py``, which is never skipped and which owns the shared spec
+builders.
 
 Self-contained otherwise: no live Inductor graph, no compiler run.
 """
 
 import unittest
 
-from test_ktir_validate import _add_op_specs, _baked_add_op_specs
+from test_ktir_validate import make_chained_op_specs, make_nested_op_spec, make_op_spec
 
 
 def _mlir_ktdp_available() -> bool:
@@ -77,7 +77,7 @@ module {
     def test_pointwise_add_golden(self):
         from torch_spyre._inductor.codegen.ktir import generate_ktir
 
-        emitted = generate_ktir("ktir_fused_add_0", _add_op_specs())
+        emitted = generate_ktir("ktir_fused_add_0", [make_op_spec()])
         self.assertEqual(emitted, self.EXPECTED_ADD_KTIR)
 
     def test_registered_ops_reach_their_own_binding(self):
@@ -86,12 +86,9 @@ module {
         Asserted as a delta against the golden rather than a second copy of it --
         only the compute line differs.
         """
-        import dataclasses
-
         from torch_spyre._inductor.codegen.ktir import generate_ktir
 
-        specs = [dataclasses.replace(_add_op_specs()[0], op="mul")]
-        emitted = generate_ktir("ktir_fused_mul_0", specs)
+        emitted = generate_ktir("ktir_fused_mul_0", [make_op_spec("mul")])
         self.assertIn("linalg.mul ins(", emitted)
         self.assertNotIn("linalg.add", emitted)
         # Everything either side of the compute op is unchanged by the op name.
@@ -119,7 +116,7 @@ class TestKtirBakedAddresses(unittest.TestCase):
         from torch_spyre._inductor.codegen.ktir import generate_ktir
 
         emitted = generate_ktir(
-            "ktir_fused_add_0", _baked_add_op_specs(), bake_addresses=True
+            "ktir_fused_add_0", [make_op_spec(baked=True)], bake_addresses=True
         )
 
         # 1. No address is a runtime value: zero-arg func, no %arg anywhere.
@@ -182,23 +179,8 @@ module {
 
     @staticmethod
     def _chain():
-        """``(a + b) * c``, where the intermediate is LX-allocated."""
-        import dataclasses
-
-        base = _add_op_specs()[0]
-        a, b, mid = base.args
-        c = dataclasses.replace(a, name="arg2", arg_index=2)
-        out = dataclasses.replace(mid, name="buf1", arg_index=3)
-        # arg_index -1 *and* an lx allocation: not passed in, and owned here.
-        mid = dataclasses.replace(mid, name="buf0", arg_index=-1, allocation={"lx": 0})
-        return [
-            dataclasses.replace(base, args=[a, b, mid]),
-            dataclasses.replace(
-                base,
-                op="mul",
-                args=[dataclasses.replace(mid, is_input=True), c, out],
-            ),
-        ]
+        """``(a + b) * c`` in one kernel: the add's result is the mul's operand."""
+        return make_chained_op_specs(("add", "mul"))
 
     def test_chain_golden(self):
         from torch_spyre._inductor.codegen.ktir import generate_ktir
@@ -279,34 +261,14 @@ module {
         """
         import sympy
 
-        from torch_spyre._C import DataFormats
-        from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg
-
         n_stick, m = sympy.symbols("n_stick m")
         advance = 16384 * n_stick + 64 * m
-
-        def arg(name, index, is_input):
-            return TensorArg(
-                is_input=is_input,
-                arg_index=index,
-                device_dtype=DataFormats.SEN169_FP16,
-                device_size=[1, 1, 64],
-                device_coordinates=[],
-                allocation={"hbm": None},
-                name=name,
-                device_tile_advance_expr=advance,
-            )
-
-        spec = OpSpec(
-            op="add",
-            is_reduction=False,
-            iteration_space={},
-            args=[arg("arg0", 0, True), arg("arg1", 1, True), arg("buf0", 2, False)],
-            op_info={},
-            tiled_symbols=[[m], [n_stick]],  # innermost-first
-            tiled_symbol_trip_counts={m: 256, n_stick: 2},
+        nest, _spec, _loops = make_nested_op_spec(
+            levels=[(n_stick, 2), (m, 256)],  # outermost-first
+            size=[1, 1, 64],  # one row per iteration, for every arg
+            advances=[advance] * 3,
         )
-        return LoopSpec(count=2, body=[LoopSpec(count=256, body=[spec])])
+        return nest
 
     def test_two_level_nest_golden(self):
         from torch_spyre._inductor.codegen import ktir

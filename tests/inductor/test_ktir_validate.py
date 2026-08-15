@@ -21,8 +21,8 @@ by a pure walk over the spec tree, before the lazy dialect import, so the whole 
 surface is covered wherever ``import torch_spyre`` works.
 
 ``test_ktir_emitter.py`` holds the complement -- the golden MLIR snapshots, which
-do need the dialect build and are skipped without it.  It imports the shared
-``_add_op_specs`` fixture from here, so the fixture itself stays dialect-free.
+do need the dialect build and are skipped without it.  It imports the shared spec
+builders from here (``make_op_spec`` and friends), so they stay dialect-free.
 """
 
 import ast
@@ -41,50 +41,180 @@ from torch_spyre._inductor.codegen import ktir
 from torch_spyre._inductor.constants import STAGGERED_EAS
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
 
+# ---------------------------------------------------------------------------
+# Building a spec
+#
+# One builder, so a test states only what it is about and states it on one line:
+# ``make_op_spec()`` is the whole pointwise contract the frontend produces, and
+# every keyword is one deviation from it.  The ``TensorArg``s are built inside,
+# because their two positional fields are not a test's to choose: ``arg_index``
+# is the position among the HBM args, and an arg that memory planning placed (an
+# ``lx`` / ``hbm_pool`` allocation) is not passed in at all, so it takes -1 and
+# consumes no position -- the frontend's own rule, applied here rather than
+# restated per fixture.
+#
+# The per-arg keywords (``names`` / ``sizes`` / ``allocations`` / ``advances``)
+# are indexed over inputs then outputs, and may be short or hold ``None`` to
+# leave an arg at its default.
+# ---------------------------------------------------------------------------
 
-def _add_op_specs() -> list:
-    """Finished OpSpec list for ``a + b`` at device shape [16, 512, 64] fp16.
+FP16 = DataFormats.SEN169_FP16
+ADD_SIZE = [16, 512, 64]
 
-    This mirrors what the SuperDSC frontend produces for a pointwise ``a + b``:
-    two HBM inputs and one HBM output, each addressed at the identity
-    coordinates ``(d0, d1, d2)`` over the stickified device shape.
+
+def make_op_spec(
+    op: str = "add",
+    *,
+    inputs: int = 2,
+    outputs: int = 1,
+    names: list | None = None,
+    size: list = ADD_SIZE,
+    sizes: list | None = None,
+    coords: list | None = None,
+    dtype: DataFormats = FP16,
+    allocations: list | None = None,
+    baked: bool = False,
+    advances: list | None = None,
+    is_reduction: bool = False,
+    divisions: dict | None = None,
+    space: dict | None = None,
+    tiled: list | None = None,
+    trips: dict | None = None,
+    first_arg_index: int = 0,
+) -> OpSpec:
+    """A finished ``OpSpec``, defaulting to ``a + b`` at [16, 512, 64] fp16.
+
+    That default is what the SuperDSC frontend produces for a pointwise add: two
+    HBM inputs and one HBM output at identity ``(d0, ..., dn)`` coordinates, with
+    the HBM address left unassigned (the symbolic form reads no address, and the
+    baked form is the one that rejects that).
+
+    The deviations, each a keyword:
+
+    * ``op`` / ``inputs`` / ``outputs`` / ``names`` -- the op and its roles.
+    * ``size`` for every arg, or ``sizes`` per arg; ``coords=[]`` for a tiled arg,
+      which addresses through ``advances`` instead of coordinates.
+    * ``allocations`` per arg, for an ``lx`` / ``hbm_pool`` intermediate or an
+      unrecognised space; ``baked=True`` for the byte HBM address the baked form
+      wants, which is the same field said the other way, so not both.
+    * ``divisions`` maps a coordinate symbol's name to its work division;
+      ``space`` replaces the iteration space outright (``{}`` for a tiled op).
+    * ``tiled`` / ``trips`` are the loop-level symbols and trip counts, and
+      ``first_arg_index`` continues the numbering for a second op in one kernel.
     """
-    d0, d1, d2 = sympy.symbols("d0 d1 d2")
-    coords = [d0, d1, d2]
-    size = [16, 512, 64]
+    if allocations and baked:
+        raise ValueError("make_op_spec: pass allocations= or baked=, not both")
 
-    def arg(is_input: bool, index: int, name: str) -> TensorArg:
-        return TensorArg(
-            is_input=is_input,
-            arg_index=index,
-            device_dtype=DataFormats.SEN169_FP16,
-            device_size=list(size),
-            device_coordinates=list(coords),
-            allocation={"hbm": None},
-            name=name,
+    def at(per_arg: list | None, position: int):
+        """``per_arg[position]``, treating short lists and ``None`` as default."""
+        if per_arg is None or position >= len(per_arg):
+            return None
+        return per_arg[position]
+
+    roles = [(True, i) for i in range(inputs)] + [(False, i) for i in range(outputs)]
+    args, next_index = [], first_arg_index
+    for position, (is_input, ordinal) in enumerate(roles):
+        allocation = at(allocations, position)
+        # An arg planning placed is not passed in: -1, and it takes no position.
+        if allocation is not None and "hbm" not in allocation:
+            arg_index = -1
+        else:
+            arg_index, next_index = next_index, next_index + 1
+            if allocation is None:
+                allocation = {"hbm": arg_index << 34 if baked else None}
+        arg_size = at(sizes, position) or size
+        args.append(
+            TensorArg(
+                is_input=is_input,
+                arg_index=arg_index,
+                device_dtype=dtype,
+                device_size=list(arg_size),
+                device_coordinates=(
+                    list(sympy.symbols(f"d0:{len(arg_size)}"))
+                    if coords is None
+                    else list(coords)
+                ),
+                allocation=allocation,
+                name=at(names, position)
+                or (f"arg{ordinal}" if is_input else f"buf{ordinal}"),
+                device_tile_advance_expr=at(advances, position),
+            )
         )
 
-    return [
-        OpSpec(
-            op="add",
-            is_reduction=False,
-            iteration_space={d0: (16, 1), d1: (512, 1), d2: (64, 1)},
-            args=[
-                arg(True, 0, "arg0"),
-                arg(True, 1, "arg1"),
-                arg(False, 2, "buf0"),
-            ],
-            op_info={},
+    if space is None:
+        out_size = args[-1].device_size
+        space = {
+            symbol: (extent, (divisions or {}).get(str(symbol), 1))
+            for symbol, extent in zip(sympy.symbols(f"d0:{len(out_size)}"), out_size)
+        }
+    return OpSpec(
+        op=op,
+        is_reduction=is_reduction,
+        iteration_space=space,
+        args=args,
+        op_info={},
+        tiled_symbols=tiled or [],
+        tiled_symbol_trip_counts=trips or {},
+    )
+
+
+def make_chained_op_specs(ops: tuple = ("add", "mul"), **overrides) -> list:
+    """The ops of one kernel, each threading its result into the next.
+
+    Every op but the last writes an ``lx`` intermediate that the next op reads,
+    which is the contract saying this kernel owns it: not passed in, no address,
+    and nothing outside the kernel can reach it.  The fresh inputs and the final
+    output are HBM args, numbered across the whole kernel rather than per op.
+    """
+    lx = {"lx": 0}
+    specs, next_arg = [], 0
+    for level, op in enumerate(ops):
+        # The first op reads two fresh inputs; every later one reads the previous
+        # result and one fresh input.  Only the last op's output is HBM.
+        threaded = [] if level == 0 else [f"buf{level - 1}"]
+        fresh = [f"arg{next_arg + i}" for i in range(2 - len(threaded))]
+        specs.append(
+            make_op_spec(
+                op,
+                names=[*threaded, *fresh, f"buf{level}"],
+                allocations=[
+                    *([lx] if threaded else []),
+                    *([None] * len(fresh)),
+                    None if level == len(ops) - 1 else lx,
+                ],
+                first_arg_index=next_arg,
+                **overrides,
+            )
         )
-    ]
-
-
-def _baked_add_op_specs() -> list:
-    """``_add_op_specs`` with the byte HBM addresses the baked form needs."""
-    specs = _add_op_specs()
-    for arg in specs[0].args:
-        arg.allocation = {"hbm": arg.arg_index << 34}
+        next_arg += len(fresh)
     return specs
+
+
+def make_nested_op_spec(*, levels: list, **overrides) -> tuple:
+    """One op inside a loop nest, as ``(nest, op, loops)``.
+
+    ``levels`` is ``[(symbol, trip count), ...]`` outermost-first, and it states
+    the nest once: the ``scf.for`` trip counts, the op's ``tiled_symbols``
+    (innermost-first, one entry per level) and its ``tiled_symbol_trip_counts``
+    all come from it, so they cannot disagree.  A tiled op addresses through
+    ``advances`` rather than coordinates, and its iteration space is empty.
+
+    ``loops`` is the enclosing chain outermost-first -- what the plan walk would
+    reach the op with, and what ``_levels`` takes.
+    """
+    spec = make_op_spec(
+        coords=[],
+        space={},
+        tiled=[[symbol] for symbol, _ in reversed(levels)],
+        trips=dict(levels),
+        **overrides,
+    )
+    body: list = [spec]
+    loops: list = []
+    for _symbol, trip in reversed(levels):
+        loops.insert(0, LoopSpec(count=trip, body=body))
+        body = [loops[0]]
+    return loops[0], spec, loops
 
 
 class TestValidateRejections(unittest.TestCase):
@@ -111,9 +241,7 @@ class TestValidateRejections(unittest.TestCase):
     def test_work_division_rejected(self):
         """The grid comes from the contract, so the refusal reads the contract:
         a symbol the iteration space splits has no grid to emit for yet."""
-        specs = _add_op_specs()
-        d1 = next(s for s in specs[0].iteration_space if str(s) == "d1")
-        specs[0].iteration_space[d1] = (512, 32)
+        specs = [make_op_spec(divisions={"d1": 32})]
         self._rejects(specs, "multi-core work division is not supported")
 
     # -- spec-tree shape ---------------------------------------------------
@@ -127,76 +255,73 @@ class TestValidateRejections(unittest.TestCase):
     def test_reduction_rejected(self):
         """A reduction is a second emission shape, not a second binding: refused
         until a builder method exists for it."""
-        specs = _add_op_specs()
-        specs[0].is_reduction = True
-        self._rejects(specs, "reductions are not supported yet")
+        self._rejects([make_op_spec(is_reduction=True)], "reductions are not supported")
 
     def test_unregistered_op_rejected(self):
         """An op with no recipe is rejected, and the message names what exists."""
-        specs = _add_op_specs()
-        specs[0].op = "atan2"
         self.assertNotIn("atan2", ktir.KtirBuilder.RECIPES)
-        self._rejects(specs, "op 'atan2' is not supported yet")
+        self._rejects([make_op_spec("atan2")], "op 'atan2' is not supported yet")
 
     # -- per-op roles ------------------------------------------------------
 
     def test_multiple_outputs_rejected(self):
-        specs = _add_op_specs()
-        specs[0].args[1].is_input = False
+        specs = [make_op_spec(inputs=1, outputs=2)]
         self._rejects(specs, "expected exactly one output, got 2")
 
     def test_wrong_arity_rejected(self):
-        specs = _add_op_specs()
-        del specs[0].args[1]
-        self._rejects(specs, "'add' expects 2 inputs, got 1")
+        self._rejects([make_op_spec(inputs=1)], "'add' expects 2 inputs, got 1")
 
     def test_in_place_rejected(self):
-        specs = _add_op_specs()
-        specs[0].args[0].name = specs[0].args[-1].name
+        """The output names an input, which is the aliasing this cannot emit."""
+        specs = [make_op_spec(names=["arg0", "arg1", "arg0"])]
         self._rejects(specs, "in-place ops (input aliases output)")
 
     def test_broadcast_operand_rejected(self):
-        specs = _add_op_specs()
         # A unit outer-stick extent against the output's 16: a real broadcast.
-        specs[0].args[0].device_size = [1, 512, 64]
+        specs = [make_op_spec(sizes=[[1, 512, 64]])]
         self._rejects(specs, "broadcast / reshape operands")
 
     # -- per-buffer --------------------------------------------------------
 
     def test_non_kernel_argument_buffer_rejected(self):
-        """arg_index stays -1 for LX / HBM-pool buffers; only HBM is emitted."""
-        specs = _add_op_specs()
+        """arg_index stays -1 for LX / HBM-pool buffers; only HBM is emitted.
+
+        Set here rather than asked of the builder: an HBM buffer that is *also*
+        not a kernel argument is the contradiction under test, and the builder
+        ties -1 to a non-HBM allocation precisely so it cannot produce one.
+        """
+        specs = [make_op_spec()]
         specs[0].args[0].arg_index = -1
         self._rejects(specs, "is not a kernel argument")
 
     def test_symbolic_trip_count_rejected(self):
-        nest = LoopSpec(count=sympy.Symbol("s0"), body=_add_op_specs())
+        nest = LoopSpec(count=sympy.Symbol("s0"), body=[make_op_spec()])
         self._rejects([nest], "trip count s0 is symbolic")
 
     def test_unsupported_dtype_rejected(self):
-        specs = _add_op_specs()
-        for arg in specs[0].args:
-            arg.device_dtype = DataFormats.SENINT8
-        self._rejects(specs, "unsupported device dtype")
+        self._rejects([make_op_spec(dtype=DataFormats.SENINT8)], "unsupported device")
         self.assertNotIn(DataFormats.SENINT8, ktir.ElemTypes.NAMES)
 
     def test_baked_non_hbm_allocation_rejected(self):
-        """An allocation that is neither HBM nor one this emitter threads."""
-        specs = _baked_add_op_specs()
+        """An allocation that is neither HBM nor one this emitter threads.
+
+        Set here for the same reason as ``test_non_kernel_argument_buffer``: the
+        builder would read an unrecognised allocation as an intermediate and give
+        it -1, which is a different rejection than the one under test.
+        """
+        specs = [make_op_spec(baked=True)]
         specs[0].args[0].allocation = {"somewhere_new": 0x1000}
         self._rejects(specs, "is not HBM-allocated", bake_addresses=True)
 
     def test_threaded_input_without_a_producer_rejected(self):
         """An lx buffer this kernel reads but does not produce: threading it has
         no value to read, so it needs materialising."""
-        specs = _add_op_specs()
-        specs[0].args[0].allocation = {"lx": 0x1000}
-        specs[0].args[0].arg_index = -1
+        specs = [make_op_spec(allocations=[{"lx": 0x1000}])]
         self._rejects(specs, "no op in this kernel produces it")
 
     def test_baked_unassigned_hbm_address_rejected(self):
-        # _add_op_specs leaves every 'hbm' address None.
-        self._rejects(_add_op_specs(), "unassigned 'hbm' address", bake_addresses=True)
+        # [make_op_spec()] leaves every 'hbm' address None.
+        self._rejects([make_op_spec()], "unassigned 'hbm' address", bake_addresses=True)
 
 
 class TestRejectionsThroughGenerateKtir(unittest.TestCase):
@@ -207,19 +332,19 @@ class TestRejectionsThroughGenerateKtir(unittest.TestCase):
     """
 
     def test_reduction_unsupported(self):
-        specs = _add_op_specs()
+        specs = [make_op_spec()]
         specs[0].is_reduction = True
         with self.assertRaises(NotImplementedError):
             ktir.generate_ktir("ktir_fused_add_0", specs)
 
     def test_unregistered_op_unsupported(self):
-        specs = _add_op_specs()
+        specs = [make_op_spec()]
         specs[0].op = "atan2"
         with self.assertRaises(NotImplementedError):
             ktir.generate_ktir("ktir_fused_atan2_0", specs)
 
     def test_work_division_unsupported(self):
-        specs = _add_op_specs()
+        specs = [make_op_spec()]
         d1 = next(s for s in specs[0].iteration_space if str(s) == "d1")
         specs[0].iteration_space[d1] = (512, 32)
         with self.assertRaises(NotImplementedError):
@@ -228,7 +353,7 @@ class TestRejectionsThroughGenerateKtir(unittest.TestCase):
     def test_unknown_option_is_a_typeerror(self):
         """Options are PlanOptions fields; a typo is not silently ignored."""
         with self.assertRaises(TypeError) as ctx:
-            ktir.generate_ktir("k", _add_op_specs(), bake_address=True)
+            ktir.generate_ktir("k", [make_op_spec()], bake_address=True)
         self.assertIn("bake_address", str(ctx.exception))
 
 
@@ -255,7 +380,7 @@ class TestKernelPlan(unittest.TestCase):
     """What ``build_kernel_plan`` returns: the func signature, before any emission."""
 
     def test_param_entries_are_ordered_by_arg_index(self):
-        specs = _add_op_specs()
+        specs = [make_op_spec()]
         # Registration order (spec.args) is 0, 1, 2; shuffle it so the sort is
         # doing the work rather than agreeing with insertion order by luck.
         specs[0].args = [specs[0].args[2], specs[0].args[0], specs[0].args[1]]
@@ -268,14 +393,14 @@ class TestKernelPlan(unittest.TestCase):
         self.assertEqual(plan.parameters[0].layout.strides, (32768, 64, 1))
 
     def test_symbolic_form_resolves_no_base_addresses(self):
-        plan = ktir.build_kernel_plan(_add_op_specs())
+        plan = ktir.build_kernel_plan([make_op_spec()])
         # Every 'hbm' address in the fixture is None and never read: the bases
         # are func arguments.
         self.assertEqual([e.base_elements for e in plan.parameters], [None] * 3)
 
     def test_baked_form_resolves_bases_in_elements(self):
         plan = ktir.build_kernel_plan(
-            _baked_add_op_specs(),
+            [make_op_spec(baked=True)],
             ktir.PlanOptions(bake_addresses=True),
         )
         # fp16: 2 bytes per element, so the byte slot halves.
@@ -286,10 +411,10 @@ class TestKernelPlan(unittest.TestCase):
 
     def test_the_grid_is_one_core(self):
         """One core until the grid is read from the iteration space."""
-        self.assertEqual(ktir.build_kernel_plan(_add_op_specs()).grid, (1,))
+        self.assertEqual(ktir.build_kernel_plan([make_op_spec()]).grid, (1,))
 
     def test_repeated_buffer_is_registered_once(self):
-        specs = _add_op_specs() + _add_op_specs()
+        specs = [make_op_spec()] + [make_op_spec()]
         plan = ktir.build_kernel_plan(specs)
         self.assertEqual(len(plan.buffers), 3)
 
@@ -299,9 +424,8 @@ class TestBaseAddressElements(unittest.TestCase):
 
     @staticmethod
     def _arg(allocation):
-        arg = _add_op_specs()[0].args[1]
-        arg.allocation = allocation
-        return arg
+        """One input carrying ``allocation``, taken out of a whole spec."""
+        return make_op_spec(allocations=[None, allocation]).args[1]
 
     def test_byte_address_scales_to_elements(self):
         # fp16: 2 bytes per element.  Zero is a real address, not "unset".
@@ -328,29 +452,25 @@ class TestInternalBufferSignal(unittest.TestCase):
     """
 
     def test_an_hbm_buffer_is_passed_in_not_owned(self):
-        for arg in _add_op_specs()[0].args:
+        for arg in make_op_spec().args:
             self.assertFalse(ktir.is_internal(arg))
 
     def test_planning_placed_it_means_the_kernel_owns_it(self):
         for allocation in ({"lx": 0x1000}, {"hbm_pool": 0x2000}):
             with self.subTest(allocation=allocation):
-                arg = _add_op_specs()[0].args[2]
-                arg.allocation = allocation
-                self.assertTrue(ktir.is_internal(arg))
+                spec = make_op_spec(allocations=[None, None, allocation])
+                self.assertTrue(ktir.is_internal(spec.args[-1]))
 
     def test_an_unrecognised_allocation_is_not_threaded(self):
         """Threading is chosen on a positive signal, so an allocation this
         emitter does not know reaches the buffer rejection instead."""
-        specs = _add_op_specs()
-        specs[0].args[2].allocation = {"somewhere_new": 0}
-        self.assertFalse(ktir.is_internal(specs[0].args[2]))
+        spec = make_op_spec(allocations=[None, None, {"somewhere_new": 0}])
+        self.assertFalse(ktir.is_internal(spec.args[-1]))
 
     def test_a_threaded_buffer_nothing_reads_is_rejected(self):
         """An intermediate whose consumer is in another kernel: not stored, and
         not read here either, so the op that produced it would write nowhere."""
-        specs = _add_op_specs()
-        specs[0].args[2].allocation = {"lx": 0x1000}
-        specs[0].args[2].arg_index = -1
+        specs = [make_op_spec(allocations=[None, None, {"lx": 0x1000}])]
         with self.assertRaises(NotImplementedError) as ctx:
             ktir.build_kernel_plan(specs)
         self.assertIn("nothing in this kernel", str(ctx.exception))
@@ -386,7 +506,7 @@ class TestRecipes(unittest.TestCase):
         """The family is read from the spec rather than the op name, so one
         binding can be wanted in more than one shape.  Only ELEMENTWISE has an
         emission today, which is why a reducing spec is refused by the walk."""
-        spec = _add_op_specs()[0]
+        spec = [make_op_spec()][0]
         self.assertIs(ktir.Family.of(spec), ktir.Family.ELEMENTWISE)
         self.assertEqual(list(ktir.Family), [ktir.Family.ELEMENTWISE])
 
@@ -418,34 +538,16 @@ def _tiled_reduction_specs() -> tuple:
     see are the nest's own.
     """
     n_stick, m = sympy.symbols("n_stick m")
-
-    def arg(name, index, is_input, size, advance):
-        return TensorArg(
-            is_input=is_input,
-            arg_index=index,
-            device_dtype=DataFormats.IEEE_FP16,
-            device_size=list(size),
-            device_coordinates=[],
-            allocation={"hbm": 0},
-            name=name,
-            device_tile_advance_expr=advance,
-        )
-
-    spec = OpSpec(
-        op="add",
-        is_reduction=False,
-        iteration_space={},
-        args=[
-            arg("a", 0, True, [1, 1, 64], 16384 * n_stick + 64 * m),
-            arg("c", 1, False, [1, 64], 64 * n_stick),
-        ],
-        op_info={},
-        # innermost-first, one entry per enclosing level
-        tiled_symbols=[[m], [n_stick]],
-        tiled_symbol_trip_counts={m: 256, n_stick: 2},
+    _nest, spec, loops = make_nested_op_spec(
+        levels=[(n_stick, 2), (m, 256)],  # outermost-first
+        inputs=1,
+        names=["a", "c"],
+        sizes=[[1, 1, 64], [1, 64]],
+        advances=[16384 * n_stick + 64 * m, 64 * n_stick],
+        allocations=[{"hbm": 0}, {"hbm": 0}],
+        dtype=DataFormats.IEEE_FP16,
     )
-    nest = LoopSpec(count=2, body=[LoopSpec(count=256, body=[spec])])
-    return spec, [nest, nest.body[0]]
+    return spec, loops
 
 
 class TestLoopDerivations(unittest.TestCase):
@@ -523,15 +625,14 @@ class TestLoopDerivations(unittest.TestCase):
         ``device_size`` does not survive the pointwise alignment check's
         ``int()`` either, so the walk reports the wrong thing about it.
         """
-        arg = _add_op_specs()[0].args[0]
-        arg.device_size = [sympy.Symbol("s0"), 512, 64]
+        arg = make_op_spec(size=[sympy.Symbol("s0"), 512, 64]).args[0]
         with self.assertRaises(NotImplementedError) as ctx:
             ktir._solve_layout(arg, [])
         self.assertIn("is symbolic; a symbolic device size", str(ctx.exception))
 
     def test_untiled_access_sits_at_the_view_origin(self):
         """Depth zero is the general answer, not a special case."""
-        arg = _add_op_specs()[0].args[0]
+        arg = make_op_spec().args[0]
         layout, q = ktir._solve_layout(arg, [])
         self.assertEqual(layout.extent, (16, 512, 64))
         self.assertEqual(q, [])
@@ -673,13 +774,13 @@ class TestWithoutTheDialectBuild(unittest.TestCase):
                 fresh.generate_ktir("k", [UnimplementedOp(op="atan2")])
             self.assertIn("unimplemented op", str(ctx.exception))
             # And the derivations answer, dialect or no dialect.
-            layout, _ = fresh._solve_layout(_add_op_specs()[0].args[0], [])
+            layout, _ = fresh._solve_layout(make_op_spec().args[0], [])
             self.assertEqual(layout.extent, (16, 512, 64))
 
     def test_emission_is_what_needs_the_dialect(self):
         # A *valid* request gets as far as the builder and no further.
         with self._blocked() as fresh, self.assertRaises(ImportError):
-            fresh.generate_ktir("k", _add_op_specs())
+            fresh.generate_ktir("k", [make_op_spec()])
 
 
 class TestScopeStack(unittest.TestCase):

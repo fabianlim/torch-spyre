@@ -35,7 +35,7 @@ from torch_spyre._inductor.kernel_provenance import (
     build_kernel_provenance_descriptor,
 )
 from torch_spyre._inductor.codegen.bundle import generate_bundle
-from torch_spyre.profiler._ffdc import CATEGORY_COMPILE, try_collect
+from torch_spyre.profiler._ffdc import CATEGORY_COMPILE_BACKEND, try_collect
 from .kernel_runner import SpyreSDSCKernelRunner, SpyreUnimplementedRunner
 
 logger = get_inductor_logger("sdsc_compile")
@@ -159,7 +159,7 @@ class SpyreAsyncCompile(AsyncCompile):
                 try_collect(
                     exc,
                     logger=logger,
-                    failure_category=CATEGORY_COMPILE,
+                    failure_category=CATEGORY_COMPILE_BACKEND,
                     kernel_name=kernel_name,
                     code_dir=output_dir,
                 )
@@ -270,7 +270,7 @@ class SpyreAsyncCompile(AsyncCompile):
                 try_collect(
                     exc,
                     logger=logger,
-                    failure_category=CATEGORY_COMPILE,
+                    failure_category=CATEGORY_COMPILE_BACKEND,
                     kernel_name=kernel_name,
                     code_dir=output_dir,
                 )
@@ -283,7 +283,7 @@ class SpyreAsyncCompile(AsyncCompile):
                 try_collect(
                     exc,
                     logger=logger,
-                    failure_category=CATEGORY_COMPILE,
+                    failure_category=CATEGORY_COMPILE_BACKEND,
                     kernel_name=kernel_name,
                     code_dir=output_dir,
                 )
@@ -296,7 +296,7 @@ class SpyreAsyncCompile(AsyncCompile):
                 try_collect(
                     exc,
                     logger=logger,
-                    failure_category=CATEGORY_COMPILE,
+                    failure_category=CATEGORY_COMPILE_BACKEND,
                     kernel_name=kernel_name,
                     code_dir=output_dir,
                 )

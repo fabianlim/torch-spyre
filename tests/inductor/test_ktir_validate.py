@@ -30,10 +30,10 @@ import contextlib
 import dataclasses
 import importlib
 import inspect
-import re
 import sys
 import unittest
 
+import regex as re
 import sympy
 
 from torch_spyre._C import DataFormats, ElementArrangement
@@ -882,14 +882,17 @@ class TestEmissionCannotRefuse(unittest.TestCase):
                     if callee in methods or callee in functions:
                         pending.append(callee)
 
-        # Every raise on the emission path is a malformed-plan assertion.  In
-        # particular no guard (_downstream_unsupported / _unspecified) and no
-        # derivation that can raise is reachable.
+        # Every explicit raise on the emission path is a malformed-plan assertion:
+        # no NotImplementedError and no Unimplemented, which is what a refusal is
+        # spelled as.  So none of the functions that *can* refuse -- the labelled
+        # guard `_unimplemented`, and the derivations `_levels`, `_solve_layout`
+        # and `_access` that call it or raise directly -- is reachable from here.
+        #
+        # Stated over the raise kinds rather than over those names: a name would
+        # have to be kept in step with the source, and two of them once were not,
+        # so they silently asserted nothing for as long as that lasted.
         self.assertTrue(raised, "expected the plan-bug assertions to be found")
         self.assertEqual({kind for _, kind in raised}, {"AssertionError"})
-        for guard in ("_downstream_unsupported", "_unspecified", "_levels", "_access"):
-            with self.subTest(unreachable=guard):
-                self.assertNotIn(guard, seen)
 
 
 class TestNoModuleLevelDialectImport(unittest.TestCase):

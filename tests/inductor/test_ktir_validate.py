@@ -82,6 +82,7 @@ def make_op_spec(
     tiled: list | None = None,
     trips: dict | None = None,
     first_arg_index: int = 0,
+    op_info: dict | None = None,
 ) -> OpSpec:
     """A finished ``OpSpec``, defaulting to ``a + b`` at [16, 512, 64] fp16.
 
@@ -104,6 +105,8 @@ def make_op_spec(
       ``space`` replaces the iteration space outright (``{}`` for a tiled op).
     * ``tiled`` / ``trips`` are the loop-level symbols and trip counts, and
       ``first_arg_index`` continues the numbering for a second op in one kernel.
+    * ``op_info`` is the op's auxiliary dict (softplus's beta/threshold live in
+      ``op_info["constants"]``); it defaults to empty.
     """
     if allocations and baked:
         raise ValueError("make_op_spec: pass allocations= or baked=, not both")
@@ -156,7 +159,7 @@ def make_op_spec(
         is_reduction=is_reduction,
         iteration_space=space,
         args=args,
-        op_info={},
+        op_info=op_info or {},
         tiled_symbols=tiled or [],
         tiled_symbol_trip_counts=trips or {},
     )

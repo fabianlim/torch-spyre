@@ -468,5 +468,105 @@ module {
         self.assertEqual(emitted, self.EXPECTED_TILED_ADD_KTIR)
 
 
+@unittest.skipUnless(
+    _mlir_ktdp_available(),
+    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
+)
+class TestOpaqueEmission(unittest.TestCase):
+    """A unary ``spyreop`` intrinsic (``sqrt``) over the whole [16, 512, 64] tile.
+
+    The one emission shape the ``OPAQUE`` family adds is a ``linalg.generic``
+    whose body is a single ``spyreop`` scalar op: identity ``indexing_maps``,
+    all-``parallel`` iterators, and a ``^bb0`` that applies the intrinsic and
+    ``linalg.yield``s it.  The intrinsic owns its own f16->f32->approx->f16, so
+    there is no fp32 precision bracket (dataflow-scheduler#36).  The dataflow
+    either side of the compute -- view, tile, load, store -- is exactly the
+    pointwise form; only the compute lines differ from ``EXPECTED_ADD_KTIR``.
+    """
+
+    EXPECTED_SQRT_KTIR = """\
+#map = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+#set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 15 >= 0, d1 >= 0, -d1 + 511 >= 0, d2 >= 0, -d2 + 63 >= 0)>
+module {
+  func.func @ktir_fused_sqrt_0(%arg0: index, %arg1: index) attributes {grid = [1]} {
+    %c0 = arith.constant 0 : index
+    %0 = ktdp.construct_memory_view %arg0, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
+    %1 = ktdp.construct_memory_view %arg1, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
+    %2 = ktdp.construct_access_tile %0[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
+    %3 = ktdp.load %2 : <16x512x64xindex> -> tensor<16x512x64xf16>
+    %4 = tensor.empty() : tensor<16x512x64xf16>
+    %5 = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel", "parallel", "parallel"]} ins(%3 : tensor<16x512x64xf16>) outs(%4 : tensor<16x512x64xf16>) {
+    ^bb0(%in: f16, %out: f16):
+      %7 = spyreop.sqrt %in : f16
+      linalg.yield %7 : f16
+    } -> tensor<16x512x64xf16>
+    %6 = ktdp.construct_access_tile %1[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
+    ktdp.store %5, %6 : tensor<16x512x64xf16>, <16x512x64xindex>
+    return
+  }
+}
+"""
+
+    def test_sqrt_golden(self):
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir("ktir_fused_sqrt_0", [make_op_spec("sqrt", inputs=1)])
+        self.assertEqual(emitted, self.EXPECTED_SQRT_KTIR)
+
+    def test_the_generic_body_is_a_single_spyreop(self):
+        """The body is one ``spyreop`` op with no fp32 bracket: the ``linalg.generic``
+        walks all-parallel, the op takes and yields the tile's own f16, and no
+        ``arith.extf``/``truncf`` widen/narrow appears."""
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir("ktir_fused_sqrt_0", [make_op_spec("sqrt", inputs=1)])
+        self.assertIn('iterator_types = ["parallel", "parallel", "parallel"]', emitted)
+        self.assertIn("spyreop.sqrt %in : f16", emitted)
+        self.assertIn("linalg.yield", emitted)
+        # No fp32 precision bracket: the intrinsic owns its own precision.
+        self.assertNotIn("arith.extf", emitted)
+        self.assertNotIn("arith.truncf", emitted)
+
+    def test_each_intrinsic_reaches_its_own_binding(self):
+        """A second intrinsic costs one recipe: same generic shape, different
+        ``spyreop`` op.  Asserted against ``sqrt`` so only the op name differs."""
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir("ktir_fused_exp_0", [make_op_spec("exp", inputs=1)])
+        self.assertIn("spyreop.exp %in : f16", emitted)
+        self.assertNotIn("spyreop.sqrt", emitted)
+        self.assertEqual(
+            emitted.replace("spyreop.exp", "spyreop.sqrt").replace(
+                "@ktir_fused_exp_0", "@ktir_fused_sqrt_0"
+            ),
+            self.EXPECTED_SQRT_KTIR,
+        )
+
+    def test_softplus_carries_its_beta_and_threshold(self):
+        """An intrinsic with scalar attributes: softplus reads ``beta``/
+        ``threshold`` from ``op_info["constants"]`` and prints them on the op,
+        the generic scaffold otherwise identical to the attribute-free case."""
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        spec = make_op_spec(
+            "softplus",
+            inputs=1,
+            op_info={"constants": {"softplusBeta": 1.0, "softplusThresh": 20.0}},
+        )
+        emitted = generate_ktir("ktir_fused_softplus_0", [spec])
+        self.assertIn(
+            "spyreop.softplus %in beta 1.000000e+00 threshold 2.000000e+01 : f16",
+            emitted,
+        )
+        # Same scaffold as the attribute-free intrinsics: only the op line differs.
+        self.assertEqual(
+            emitted.replace(
+                "spyreop.softplus %in beta 1.000000e+00 threshold 2.000000e+01 : f16",
+                "spyreop.sqrt %in : f16",
+            ).replace("@ktir_fused_softplus_0", "@ktir_fused_sqrt_0"),
+            self.EXPECTED_SQRT_KTIR,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

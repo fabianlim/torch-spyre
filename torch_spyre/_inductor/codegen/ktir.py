@@ -78,14 +78,14 @@ from torch_spyre._inductor.pass_utils import coeff_through_floor
 # this module requires no dialect build.
 if TYPE_CHECKING:
     from mlir_ktdp import ir
-    from mlir_ktdp.dialects import arith, func, ktdp, linalg, scf, tensor
+    from mlir_ktdp.dialects import arith, func, ktdp, linalg, scf, spyreop, tensor
 else:
-    ir = arith = func = ktdp = linalg = scf = tensor = None
+    ir = arith = func = ktdp = linalg = scf = spyreop = tensor = None
 
 
 def _load_dialects() -> None:
     """Bind the dialect handles into this module, once.  The only import site."""
-    global ir, arith, func, ktdp, linalg, scf, tensor
+    global ir, arith, func, ktdp, linalg, scf, spyreop, tensor
     if ir is not None:
         return
     from mlir_ktdp import ir as _ir
@@ -94,15 +94,17 @@ def _load_dialects() -> None:
     from mlir_ktdp.dialects import ktdp as _ktdp
     from mlir_ktdp.dialects import linalg as _linalg
     from mlir_ktdp.dialects import scf as _scf
+    from mlir_ktdp.dialects import spyreop as _spyreop
     from mlir_ktdp.dialects import tensor as _tensor
 
-    ir, arith, func, ktdp, linalg, scf, tensor = (
+    ir, arith, func, ktdp, linalg, scf, spyreop, tensor = (
         _ir,
         _arith,
         _func,
         _ktdp,
         _linalg,
         _scf,
+        _spyreop,
         _tensor,
     )
 
@@ -312,6 +314,8 @@ class ComputeStep:
     ``store`` is ``False`` for an internal result, which is bound in scope for a
     later step instead of being stored through ``out``.  ``reduce_dims`` is the
     input tile axes a REDUCTION consumes, and empty for every other family.
+    ``attrs`` are scalar attributes the op's builder takes beyond its operands
+    (softplus's ``beta``/``threshold``), read once from the spec's ``op_info``.
     """
 
     op: str  # a KtirBuilder.RECIPES key
@@ -321,6 +325,7 @@ class ComputeStep:
     out_buf_id: str
     store: bool
     reduce_dims: tuple[int, ...] = ()
+    attrs: tuple[tuple[str, float], ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1024,6 +1029,13 @@ class KernelPlan:
                     "same elements; dividing the within-stick axis or a reduced "
                     "axis (which needs a cross-core combine) reads like this"
                 )
+        # Scalar attributes the op's builder takes beyond its operands are read
+        # here, once, from the spec's ``op_info`` -- the same place-and-time
+        # discipline as ``reduce_dims`` -- so emission has nothing left to derive.
+        recipe = KtirBuilder.RECIPES[spec.op]
+        op_attrs: tuple[tuple[str, float], ...] = ()
+        if recipe.attrs is not None:
+            op_attrs = tuple(recipe.attrs(spec.op_info).items())
         return ComputeStep(
             op=spec.op,
             family=family,
@@ -1031,6 +1043,7 @@ class KernelPlan:
             out=accesses[buf_id(out)],
             out_buf_id=buf_id(out),
             reduce_dims=reduce_dims,
+            attrs=op_attrs,
             # An internal buffer never reaches memory: it is threaded as a value,
             # so it gets no store, no func parameter, no view and no address.
             store=not is_internal(out),
@@ -1148,12 +1161,26 @@ class Family(enum.Enum):
 
     ELEMENTWISE = enum.auto()
     REDUCTION = enum.auto()
+    OPAQUE = enum.auto()
 
     @classmethod
     def of(cls, spec: OpSpec) -> Family:
-        """The family ``spec`` asks for, read from the spec rather than the op
-        name: the same binding can be wanted in more than one shape."""
-        return cls.REDUCTION if spec.is_reduction else cls.ELEMENTWISE
+        """The family ``spec`` asks for.
+
+        The reduction-vs-pointwise choice is the spec's, read from
+        ``is_reduction`` rather than the op name: the same binding (``arith.addf``)
+        is a pointwise ``add`` or the combiner of a ``sum``.  Within the pointwise
+        shapes, ELEMENTWISE (a ``linalg`` named op) vs OPAQUE (a ``linalg.generic``
+        whose body is a single ``spyreop`` scalar intrinsic) is instead a property
+        of the op -- ``sqrt`` is never anything but opaque -- so it is read from
+        the recipe.
+        """
+        if spec.is_reduction:
+            return cls.REDUCTION
+        recipe = KtirBuilder.RECIPES.get(spec.op)
+        if recipe is not None and recipe.family is cls.OPAQUE:
+            return cls.OPAQUE
+        return cls.ELEMENTWISE
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1161,6 +1188,10 @@ class Recipe:
     arity: int
     family: Family
     binding: Callable[[], Any]
+    # How to read the op's scalar attributes from a spec's ``op_info``, for the
+    # few ops whose builder takes more than operands (softplus).  ``None`` when
+    # the op is a pure function of its operands, which is almost all of them.
+    attrs: Callable[[dict[str, Any]], dict[str, float]] | None = None
 
     def __post_init__(self) -> None:
         if self.arity < 1:
@@ -1552,6 +1583,37 @@ class KtirBuilder:
         "add": Recipe(arity=2, family=Family.ELEMENTWISE, binding=lambda: linalg.add),
         "mul": Recipe(arity=2, family=Family.ELEMENTWISE, binding=lambda: linalg.mul),
         "sum": Recipe(arity=1, family=Family.REDUCTION, binding=lambda: arith.addf),
+        # Opaque unary ops: each maps directly to one ``spyreop`` scalar
+        # intrinsic, emitted as the body of a ``linalg.generic`` (see ``opaque``).
+        # The intrinsic owns its own f16->f32->approx->f16, so there is no fp32
+        # bracket.  Only the unary ``spyreop`` float ops live here; the
+        # pointwise-handler name is the key, the ``spyreop`` op the binding (they
+        # differ for ``gelufwd`` -> ``spyreop.gelu``).  ``softplus`` also carries
+        # two scalar attributes, read from its ``op_info`` by ``attrs``.  Binary
+        # ops (realdiv) do not fit this unary shape yet, and ops with no
+        # ``spyreop`` equivalent (log, rsqrt, tanh, erf, silu, relufwd) are not
+        # supported on this path.
+        "exp": Recipe(arity=1, family=Family.OPAQUE, binding=lambda: spyreop.exp),
+        "sqrt": Recipe(arity=1, family=Family.OPAQUE, binding=lambda: spyreop.sqrt),
+        "sigmoid": Recipe(
+            arity=1, family=Family.OPAQUE, binding=lambda: spyreop.sigmoid
+        ),
+        "reciprocal": Recipe(
+            arity=1, family=Family.OPAQUE, binding=lambda: spyreop.reciprocal
+        ),
+        "gelufwd": Recipe(arity=1, family=Family.OPAQUE, binding=lambda: spyreop.gelu),
+        "layernormscale": Recipe(
+            arity=1, family=Family.OPAQUE, binding=lambda: spyreop.layernormscale
+        ),
+        "softplus": Recipe(
+            arity=1,
+            family=Family.OPAQUE,
+            binding=lambda: spyreop.softplus,
+            attrs=lambda info: {
+                "beta": float(info["constants"]["softplusBeta"]),
+                "threshold": float(info["constants"]["softplusThresh"]),
+            },
+        ),
     }
 
     def elementwise(self, recipe: Recipe, ins: Sequence, step: ComputeStep):
@@ -1571,6 +1633,50 @@ class KtirBuilder:
             outs=[dest],
             result_tensors=[ir.RankedTensorType.get(extents, elt_t)],
         )
+
+    def opaque(self, recipe: Recipe, ins: Sequence, step: ComputeStep):
+        """A unary ``spyreop`` scalar intrinsic as a ``linalg.generic`` body.
+
+        The op maps to one ``spyreop`` intrinsic (``recipe.binding()``), emitted
+        as the single-op body of an all-parallel ``linalg.generic`` over the
+        result tile: identity ``indexing_maps`` and ``"parallel"`` iterators, so
+        the generic walks every element once and the body computes one output
+        from one input.  The intrinsic owns its own f16->f32->approx->f16, so
+        there is no fp32 precision bracket (dataflow-scheduler#36); the operand,
+        the body value and the result all share the result tile's element type
+        and extents.
+
+        Any scalar attributes the intrinsic takes beyond its operand
+        (softplus's ``beta``/``threshold``) ride on ``step.attrs``, read from the
+        spec's ``op_info`` when the step was planned, and are passed through as
+        keyword arguments to the builder.
+
+        The destination is an uninitialised ``tensor.empty``, valid because the
+        generic writes every element of it (the mirror of ``elementwise``).
+        """
+        [source] = ins
+        extents = list(step.out.extent)
+        elt_t = self.named_type(step.out.elems.value)
+        dest = self.val(tensor.EmptyOp(extents, elt_t))
+        identity = ir.AffineMap.get_identity(len(extents))
+        intrinsic = recipe.binding()
+        attrs = dict(step.attrs)
+
+        # ``linalg.generic`` is a region op: the decorated function's return is
+        # yielded as the body terminator, and the block arguments (one per input,
+        # one per output; ``out`` is the unwritten accumulator) arrive
+        # positionally.  The decorator evaluates here and binds the op's single
+        # result value to ``body``.
+        @linalg.generic(
+            inputs=[source],
+            outputs=[dest],
+            indexing_maps=[identity, identity],
+            iterator_types=["parallel"] * len(extents),
+        )
+        def body(in_, out_):
+            return intrinsic(in_, **attrs)
+
+        return body
 
     def reduction(self, recipe: Recipe, ins: Sequence, step: ComputeStep):
         """``linalg.reduce`` over ``step.reduce_dims``, combining with ``recipe``.

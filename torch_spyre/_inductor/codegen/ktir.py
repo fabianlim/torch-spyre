@@ -1440,10 +1440,16 @@ class KtirBuilder:
         sizes = [int(e) for e in buffer.layout.extent]
         strides = [int(s) for s in buffer.layout.strides]
         memref_t = ir.MemRefType.get(sizes, self.named_type(buffer.elems.storage))
-        # No Python builder is exposed for the ``spyre_memory_space`` enum
-        # attribute (only the ktdp *types* have getters), so this small enum
-        # literal is the one unavoidable textual attribute.
-        memory_space = ir.Attribute.parse(f"#ktdp.spyre_memory_space<{buffer.space}>")
+        # The dialect names memory spaces in its own data-parallel vocabulary:
+        # ``global`` (visible to every compute tile) and ``ct_local`` (one
+        # tile's scratchpad).  This emitter only builds HBM views today (LX /
+        # hbm_pool are rejected in ``_buffer``), which are ``global``.  No
+        # Python builder is exposed for the enum attribute (only the ktdp
+        # *types* have getters), so this small enum literal is textual; the
+        # mapping raises loudly if a space it does not translate ever reaches
+        # here.
+        kind = {"HBM": "global"}[buffer.space]
+        memory_space = ir.Attribute.parse(f"#ktdp.memory_space<{kind}>")
         return self.val(
             ktdp.construct_memory_view(
                 result=memref_t,

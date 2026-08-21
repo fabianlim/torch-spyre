@@ -1440,10 +1440,22 @@ class KtirBuilder:
         sizes = [int(e) for e in buffer.layout.extent]
         strides = [int(s) for s in buffer.layout.strides]
         memref_t = ir.MemRefType.get(sizes, self.named_type(buffer.elems.storage))
-        # No Python builder is exposed for the ``spyre_memory_space`` enum
-        # attribute (only the ktdp *types* have getters), so this small enum
-        # literal is the one unavoidable textual attribute.
-        memory_space = ir.Attribute.parse(f"#ktdp.spyre_memory_space<{buffer.space}>")
+        # ``memory_space`` was the last attribute built as text, because no
+        # builder was exposed for it; ktir-mlir-frontend#61 adds one, so it now
+        # goes through the same verifier-checked API as everything else and a
+        # rename breaks type checking rather than failing at runtime.
+        #
+        # The builder takes the tablegen-generated ``MemorySpaceKind``, not a
+        # spelling, so the mapping names enum members.  ``global_`` carries the
+        # trailing underscore mlir-tblgen adds to escape the Python keyword.
+        # Keyed lookup rather than a fallback, so a space this mapping has not
+        # been taught fails loudly instead of emitting an attribute the backend
+        # cannot read.
+        kind = {
+            "HBM": ktdp.MemorySpaceKind.global_,
+            "LX": ktdp.MemorySpaceKind.ct_local,
+        }[buffer.space]
+        memory_space = ktdp.MemorySpaceAttr.get(kind)
         return self.val(
             ktdp.construct_memory_view(
                 result=memref_t,

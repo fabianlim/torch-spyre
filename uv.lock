@@ -227,7 +227,7 @@ wheels = [
 [[package]]
 name = "ktir-mlir-frontend"
 version = "0.1.0"
-source = { git = "https://github.com/torch-spyre/ktir-mlir-frontend.git?rev=05e7a0ff814ebefb6e78450b1ec0e871c488c8bc#05e7a0ff814ebefb6e78450b1ec0e871c488c8bc" }
+source = { git = "https://github.com/torch-spyre/ktir-mlir-frontend.git?rev=91455932139b219653f2396b0861b7aaf1961d6b#91455932139b219653f2396b0861b7aaf1961d6b" }
 dependencies = [
     { name = "nanobind", marker = "python_full_version >= '3.12'" },
 ]
@@ -1381,7 +1381,7 @@ requires-dist = [
 provides-extras = ["cpsat", "build", "test", "lint"]
 
 [package.metadata.requires-dev]
-ktir = [{ name = "ktir-mlir-frontend", marker = "python_full_version >= '3.12'", git = "https://github.com/torch-spyre/ktir-mlir-frontend.git?rev=05e7a0ff814ebefb6e78450b1ec0e871c488c8bc" }]
+ktir = [{ name = "ktir-mlir-frontend", marker = "python_full_version >= '3.12'", git = "https://github.com/torch-spyre/ktir-mlir-frontend.git?rev=91455932139b219653f2396b0861b7aaf1961d6b" }]
 
 [[package]]
 name = "types-pyyaml"

@@ -1561,42 +1561,87 @@ class KtirBuilder:
     }
 
     def elementwise(self, recipe: Recipe, ins: Sequence, step: ComputeStep):
-        """Apply ``recipe``'s builder to ``ins``, shaped by the result's tile.
+        """The named linalg op ``recipe`` names, applied to ``ins``.
 
-        Returns the result value; what becomes of it is the caller's decision.
-        Every operand and the result share the result tile's extents.
+        An elementwise op is one op in the dialect already, so the recipe's
+        builder *is* the emission and the surface is the bare call -- nothing
+        about the shape is this family's to choose.
+        """
+        return self._emit_bare(recipe.binding(), ins, step)
 
-        The destination is an uninitialised ``tensor.empty``, valid because an
-        elementwise op writes every element of it.
+    def reduction(self, recipe: Recipe, ins: Sequence, step: ComputeStep):
+        """``linalg.reduce`` over ``step.reduce_dims``, combining with ``recipe``.
+
+        The recipe contributes the *combiner* rather than a whole-op builder
+        (``arith.addf`` for a sum), because ``linalg.reduce`` is one op for every
+        reduction and the payload is what differs between them.  Reducing over
+        whole axes of the result tile is exactly the shape ``linalg.reduce``
+        expresses, so that is the surface this family selects.
+        """
+        return self._emit_reduce(recipe.binding(), ins, step)
+
+    # -- emission surfaces -------------------------------------------------
+    #
+    # One method per *surface form*: the shape of the op that carries a family's
+    # payload.  A family method picks a surface and supplies the payload; the
+    # surface owns the destination and the operand/result typing, so the shape is
+    # written once however many families reach for it.
+    #
+    # Two surfaces cover the ops here, and the split is worth making anyway
+    # because the next reduction shape can reuse neither.  ``linalg.reduce``
+    # derives its indexing maps as the identity with the reduced dimensions
+    # dropped, so it says only rank-reducing, identity-indexed reductions.  A
+    # reduction over the stick axis is not one -- it reduces the lane axis on the
+    # way in and keeps it on the way out -- so it needs a ``linalg.generic`` whose
+    # maps say that.  That is a third surface, and it arrives with its first
+    # caller rather than ahead of it.
+    #
+    # Every surface writes its result into an uninitialised ``tensor.empty``: on
+    # this path the destination is a pure destination -- the op writes every
+    # element of it, or (a reduction) leaves materialising the identity to the
+    # scheduler's reduction passes, for which a ``linalg.fill`` here would be a
+    # second compute op to unpick.
+
+    def _destination(self, step: ComputeStep):
+        """``(extents, elt_t, dest)`` for ``step``'s result: what every surface needs.
+
+        Emits the ``tensor.empty``, so a surface calls this once and first --
+        before the op that writes into it, which is the order the module reads
+        in.  Shared rather than repeated because the surfaces agree on it
+        exactly, and one that disagreed would be describing a different
+        destination, not a different shape.
         """
         extents = list(step.out.extent)
         elt_t = self.named_type(step.out.elems.value)
-        dest = self.val(tensor.EmptyOp(extents, elt_t))
-        return recipe.binding()(
+        return extents, elt_t, self.val(tensor.EmptyOp(extents, elt_t))
+
+    def _emit_bare(self, build: Callable, ins: Sequence, step: ComputeStep):
+        """``build`` called directly, shaped by the result tile.
+
+        The surface for an op the dialect already names: no region to fill and no
+        maps to state, because the named op's own definition says how its
+        operands are indexed.  Every operand and the result share the result
+        tile's extents, which is what makes the call legal without them.
+        """
+        extents, elt_t, dest = self._destination(step)
+        return build(
             *ins,
             outs=[dest],
             result_tensors=[ir.RankedTensorType.get(extents, elt_t)],
         )
 
-    def reduction(self, recipe: Recipe, ins: Sequence, step: ComputeStep):
-        """``linalg.reduce`` over ``step.reduce_dims``, combining with ``recipe``.
+    def _emit_reduce(self, combine: Callable, ins: Sequence, step: ComputeStep):
+        """``linalg.reduce`` over ``step.reduce_dims``, folding with ``combine``.
 
-        The recipe contributes the *combiner* here rather than a whole-op builder
-        (``arith.addf`` for a sum), because ``linalg.reduce`` is one op for every
-        reduction and the payload is what differs between them.
-
-        The accumulator is a bare ``tensor.empty``, not a filled one: the identity
-        belongs to whoever materialises the accumulator, and on this path that is
-        the scheduler's reduction passes -- a ``linalg.fill`` here becomes a second
-        compute op they have to unpick.  Reducing in place also means no reshape:
-        keeping the surviving axes in the output tile makes the result the shape
-        the store's access tile already has.
+        The surface for a reduction that drops whole axes: ``linalg.reduce``
+        indexes its operands for you and its region is fixed at two scalars, so
+        all it needs is the dimensions and a combiner -- there is no room for the
+        payload to be anything else, which is why it takes the two-argument
+        function and builds the region itself.  Reducing in place also means no
+        reshape: keeping the surviving axes in the output tile makes the result
+        the shape the store's access tile already has.
         """
-        [source] = ins
-        extents = list(step.out.extent)
-        elt_t = self.named_type(step.out.elems.value)
-        dest = self.val(tensor.EmptyOp(extents, elt_t))
-        combine = recipe.binding()
+        extents, elt_t, dest = self._destination(step)
 
         def body(accumulated, element):
             return combine(accumulated, element)
@@ -1607,7 +1652,7 @@ class KtirBuilder:
         body.__annotations__ = {"accumulated": elt_t, "element": elt_t}
         return linalg.reduce(
             result=[ir.RankedTensorType.get(extents, elt_t)],
-            inputs=[source],
+            inputs=list(ins),
             inits=[dest],
             dimensions=list(step.reduce_dims),
         )(body)

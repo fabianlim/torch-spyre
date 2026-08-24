@@ -264,7 +264,7 @@ class TestValidateRejections(unittest.TestCase):
         """An ``add`` asked for as a reduction: the recipe is what has an
         emission, so the request is refused rather than emitted elementwise."""
         specs = [make_op_spec(is_reduction=True)]
-        self._rejects(specs, "registered as ELEMENTWISE")
+        self._rejects(specs, "registered as NAMED")
 
     def test_unregistered_op_rejected(self):
         """An op with no recipe is rejected, and the message names what exists."""
@@ -530,38 +530,63 @@ class TestInternalBufferSignal(unittest.TestCase):
 
 
 class TestRecipes(unittest.TestCase):
-    """One recipe per op, and every recipe is emittable by some family method."""
+    """One recipe per op, and every surface the plan can pick has an arm."""
 
     def test_every_recipe_is_complete(self):
         self.assertTrue(ktir.KtirBuilder.RECIPES)
         for op, recipe in ktir.KtirBuilder.RECIPES.items():
             with self.subTest(op=op):
                 self.assertGreaterEqual(recipe.arity, 1)
-                self.assertIsInstance(recipe.family, ktir.Family)
+                self.assertIsInstance(recipe.kind, ktir.BindingKind)
                 # A thunk, not the builder itself: resolving it here would need
                 # the dialect, which this module deliberately does not require.
                 self.assertTrue(callable(recipe.binding))
-                # The family it declares must be one the builder can emit,
-                # otherwise the walk fails at emit time rather than here.
-                self.assertTrue(
-                    callable(
-                        getattr(ktir.KtirBuilder, recipe.family.name.lower(), None)
-                    ),
-                    f"KtirBuilder has no {recipe.family.name.lower()}() for {op!r}",
-                )
+
+        # Which surface a step gets is the plan's choice, not a recipe's, so
+        # completeness on this side is about ``compute`` rather than about any one
+        # op: every ``Surface`` must appear as a ``case`` pattern.  Read off the
+        # AST because ``case _:`` alone turns a missing arm into a runtime
+        # discovery, at which point a module is already half built.  Deliberately
+        # *not* the mirror assertion that every ``BindingKind`` is used by some
+        # recipe -- PAYLOAD is the registered-nowhere hook for ``spyreop``.
+        tree = ast.parse(inspect.getsource(ktir))
+        builder = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "KtirBuilder"
+        )
+        compute = next(
+            node
+            for node in builder.body
+            if isinstance(node, ast.FunctionDef) and node.name == "compute"
+        )
+        cased = {
+            node.pattern.value.attr
+            for node in ast.walk(compute)
+            if isinstance(node, ast.match_case)
+            and isinstance(node.pattern, ast.MatchValue)
+            and isinstance(node.pattern.value, ast.Attribute)
+        }
+        for surface in ktir.Surface:
+            self.assertIn(surface.name, cased, f"compute has no case for {surface}")
 
     def test_recipe_rejects_a_nonsense_arity(self):
         """A duplicate op name is ruff F601; arity is checked at construction."""
         with self.assertRaises(ValueError):
-            ktir.Recipe(arity=0, family=ktir.Family.ELEMENTWISE, binding=lambda: None)
+            ktir.Recipe(arity=0, kind=ktir.BindingKind.NAMED, binding=lambda: None)
 
-    def test_family_comes_from_the_spec_not_the_name(self):
-        """A reducing spec asks for REDUCTION even when the op is registered
-        elementwise -- which is why the plan walk rejects it rather than the walk
-        silently emitting the wrong shape."""
-        self.assertIs(ktir.Family.of(make_op_spec()), ktir.Family.ELEMENTWISE)
-        reducing = make_op_spec(is_reduction=True)
-        self.assertIs(ktir.Family.of(reducing), ktir.Family.REDUCTION)
+    def test_a_reduction_asked_for_elementwise_is_rejected(self):
+        """The other direction of the agreement check, and the dangerous one.
+
+        ``sum``'s binding is a two-operand combiner; with nothing labelled as
+        reduced it would be handed a single operand and fail *inside* emission,
+        with a half-built module in hand.  Refused by the plan instead.
+        """
+        specs = [make_op_spec("sum", inputs=1, is_reduction=False)]
+        with self.assertRaises(NotImplementedError) as ctx:
+            ktir.build_kernel_plan(specs)
+        self.assertIn("registered as COMBINER", str(ctx.exception))
+        self.assertIn("elementwise", str(ctx.exception))
 
     def test_emit_asserts_on_an_unplanned_step(self):
         """The emitter's only remaining ``raise`` is this plan-bug guard.
@@ -889,14 +914,7 @@ class TestEmissionCannotRefuse(unittest.TestCase):
         }
 
         seen: set[str] = set()
-        # ``compute`` reaches a family's method by name (``Family.ELEMENTWISE`` ->
-        # ``elementwise``), which no call-graph walk can follow, so every family
-        # method is a root here: a new family cannot escape this check by being
-        # dispatched dynamically.
-        families = [family.name.lower() for family in ktir.Family]
-        for family in families:
-            self.assertIn(family, methods, f"KtirBuilder has no {family}()")
-        pending = ["emit", *families]
+        pending = ["emit"]
         raised: list[tuple[str, str]] = []
         while pending:
             name = pending.pop()

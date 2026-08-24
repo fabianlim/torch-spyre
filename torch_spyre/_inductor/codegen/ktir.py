@@ -61,6 +61,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, NoReturn
 from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor.codegen.compute_ops import num_bytes
 from torch_spyre._inductor.codegen.opspec_utils import (
+    PARALLEL,
     REDUCTION,
     align_reshape_plan,
     buf_id,
@@ -326,6 +327,31 @@ class Surface(enum.Enum):
 
 
 @dataclasses.dataclass(frozen=True)
+class Indexing:
+    """What a ``linalg.generic`` must state, and nothing else.
+
+    ``maps`` is the inputs in operand order and then the result last -- the order
+    ``indexing_maps`` itself takes.  Each row is one iteration-dim index per
+    result position, i.e. a *projection*: ``(0, 1, 2)`` against a rank-4 nest is
+    ``(d0, d1, d2, d3) -> (d0, d1, d2)``.  Ints and strings rather than
+    ``ir.AffineMap`` and iterator attributes, so the record stays dialect-free
+    like every other one; ``KtirBuilder._affine_map`` is what turns a row into a
+    map, the way ``access_tile`` already turns a rank into an identity.
+
+    No ``extents`` field: ``linalg.generic`` infers its loop bounds from the
+    operand shapes and the maps, so nothing would read one.
+
+    A row is a bare dim index per position, which is every map in scope and not
+    every map there is: a *linearised* map such as
+    ``(d0, d1, d2, d3, d4) -> (d0, d2 * 64 + d3, d4)`` needs (coefficient, dim)
+    terms, so nothing here generalises to one for free.
+    """
+
+    iters: tuple[str, ...]  # PARALLEL | REDUCTION, one per iteration dim
+    maps: tuple[tuple[int, ...], ...]  # [operand][result position] -> dim
+
+
+@dataclasses.dataclass(frozen=True)
 class ComputeStep:
     """One compute op: what to read, what to apply, what to do with the result.
 
@@ -338,6 +364,11 @@ class ComputeStep:
     input tile's own axes -- which is what ``dimensions=`` means -- because
     ``REDUCE`` is chosen exactly when the input map is the full identity; on a
     ``GENERIC`` step they do not, and the maps are what say so.
+
+    ``indexing`` is carried on a ``GENERIC`` step and on no other, because it is
+    read by one surface: a named op defines its own indexing and ``linalg.reduce``
+    derives its maps from ``dimensions=``, so a per-operand map record on every
+    step would be built three times and read once.
     """
 
     op: str  # a KtirBuilder.RECIPES key
@@ -347,6 +378,7 @@ class ComputeStep:
     out_buf_id: str
     store: bool
     reduce_dims: tuple[int, ...] = ()
+    indexing: Indexing | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -689,6 +721,36 @@ def _reduce_surface(
     )
 
 
+def _parallel_surface(
+    recipe: Recipe, operands: int, rank: int
+) -> tuple[Surface, Indexing | None]:
+    """Which shape carries a non-reducing payload, and what it has to state.
+
+    Nothing is *derived* here and nothing needs to be: the pointwise arm's
+    alignment refusal has already established that every operand's coordinates
+    and extents equal the output's, which is precisely the identity condition, so
+    the maps are known rather than read off the coordinates.  Deriving them
+    instead would make the emitted form of ``add`` hostage to the dim-reuse rule
+    ``reduction_indexing`` needs -- a coordinate list that repeated a
+    classification would yield a non-identity map and silently turn a
+    ``linalg.add`` into a ``linalg.generic``.
+
+    So the choice is only about spelling, and it follows from the binding: a
+    ``NAMED`` builder is an op the dialect already has, which says its own
+    indexing and needs no record, while anything else has to state the identity
+    maps and the all-parallel iterators itself -- which only a generic can do.
+    That second arm is where a ``spyreop`` intrinsic hooks in; no recipe selects
+    it yet.
+    """
+    if recipe.kind is BindingKind.NAMED:
+        return Surface.BARE, None
+    identity = tuple(range(rank))
+    return Surface.GENERIC, Indexing(
+        iters=(PARALLEL,) * rank,
+        maps=(identity,) * (operands + 1),
+    )
+
+
 def _access(
     arg: TensorArg,
     extent: Sequence[Any],
@@ -1028,6 +1090,7 @@ class KernelPlan:
                     "OpSpec->KTIR: in-place ops (input aliases output) not supported"
                 )
         reduce_dims: tuple[int, ...] = ()
+        indexing: Indexing | None = None
         args = list(spec.args)
         if spec.is_reduction:
             # What iteration nest a reduction wants is a fact about its operands'
@@ -1059,15 +1122,13 @@ class KernelPlan:
             reduce_dims = tuple(
                 dim for dim, iterator in enumerate(iters) if iterator == REDUCTION
             )
+            if surface is Surface.GENERIC:
+                # The one nest ``dimensions=`` cannot state, so the maps have to
+                # travel with the step: the input covers three of four dims and
+                # the lane axis is reduced on the way in and kept on the way out.
+                indexing = Indexing(iters=iters, maps=(in_map, out_map))
         else:
-            # Non-reducing does not mean bare: it means the maps are the identity
-            # and every iterator is parallel, and *which* shape says that depends
-            # on whether a named linalg op exists for the payload.  A NAMED
-            # binding is one op in the dialect already; anything else has to state
-            # the identity maps itself, which only a generic can do.
-            surface = (
-                Surface.BARE if recipe.kind is BindingKind.NAMED else Surface.GENERIC
-            )
+            surface, indexing = _parallel_surface(recipe, len(inputs), len(out_extents))
             for arg in inputs:
                 # Reject broadcast / transpose operands: only operands whose
                 # device axes already match the output tile exactly are supported.
@@ -1107,6 +1168,7 @@ class KernelPlan:
             out=accesses[buf_id(out)],
             out_buf_id=buf_id(out),
             reduce_dims=reduce_dims,
+            indexing=indexing,
             # An internal buffer never reaches memory: it is threaded as a value,
             # so it gets no store, no func parameter, no view and no address.
             store=not is_internal(out),
@@ -1375,6 +1437,20 @@ class KtirBuilder:
         """A fresh ``arith.constant <value> : index``."""
         return self.val(arith.ConstantOp(self.index_t, int(value)))
 
+    @staticmethod
+    def _affine_map(rank: int, row: Sequence[int]):
+        """One ``Indexing`` row as a projection of a ``rank``-dim iteration nest.
+
+        ``(0, 1, 2)`` of rank 4 is ``(d0, d1, d2, d3) -> (d0, d1, d2)``: the row is
+        one dim index per result position, so the map has ``rank`` dims, no
+        symbols, and one expression per entry.  Returns the map itself and not an
+        ``ir.AffineMapAttr`` -- ``indexing_maps`` takes maps, and an attribute
+        raises there.
+        """
+        return ir.AffineMap.get(
+            rank, 0, [ir.AffineExpr.get_dim(int(dim)) for dim in row]
+        )
+
     # -- module scaffolding ------------------------------------------------
 
     @contextlib.contextmanager
@@ -1517,15 +1593,7 @@ class KtirBuilder:
             case Surface.REDUCE:
                 value = self._emit_reduce(recipe.binding(), ins, step)
             case Surface.GENERIC:
-                # The plan can select this for a PAYLOAD binding or an on-stick
-                # reduction, and no recipe is a PAYLOAD yet; a ``linalg.generic``
-                # needs the per-operand maps stated, which no step carries, so
-                # reaching here says the plan selected a shape this builder has no
-                # record to build.
-                raise AssertionError(
-                    f"no generic emission for {step.op!r}: a generic states its "
-                    "own indexing maps and this step carries none"
-                )
+                value = self._emit_generic(recipe.binding(), ins, step)
             case _:
                 raise AssertionError(f"unplanned surface {step.surface} of {step.op!r}")
         self.result(step.out_buf_id, step.out if step.store else None, value)
@@ -1733,6 +1801,38 @@ class KtirBuilder:
             inputs=list(ins),
             inits=[dest],
             dimensions=list(step.reduce_dims),
+        )(body)
+
+    def _emit_generic(self, payload: Callable, ins: Sequence, step: ComputeStep):
+        """``linalg.generic`` stating the plan's maps and iterators.
+
+        The surface for a nest nothing else can spell.  Two callers reach it and
+        one body serves both: the block arguments are one per input and then the
+        ``outs`` accumulator, which a reducing nest folds into and a parallel one
+        drops -- so the arity works out either way (one input plus an accumulator,
+        or two inputs with the accumulator dropped, both two arguments).
+
+        Only ``dest`` is taken from ``_destination``: a generic's result type comes
+        from its ``outs`` operand rather than being stated, and unlike
+        ``_emit_reduce`` the region's block argument types are appended by the
+        builder off the operand element types, so there is no annotation to set.
+        """
+        indexing = step.indexing
+        # Every GENERIC step carries one (the plan's field invariant); reaching
+        # here without it is a plan bug, not an unsupported request.
+        assert indexing is not None, f"generic {step.op!r} with no indexing record"
+        _extents, _elt_t, dest = self._destination(step)
+        rank = len(indexing.iters)
+        reducing = bool(step.reduce_dims)
+
+        def body(*args):
+            return payload(*(args if reducing else args[:-1]))
+
+        return linalg.generic(
+            inputs=list(ins),
+            outputs=[dest],
+            indexing_maps=[self._affine_map(rank, row) for row in indexing.maps],
+            iterator_types=list(indexing.iters),
         )(body)
 
     # -- attributes --------------------------------------------------------

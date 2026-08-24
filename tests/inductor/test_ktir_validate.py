@@ -600,6 +600,96 @@ class TestRecipes(unittest.TestCase):
             ktir.KtirBuilder.emit(None, [UnimplementedOp(op="atan2")])
 
 
+class TestReduceSurface(unittest.TestCase):
+    """Which of the two reduction shapes a loop nest can be emitted as.
+
+    ``linalg.reduce`` is the compact spelling: hand it the dimensions to fold
+    away and it works out the rest itself.  The price is that it can only say a
+    reduction that reads its input with one loop per input dimension and leaves
+    the surviving dimensions where they were.  Anything else has to be a
+    ``linalg.generic``, which spells the correspondence out in full.  These tests
+    go straight at that rule -- no spec is involved.
+    """
+
+    def test_a_plain_reduction_can_be_a_linalg_reduce(self):
+        """Fold away the middle dimension of three, keep the other two in order."""
+        self.assertIs(
+            ktir._reduce_surface(
+                ("parallel", "reduction", "parallel"), (0, 1, 2), (0, 2)
+            ),
+            ktir.Surface.REDUCE,
+        )
+
+    def test_a_reduction_over_the_stick_cannot_be_a_linalg_reduce(self):
+        """The on-stick sum, and the reason it is worth a test of its own.
+
+        Judged on its output alone, ``(1, 3)`` reads as "keep dimensions 1 and 3
+        of four, fold away 0 and 2" -- which ``linalg.reduce`` says perfectly
+        well.  What it cannot say is the input side: three input dimensions
+        addressed by a loop nest of four, because the 64 lanes are read as one
+        dimension and written as a different one.  ``linalg.reduce`` always reads
+        its input with exactly one loop per input dimension.
+
+        So if this rule is ever relaxed to look only at the output, this is the
+        test that fails -- and without it the emitter would quietly build a
+        two-dimensional ``linalg.reduce`` that sums the wrong elements.
+        """
+        iters = ("reduction", "parallel", "reduction", "parallel")
+        self.assertEqual(
+            tuple(d for d, it in enumerate(iters) if it == "reduction"), (0, 2)
+        )
+        self.assertIs(
+            ktir._reduce_surface(iters, (0, 1, 2), (1, 3)), ktir.Surface.GENERIC
+        )
+
+    def test_a_reduction_that_also_reorders_cannot_be_a_linalg_reduce(self):
+        """It folds dimensions away; it never moves the ones that survive.
+
+        Here the two survivors come out swapped, which the compact spelling has
+        no way to express.
+        """
+        self.assertIs(
+            ktir._reduce_surface(
+                ("parallel", "reduction", "parallel"), (0, 1, 2), (2, 0)
+            ),
+            ktir.Surface.GENERIC,
+        )
+
+
+class TestOnlyAReductionOutputIsSqueezed(unittest.TestCase):
+    """A pointwise op keeps a size-1 output dimension; only a reduction drops one.
+
+    Dropping a size-1 dimension is safe when a reduction left it behind, because
+    nothing was ever written along it.  It is not safe in general, and this spec
+    is the counterexample: an ``add`` whose operands and output all carry the
+    same size-1 dimension.  It compiles today, and it works precisely *because*
+    all three agree on it.  Drop it from the output alone and ``linalg.add``
+    would be handed a two-dimensional result against three-dimensional operands,
+    which fails when the module is verified -- inside emission, the one place
+    nothing is allowed to fail.
+
+    So the drop happens only for a reduction, and this test is the reason.
+    """
+
+    @staticmethod
+    def _size_one_add():
+        rows = sympy.Symbol("c1")
+        return [
+            make_op_spec(
+                size=[1, 256, 64],
+                coords=[sympy.Integer(0), rows, sympy.Mod(rows, 64)],
+            )
+        ]
+
+    def test_a_size_one_dimension_is_kept_when_nothing_is_reduced(self):
+        plan = ktir.build_kernel_plan(self._size_one_add())
+        [step] = plan.steps
+        self.assertIs(step.surface, ktir.Surface.BARE)
+        self.assertEqual(step.out.extent, (1, 256, 64))
+        for _buf_id, access in step.ins:
+            self.assertEqual(access.extent, (1, 256, 64))
+
+
 def _tiled_reduction_specs() -> tuple:
     """The loop-nest shape of a hand-written 1-core KTIR ``sum`` kernel.
 

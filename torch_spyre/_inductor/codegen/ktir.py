@@ -61,11 +61,13 @@ from typing import TYPE_CHECKING, Any, ClassVar, NoReturn
 from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor.codegen.compute_ops import num_bytes
 from torch_spyre._inductor.codegen.opspec_utils import (
+    REDUCTION,
     align_reshape_plan,
     buf_id,
     core_divisions,
     per_core_extent,
-    reduced_axes,
+    placeholder_axes,
+    reduction_indexing,
     row_major_strides,
 )
 from torch_spyre._inductor.constants import STAGGERED_EAS
@@ -329,8 +331,13 @@ class ComputeStep:
 
     ``ins`` is one ``(buf_id, Access)`` per operand, in the op's operand order.
     ``store`` is ``False`` for an internal result, which is bound in scope for a
-    later step instead of being stored through ``out``.  ``reduce_dims`` is the
-    input tile axes a reduction consumes, and empty for every other surface.
+    later step instead of being stored through ``out``.
+
+    ``reduce_dims`` is **the iteration dims whose iterator is ``REDUCTION``**, and
+    empty for every other surface.  On a ``REDUCE`` step those coincide with the
+    input tile's own axes -- which is what ``dimensions=`` means -- because
+    ``REDUCE`` is chosen exactly when the input map is the full identity; on a
+    ``GENERIC`` step they do not, and the maps are what say so.
     """
 
     op: str  # a KtirBuilder.RECIPES key
@@ -651,6 +658,34 @@ def _squeezed(arg: TensorArg, axes: Sequence[int]) -> TensorArg:
         arg,
         device_size=[arg.device_size[axis] for axis in keep],
         device_coordinates=[arg.device_coordinates[axis] for axis in keep],
+    )
+
+
+def _reduce_surface(
+    iters: Sequence[str], in_map: Sequence[int], out_map: Sequence[int]
+) -> Surface:
+    """Which shape says the nest ``reduction_indexing`` derived.
+
+    ``REDUCE`` iff the nest is what ``linalg.reduce`` *means*: an identity input
+    map of the full rank, and an output map that is the identity with the reduced
+    dims dropped.  ``mlir::linalg::ReduceOp`` derives its maps as
+    ``getMultiDimIdentityMap(rank).dropResults(dimensions)``, so nothing else is
+    expressible by ``dimensions=`` alone and everything else needs a generic.
+
+    Testing the *input* map is the load-bearing half.  An on-stick reduction's
+    output map is ``(1, 3)``, which *is* the identity of a rank-4 nest with
+    ``(0, 2)`` dropped -- so an output-only test would accept it and emit a rank-2
+    ``linalg.reduce`` over a rank-3 input, silently reducing the wrong elements.
+    What disqualifies it is that its input map covers 3 of 4 dims.
+    """
+    rank = len(iters)
+    reduced = {dim for dim, iterator in enumerate(iters) if iterator == REDUCTION}
+    identity = tuple(range(rank))
+    kept = tuple(dim for dim in identity if dim not in reduced)
+    return (
+        Surface.REDUCE
+        if tuple(in_map) == identity and tuple(out_map) == kept
+        else Surface.GENERIC
     )
 
 
@@ -995,28 +1030,35 @@ class KernelPlan:
         reduce_dims: tuple[int, ...] = ()
         args = list(spec.args)
         if spec.is_reduction:
-            # The agreement check has already established that a reducing spec
-            # carries a COMBINER recipe, which is the only kind that accumulates.
-            surface = Surface.REDUCE
-            # Which axes a reduction consumes is a fact about its operands, so it
-            # is derived here (once) and carried on the step, not re-derived from
-            # the op name at emit time.
+            # What iteration nest a reduction wants is a fact about its operands'
+            # coordinates, so it is derived here (once) and carried on the step,
+            # not re-derived from the op name at emit time.  Every reduction in
+            # scope is unary, which is why the derivation takes one input.
             [source] = inputs
-            reduce_dims, placeholder = reduced_axes(
-                source.device_coordinates,
-                [int(s) for s in source.device_size],
-                out.device_coordinates,
-                out_extents,
-            )
+            placeholder = placeholder_axes(out.device_coordinates, out_extents)
             if placeholder:
-                # The projection leaves each reduced axis in the output as a unit
-                # extent; the reduced tile does not have it at all.  Squeezing the
-                # arg here, once, is what keeps every derivation after this point
-                # unaware that a reduction is different: the output's view, tile
-                # and stored tensor are all the same (lower) rank.
+                # The projection leaves an axis the op does not write in the output
+                # as a unit extent; the reduced tile does not have it at all.
+                # Squeezing the arg here, once and before ``_access_of``, is what
+                # keeps every derivation after this point unaware that a reduction
+                # is different: the output's view, tile, per-core division and
+                # stored tensor are all the same (lower) rank.  It stays gated on
+                # ``is_reduction`` because an *accepted* pointwise spec can carry a
+                # unit constant axis on its inputs too, and squeezing only the
+                # output would hand ``linalg.add`` operands of two ranks.
                 squeezed = _squeezed(out, placeholder)
                 args = [squeezed if arg is out else arg for arg in args]
                 out = squeezed
+            iters, in_map, out_map = reduction_indexing(
+                source.device_coordinates,
+                [int(s) for s in source.device_size],
+                out.device_coordinates,
+                [int(s) for s in out.device_size],
+            )
+            surface = _reduce_surface(iters, in_map, out_map)
+            reduce_dims = tuple(
+                dim for dim, iterator in enumerate(iters) if iterator == REDUCTION
+            )
         else:
             # Non-reducing does not mean bare: it means the maps are the identity
             # and every iterator is parallel, and *which* shape says that depends

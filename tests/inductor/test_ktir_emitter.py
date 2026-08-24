@@ -361,6 +361,10 @@ module {
 
         plan = ktir.build_kernel_plan(self._sum_specs())
         [step] = plan.steps
+        # An identity input map with one dim dropped on the way out, which is the
+        # only nest ``dimensions=`` can state -- so the surface is what makes the
+        # reduced dim a bare axis list rather than a pair of maps.
+        self.assertIs(step.surface, ktir.Surface.REDUCE)
         self.assertEqual(step.reduce_dims, (1,))  # the 256 rows
         self.assertEqual(step.out.extent, (1, 64))
         self.assertEqual(plan.buffers["buf0"].layout.extent, (32, 64))

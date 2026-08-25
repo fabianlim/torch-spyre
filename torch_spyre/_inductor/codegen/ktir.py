@@ -81,14 +81,14 @@ from torch_spyre._inductor.pass_utils import coeff_through_floor
 # this module requires no dialect build.
 if TYPE_CHECKING:
     from mlir_ktdp import ir
-    from mlir_ktdp.dialects import arith, func, ktdp, linalg, scf, tensor
+    from mlir_ktdp.dialects import arith, func, ktdp, linalg, scf, spyreop, tensor
 else:
-    ir = arith = func = ktdp = linalg = scf = tensor = None
+    ir = arith = func = ktdp = linalg = scf = spyreop = tensor = None
 
 
 def _load_dialects() -> None:
     """Bind the dialect handles into this module, once.  The only import site."""
-    global ir, arith, func, ktdp, linalg, scf, tensor
+    global ir, arith, func, ktdp, linalg, scf, spyreop, tensor
     if ir is not None:
         return
     from mlir_ktdp import ir as _ir
@@ -97,15 +97,17 @@ def _load_dialects() -> None:
     from mlir_ktdp.dialects import ktdp as _ktdp
     from mlir_ktdp.dialects import linalg as _linalg
     from mlir_ktdp.dialects import scf as _scf
+    from mlir_ktdp.dialects import spyreop as _spyreop
     from mlir_ktdp.dialects import tensor as _tensor
 
-    ir, arith, func, ktdp, linalg, scf, tensor = (
+    ir, arith, func, ktdp, linalg, scf, spyreop, tensor = (
         _ir,
         _arith,
         _func,
         _ktdp,
         _linalg,
         _scf,
+        _spyreop,
         _tensor,
     )
 
@@ -369,6 +371,12 @@ class ComputeStep:
     read by one surface: a named op defines its own indexing and ``linalg.reduce``
     derives its maps from ``dimensions=``, so a per-operand map record on every
     step would be built three times and read once.
+
+    ``attrs`` are the scalar arguments the payload builder takes beyond its
+    operands -- softplus's ``beta``/``threshold`` -- as ``(name, value)`` pairs in
+    the order the builder is called with them.  A tuple rather than a dict so the
+    record stays hashable and frozen like every other field, and empty for every
+    op that is a pure function of its operands, which is almost all of them.
     """
 
     op: str  # a KtirBuilder.RECIPES key
@@ -379,6 +387,7 @@ class ComputeStep:
     store: bool
     reduce_dims: tuple[int, ...] = ()
     indexing: Indexing | None = None
+    attrs: tuple[tuple[str, float], ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -739,8 +748,8 @@ def _parallel_surface(
     ``NAMED`` builder is an op the dialect already has, which says its own
     indexing and needs no record, while anything else has to state the identity
     maps and the all-parallel iterators itself -- which only a generic can do.
-    That second arm is where a ``spyreop`` intrinsic hooks in; no recipe selects
-    it yet.
+    That second arm is where a ``spyreop`` intrinsic lands: it is a scalar builder,
+    so there is nothing to call it but a region.
     """
     if recipe.kind is BindingKind.NAMED:
         return Surface.BARE, None
@@ -1161,6 +1170,14 @@ class KernelPlan:
                     "same elements; dividing the within-stick axis or a reduced "
                     "axis (which needs a cross-core combine) reads like this"
                 )
+        # The scalar arguments the payload builder takes beyond its operands are
+        # read here, once, from the spec's ``op_info`` -- the same place-and-time
+        # discipline as ``reduce_dims`` and ``indexing`` -- so emission has nothing
+        # left to derive and a malformed ``op_info`` is refused by the plan rather
+        # than by a KeyError with a half-built module in hand.
+        attrs: tuple[tuple[str, float], ...] = ()
+        if recipe.attrs is not None:
+            attrs = tuple(recipe.attrs(spec.op_info).items())
         return ComputeStep(
             op=spec.op,
             surface=surface,
@@ -1169,6 +1186,7 @@ class KernelPlan:
             out_buf_id=buf_id(out),
             reduce_dims=reduce_dims,
             indexing=indexing,
+            attrs=attrs,
             # An internal buffer never reaches memory: it is threaded as a value,
             # so it gets no store, no func parameter, no view and no address.
             store=not is_internal(out),
@@ -1310,6 +1328,12 @@ class Recipe:
     arity: int
     kind: BindingKind
     binding: Callable[[], Any]
+    # How to read the op's scalar arguments out of a spec's ``op_info``, for the
+    # few ops whose builder takes more than operands (softplus).  ``None`` when
+    # the op is a pure function of its operands, which is almost all of them.
+    # A reader rather than the values themselves, because where they live in
+    # ``op_info`` is the op's own business and the plan should not have to know.
+    attrs: Callable[[dict[str, Any]], dict[str, float]] | None = None
 
     def __post_init__(self) -> None:
         if self.arity < 1:
@@ -1727,6 +1751,48 @@ class KtirBuilder:
         "add": Recipe(arity=2, kind=BindingKind.NAMED, binding=lambda: linalg.add),
         "mul": Recipe(arity=2, kind=BindingKind.NAMED, binding=lambda: linalg.mul),
         "sum": Recipe(arity=1, kind=BindingKind.COMBINER, binding=lambda: arith.addf),
+        # The unary float ops whose payload is one ``spyreop`` scalar intrinsic.
+        # There is no named linalg op behind any of them, so they are PAYLOADs and
+        # land on ``Surface.GENERIC``: the recipe contributes the intrinsic and the
+        # generic states the identity maps and the all-parallel iterators for it.
+        #
+        # The key is the pointwise-handler name the frontend already uses and the
+        # binding is the ``spyreop`` op, which is why they differ for ``gelufwd``
+        # -> ``spyreop.gelu``.  The intrinsic takes the tile's own f16 and owns its
+        # f16->f32->approx->f16 internally, so the body is the one op with no
+        # precision bracket around it (dataflow-scheduler#36).
+        #
+        # ``softplus`` is the one that takes more than its operand: ``attrs`` says
+        # where in ``op_info`` its two scalars live.
+        #
+        # Not here: ``spyreop.realdiv`` and the integer/address intrinsics
+        # (addi32toi32, addi64toi64, muli32toi32, idx32toaddr), which are not unary
+        # float ops and want operand rules of their own; and the pointwise ops the
+        # dialect has no intrinsic for at all (log, rsqrt, tanh, erf, silu,
+        # relufwd), which this path does not support.
+        "exp": Recipe(arity=1, kind=BindingKind.PAYLOAD, binding=lambda: spyreop.exp),
+        "sqrt": Recipe(arity=1, kind=BindingKind.PAYLOAD, binding=lambda: spyreop.sqrt),
+        "sigmoid": Recipe(
+            arity=1, kind=BindingKind.PAYLOAD, binding=lambda: spyreop.sigmoid
+        ),
+        "reciprocal": Recipe(
+            arity=1, kind=BindingKind.PAYLOAD, binding=lambda: spyreop.reciprocal
+        ),
+        "gelufwd": Recipe(
+            arity=1, kind=BindingKind.PAYLOAD, binding=lambda: spyreop.gelu
+        ),
+        "layernormscale": Recipe(
+            arity=1, kind=BindingKind.PAYLOAD, binding=lambda: spyreop.layernormscale
+        ),
+        "softplus": Recipe(
+            arity=1,
+            kind=BindingKind.PAYLOAD,
+            binding=lambda: spyreop.softplus,
+            attrs=lambda info: {
+                "beta": float(info["constants"]["softplusBeta"]),
+                "threshold": float(info["constants"]["softplusThresh"]),
+            },
+        ),
     }
 
     # -- emission surfaces -------------------------------------------------
@@ -1816,6 +1882,10 @@ class KtirBuilder:
         from its ``outs`` operand rather than being stated, and unlike
         ``_emit_reduce`` the region's block argument types are appended by the
         builder off the operand element types, so there is no annotation to set.
+
+        ``step.attrs`` are the payload's non-operand scalars, passed as keyword
+        arguments.  They were read from the spec's ``op_info`` when the step was
+        planned, so nothing here knows what an op's attributes mean.
         """
         indexing = step.indexing
         # Every GENERIC step carries one (the plan's field invariant); reaching
@@ -1824,9 +1894,10 @@ class KtirBuilder:
         _extents, _elt_t, dest = self._destination(step)
         rank = len(indexing.iters)
         reducing = bool(step.reduce_dims)
+        attrs = dict(step.attrs)
 
         def body(*args):
-            return payload(*(args if reducing else args[:-1]))
+            return payload(*(args if reducing else args[:-1]), **attrs)
 
         return linalg.generic(
             inputs=list(ins),

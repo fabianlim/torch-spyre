@@ -1750,6 +1750,7 @@ class KtirBuilder:
     RECIPES: ClassVar[dict[str, Recipe]] = {
         "add": Recipe(arity=2, kind=BindingKind.NAMED, binding=lambda: linalg.add),
         "mul": Recipe(arity=2, kind=BindingKind.NAMED, binding=lambda: linalg.mul),
+        "sub": Recipe(arity=2, kind=BindingKind.NAMED, binding=lambda: linalg.sub),
         "sum": Recipe(arity=1, kind=BindingKind.COMBINER, binding=lambda: arith.addf),
         # The unary float ops whose payload is one ``spyreop`` scalar intrinsic.
         # There is no named linalg op behind any of them, so they are PAYLOADs and
@@ -1765,11 +1766,9 @@ class KtirBuilder:
         # ``softplus`` is the one that takes more than its operand: ``attrs`` says
         # where in ``op_info`` its two scalars live.
         #
-        # Not here: ``spyreop.realdiv`` and the integer/address intrinsics
-        # (addi32toi32, addi64toi64, muli32toi32, idx32toaddr), which are not unary
-        # float ops and want operand rules of their own; and the pointwise ops the
-        # dialect has no intrinsic for at all (log, rsqrt, tanh, erf, silu,
-        # relufwd), which this path does not support.
+        # Not here: the integer/address intrinsics (addi32toi32, addi64toi64,
+        # muli32toi32, idx32toaddr) and other pointwise ops the device has no
+        # intrinsic for (log, tanh, erf, relufwd).
         "exp": Recipe(arity=1, kind=BindingKind.PAYLOAD, binding=lambda: spyreop.exp),
         "sqrt": Recipe(arity=1, kind=BindingKind.PAYLOAD, binding=lambda: spyreop.sqrt),
         "sigmoid": Recipe(
@@ -1792,6 +1791,13 @@ class KtirBuilder:
                 "beta": float(info["constants"]["softplusBeta"]),
                 "threshold": float(info["constants"]["softplusThresh"]),
             },
+        ),
+        "silu": Recipe(arity=1, kind=BindingKind.PAYLOAD, binding=lambda: spyreop.silu),
+        "rsqrt": Recipe(
+            arity=1, kind=BindingKind.PAYLOAD, binding=lambda: spyreop.rsqrt
+        ),
+        "realdiv": Recipe(
+            arity=2, kind=BindingKind.PAYLOAD, binding=lambda: spyreop.realdiv
         ),
     }
 

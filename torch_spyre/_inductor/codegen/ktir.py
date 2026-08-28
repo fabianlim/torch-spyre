@@ -167,9 +167,11 @@ class ElemTypes:
     ``storage`` types the memref (the view), ``value`` types the tensor a load
     produces or a store consumes.  KTDP compares neither against the other --
     ``LoadOp``/``StoreOp`` verify shapes only -- so they are two fields rather
-    than one, and today's derivation returns them equal.  Held as the *names* of
-    the ``mlir_ktdp.ir`` type builders, so the record stays dialect-free; the
-    builder's ``named_type`` is what resolves a name against the imported ``ir``.
+    than one, and today's derivation returns them equal.  Held as MLIR type
+    *spellings* (``f16``, ``i32``), so the record stays dialect-free; the
+    builder's ``named_type`` is what resolves a spelling against the imported
+    ``ir``.  Spellings rather than builder names so that every element type is
+    written the same way, whether or not its builder takes a width.
 
     ``NAMES`` is the supported-dtype table, and ``of`` the only way to get an
     ``ElemTypes`` from a device dtype -- so the names this record can hold, the
@@ -179,10 +181,11 @@ class ElemTypes:
     """
 
     NAMES: ClassVar[dict[DataFormats, str]] = {
-        DataFormats.IEEE_FP16: "F16Type",
-        DataFormats.SEN169_FP16: "F16Type",
-        DataFormats.IEEE_FP32: "F32Type",
-        DataFormats.BFLOAT16: "BF16Type",
+        DataFormats.IEEE_FP16: "f16",
+        DataFormats.SEN169_FP16: "f16",
+        DataFormats.IEEE_FP32: "f32",
+        DataFormats.BFLOAT16: "bf16",
+        DataFormats.IEEE_INT32: "i32",
     }
 
     storage: str
@@ -388,6 +391,26 @@ class ComputeStep:
     reduce_dims: tuple[int, ...] = ()
     indexing: Indexing | None = None
     attrs: tuple[tuple[str, float], ...] = ()
+    # Which of the two recipe tables the op name was resolved against.  Carried
+    # rather than re-derived at emit time, where the dtypes are no longer in
+    # reach: a step reads no spec.
+    i32: bool = False
+
+
+def is_i32(args: Sequence[TensorArg]) -> bool:
+    """Whether \\p args ask for the int32 arm of their op.
+
+    The one rule the four recipe lookups share: an op name alone cannot tell an
+    integer request from a float one -- both say ``add`` -- so the dtype does.
+    """
+    return any(arg.device_dtype == DataFormats.IEEE_INT32 for arg in args)
+
+
+def recipe_for(op: str, i32: bool) -> Recipe:
+    """The recipe \\p op resolves to, against the int32 table when \\p i32."""
+    if i32 and op in KtirBuilder.RECIPES_I32:
+        return KtirBuilder.RECIPES_I32[op]
+    return KtirBuilder.RECIPES[op]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1058,12 +1081,15 @@ class KernelPlan:
                 raise NotImplementedError(
                     f"OpSpec->KTIR: unexpected spec entry {type(entry).__name__}"
                 )
+            # An op whose integer form names a different intrinsic is looked up in
+            # the int32 table first; every other op, and every other dtype, comes
+            # from RECIPES.
             if entry.op not in KtirBuilder.RECIPES:
                 raise NotImplementedError(
                     f"OpSpec->KTIR: op {entry.op!r} is not supported yet "
                     f"(registered: {sorted(KtirBuilder.RECIPES)})"
                 )
-            recipe = KtirBuilder.RECIPES[entry.op]
+            recipe = recipe_for(entry.op, is_i32(entry.args))
             if (recipe.kind is BindingKind.COMBINER) != bool(entry.is_reduction):
                 # Two independent statements of one bit -- what the recipe's
                 # binding accumulates, and what the frontend labelled the request
@@ -1091,7 +1117,7 @@ class KernelPlan:
         """
         out, inputs = validated_roles(spec)
         out_extents = [int(s) for s in out.device_size]
-        recipe = KtirBuilder.RECIPES[spec.op]
+        recipe = recipe_for(spec.op, is_i32(spec.args))
         for arg in inputs:
             # In-place (input buffer aliases the output) is not supported yet.
             if buf_id(arg) == buf_id(out):
@@ -1187,6 +1213,7 @@ class KernelPlan:
             reduce_dims=reduce_dims,
             indexing=indexing,
             attrs=attrs,
+            i32=is_i32(spec.args),
             # An internal buffer never reaches memory: it is threaded as a value,
             # so it gets no store, no func parameter, no view and no address.
             store=not is_internal(out),
@@ -1277,7 +1304,7 @@ def validated_roles(spec: OpSpec) -> tuple[TensorArg, list[TensorArg]]:
         raise NotImplementedError(
             f"OpSpec->KTIR: expected exactly one output, got {len(outputs)}"
         )
-    arity = KtirBuilder.RECIPES[spec.op].arity
+    arity = recipe_for(spec.op, is_i32(spec.args)).arity
     if len(inputs) != arity:
         raise NotImplementedError(
             f"OpSpec->KTIR: {spec.op!r} expects {arity} inputs, got {len(inputs)}"
@@ -1454,8 +1481,15 @@ class KtirBuilder:
 
     @staticmethod
     def named_type(name: str):
-        """The ``ir`` type for one ``ElemTypes`` entry (a type-builder name)."""
-        return getattr(ir, name).get()
+        """The ``ir`` type for one ``ElemTypes`` entry (an MLIR type spelling).
+
+        Parsed rather than dispatched to a builder so that one spelling works for
+        every element type this emitter supports: the float builders take no
+        argument while ``IntegerType`` takes a width, so naming builders would
+        make the integer entries a second kind of name to be told apart by
+        inspecting the string.
+        """
+        return ir.Type.parse(name)
 
     def icst_index(self, value: int):
         """A fresh ``arith.constant <value> : index``."""
@@ -1609,7 +1643,7 @@ class KtirBuilder:
         (a method and an arm), and a test parses this ``match`` to catch the
         second one being forgotten.
         """
-        recipe = self.RECIPES[step.op]
+        recipe = recipe_for(step.op, step.i32)
         ins = [self.operand(buf_id, access) for buf_id, access in step.ins]
         match step.surface:
             case Surface.BARE:
@@ -1798,6 +1832,21 @@ class KtirBuilder:
         ),
         "realdiv": Recipe(
             arity=2, kind=BindingKind.PAYLOAD, binding=lambda: spyreop.realdiv
+        ),
+    }
+
+    # The int32 arms of ops that also have a float one.  ``add`` and ``mul`` name
+    # a different intrinsic at four-byte integers than the ``linalg`` op they
+    # reach at floats, and the op name alone cannot tell the two apart -- the
+    # request says ``add`` either way -- so the dtype picks the table.  Only ops
+    # whose integer form differs belong here; anything absent falls back to
+    # ``RECIPES``.
+    RECIPES_I32: ClassVar[dict[str, Recipe]] = {
+        "add": Recipe(
+            arity=2, kind=BindingKind.PAYLOAD, binding=lambda: spyreop.addi32toi32
+        ),
+        "mul": Recipe(
+            arity=2, kind=BindingKind.PAYLOAD, binding=lambda: spyreop.muli32toi32
         ),
     }
 

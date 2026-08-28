@@ -572,18 +572,28 @@ class TestRecipes(unittest.TestCase):
         for op, recipe in ktir.KtirBuilder.RECIPES.items():
             with self.subTest(op=op):
                 self.assertGreaterEqual(recipe.arity, 1)
-                self.assertIsInstance(recipe.kind, ktir.BindingKind)
-                # A thunk, not the builder itself: resolving it here would need
-                # the dialect, which this module deliberately does not require.
-                self.assertTrue(callable(recipe.binding))
+                self.assertTrue(recipe.arms)
                 # A reader, not the values: resolving one needs an ``op_info``.
                 self.assertTrue(recipe.attrs is None or callable(recipe.attrs))
+                for index, arm in enumerate(recipe.arms):
+                    with self.subTest(arm=index):
+                        self.assertIsInstance(arm.kind, ktir.BindingKind)
+                        # A thunk, not the builder itself: resolving it here would
+                        # need the dialect, which this module deliberately does
+                        # not require.
+                        self.assertTrue(callable(arm.binding))
+                # A one-armed op has to be reachable at every format, so that arm
+                # cannot list any: a lone arm claiming a format would make
+                # ``Recipe.arm`` refuse every other one.
+                if len(recipe.arms) == 1:
+                    self.assertEqual(recipe.arms[0].dtypes, ())
 
-        # Every kind is now registered by some recipe, so the mirror assertion is
+        # Every kind is now registered by some arm, so the mirror assertion is
         # worth making: PAYLOAD stopped being a hook nothing reaches when the
         # ``spyreop`` intrinsics landed on it.
         self.assertEqual(
-            {r.kind for r in ktir.KtirBuilder.RECIPES.values()}, set(ktir.BindingKind)
+            {arm.kind for r in ktir.KtirBuilder.RECIPES.values() for arm in r.arms},
+            set(ktir.BindingKind),
         )
 
         # Which surface a step gets is the plan's choice, not a recipe's, so
@@ -615,7 +625,122 @@ class TestRecipes(unittest.TestCase):
     def test_recipe_rejects_a_nonsense_arity(self):
         """A duplicate op name is ruff F601; arity is checked at construction."""
         with self.assertRaises(ValueError):
-            ktir.Recipe(arity=0, kind=ktir.BindingKind.NAMED, binding=lambda: None)
+            ktir.Recipe(arity=0, arms=self._arm())
+
+    def test_a_lone_arm_is_promoted_to_a_tuple(self):
+        """``arms=Arm(...)`` and ``arms=(Arm(...),)`` are the same recipe.
+
+        Asserted because the shorthand would otherwise be a second representation
+        of the field: anything reading ``recipe.arms`` directly must see a tuple
+        however the entry was written, or it iterates an ``Arm``'s attributes.
+        """
+        arm = self._arm()
+        self.assertEqual(ktir.Recipe(arity=1, arms=arm).arms, (arm,))
+        self.assertEqual(ktir.Recipe(arity=1, arms=(arm,)).arms, (arm,))
+        # And every registered entry has been normalised, whichever form it used.
+        for op, recipe in ktir.KtirBuilder.RECIPES.items():
+            with self.subTest(op=op):
+                self.assertIsInstance(recipe.arms, tuple)
+
+    @staticmethod
+    def _arm(*dtypes):
+        return ktir.Arm(
+            kind=ktir.BindingKind.NAMED, binding=lambda: None, dtypes=tuple(dtypes)
+        )
+
+    def test_recipe_rejects_an_ambiguous_arm_set(self):
+        """The two ways a format could resolve to more than one arm.
+
+        Both are refused where the table is written rather than at the lookup,
+        because a table that can be read two ways is wrong however it is read --
+        and ``Recipe.arm`` returning the first match would make which arm wins a
+        fact about declaration order.
+        """
+        with self.assertRaises(ValueError):
+            ktir.Recipe(arity=1, arms=())
+        with self.assertRaises(ValueError):
+            # Two arms claiming every unlisted format.
+            ktir.Recipe(arity=1, arms=(self._arm(), self._arm()))
+        with self.assertRaises(ValueError):
+            # Two arms claiming the same format.
+            ktir.Recipe(
+                arity=1,
+                arms=(
+                    self._arm(DataFormats.IEEE_INT32),
+                    self._arm(DataFormats.IEEE_INT32),
+                ),
+            )
+
+    def test_an_op_with_two_spellings_resolves_on_the_format(self):
+        """``add`` is a named linalg op at floats and a spyreop payload at int32.
+
+        The point of the arms: one entry per op, and the format picks the spelling.
+        Asserted on the recipe rather than through a plan so it holds without a
+        dialect build -- the bindings stay unresolved thunks.
+        """
+        recipe = ktir.KtirBuilder.RECIPES["add"]
+        self.assertIs(recipe.arm(DataFormats.SEN169_FP16).kind, ktir.BindingKind.NAMED)
+        self.assertIs(recipe.arm(DataFormats.IEEE_INT32).kind, ktir.BindingKind.PAYLOAD)
+        # Arity is the op's, not the arm's, so both spellings agree on it by
+        # construction rather than by two entries happening to match.
+        self.assertEqual(recipe.arity, 2)
+
+    def test_an_op_with_one_spelling_reaches_it_at_every_format(self):
+        """``sub`` has no integer intrinsic, so its one arm takes every format."""
+        recipe = ktir.KtirBuilder.RECIPES["sub"]
+        for dtype in (DataFormats.SEN169_FP16, DataFormats.IEEE_INT32, None):
+            with self.subTest(dtype=dtype):
+                self.assertIs(recipe.arm(dtype).kind, ktir.BindingKind.NAMED)
+
+    def test_the_format_reaches_the_step_and_picks_the_surface(self):
+        """An int32 ``add`` plans as a generic, and the step carries the format.
+
+        The whole path in one assertion: the spec's format picks the payload arm,
+        the payload arm picks ``Surface.GENERIC`` (a scalar builder needs a region),
+        and the format lands on the step so emission resolves the same arm without
+        seeing the spec.
+        """
+        spec = make_op_spec("add", dtype=DataFormats.IEEE_INT32)
+        [step] = ktir.build_kernel_plan([spec]).steps
+        self.assertIs(step.dtype, DataFormats.IEEE_INT32)
+        self.assertIs(step.surface, ktir.Surface.GENERIC)
+        # The same op at fp16 is the named linalg op, which states its own
+        # indexing and so needs no record.
+        [float_step] = ktir.build_kernel_plan([make_op_spec("add")]).steps
+        self.assertIs(float_step.surface, ktir.Surface.BARE)
+        self.assertIsNone(float_step.indexing)
+
+    def test_a_spec_that_mixes_formats_is_refused_by_the_plan(self):
+        """No arm resolves a mixed request, so the plan refuses to guess one.
+
+        Taking any single operand's format would emit an intrinsic for the wrong
+        type on the others, and the old ``any(... == INT32)`` rule did exactly that
+        for one int32 operand among floats.
+        """
+        spec = make_op_spec("add")
+        mixed = dataclasses.replace(
+            spec,
+            args=[
+                dataclasses.replace(spec.args[0], device_dtype=DataFormats.IEEE_INT32),
+                *spec.args[1:],
+            ],
+        )
+        with self.assertRaises(NotImplementedError) as ctx:
+            ktir.build_kernel_plan([mixed])
+        self.assertIn("mixes device formats", str(ctx.exception))
+
+    def test_a_format_no_arm_takes_is_refused(self):
+        """An op with only a claimed arm does not exist at any other format.
+
+        The membership question the two-table arrangement got wrong: an op is
+        supported at a format or it is not, and there is no second table to fall
+        back out of.
+        """
+        recipe = ktir.Recipe(arity=1, arms=(self._arm(DataFormats.IEEE_INT32),))
+        self.assertIs(recipe.arm(DataFormats.IEEE_INT32).kind, ktir.BindingKind.NAMED)
+        with self.assertRaises(NotImplementedError) as ctx:
+            recipe.arm(DataFormats.SEN169_FP16)
+        self.assertIn("no arm for", str(ctx.exception))
 
     def test_a_reduction_asked_for_elementwise_is_rejected(self):
         """The other direction of the agreement check, and the dangerous one.
@@ -794,7 +919,8 @@ class TestAPayloadWithNoNamedOpGetsAGeneric(unittest.TestCase):
         ):
             with self.subTest(op=op):
                 recipe = ktir.KtirBuilder.RECIPES[op]
-                self.assertIs(recipe.kind, ktir.BindingKind.PAYLOAD)
+                [arm] = recipe.arms
+                self.assertIs(arm.kind, ktir.BindingKind.PAYLOAD)
                 self.assertEqual(recipe.arity, 1)
 
     def test_the_identity_maps_are_stated_rather_than_implied(self):
@@ -830,7 +956,12 @@ class TestAPayloadWithNoNamedOpGetsAGeneric(unittest.TestCase):
         for op, recipe in ktir.KtirBuilder.RECIPES.items():
             # A reduction wants coordinates that actually reduce, which its own
             # fixtures own; the claim here is about the pointwise ops.
-            if recipe.attrs is not None or recipe.kind is ktir.BindingKind.COMBINER:
+            # ``arm(None)`` is the arm an unlisted format reaches, which is the one
+            # ``make_op_spec``'s fp16 args resolve to.
+            if (
+                recipe.attrs is not None
+                or recipe.arm(None).kind is ktir.BindingKind.COMBINER
+            ):
                 continue
             with self.subTest(op=op):
                 spec = make_op_spec(op, inputs=recipe.arity)

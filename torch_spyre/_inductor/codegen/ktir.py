@@ -83,14 +83,23 @@ from torch_spyre._inductor.pass_utils import coeff_through_floor
 # this module requires no dialect build.
 if TYPE_CHECKING:
     from mlir_ktdp import ir
-    from mlir_ktdp.dialects import arith, func, ktdp, linalg, scf, spyreop, tensor
+    from mlir_ktdp.dialects import (
+        arith,
+        func,
+        ktdp,
+        linalg,
+        math,
+        scf,
+        spyreop,
+        tensor,
+    )
 else:
-    ir = arith = func = ktdp = linalg = scf = spyreop = tensor = None
+    ir = arith = func = ktdp = linalg = math = scf = spyreop = tensor = None
 
 
 def _load_dialects() -> None:
     """Bind the dialect handles into this module, once.  The only import site."""
-    global ir, arith, func, ktdp, linalg, scf, spyreop, tensor
+    global ir, arith, func, ktdp, linalg, math, scf, spyreop, tensor
     if ir is not None:
         return
     from mlir_ktdp import ir as _ir
@@ -98,6 +107,7 @@ def _load_dialects() -> None:
     from mlir_ktdp.dialects import func as _func
     from mlir_ktdp.dialects import ktdp as _ktdp
     from mlir_ktdp.dialects import linalg as _linalg
+    from mlir_ktdp.dialects import math as _math
     from mlir_ktdp.dialects import scf as _scf
     from mlir_ktdp.dialects import spyreop as _spyreop
     from mlir_ktdp.dialects import tensor as _tensor
@@ -108,6 +118,7 @@ def _load_dialects() -> None:
         _func,
         _ktdp,
         _linalg,
+        _math,
         _scf,
         _spyreop,
         _tensor,
@@ -1900,6 +1911,17 @@ class KtirBuilder:
         "sum": Recipe(
             arity=1, arms=Arm(kind=BindingKind.COMBINER, binding=lambda: arith.addf)
         ),
+        "max": Recipe(
+            arity=1,
+            arms=Arm(kind=BindingKind.COMBINER, binding=lambda: arith.maximumf),
+        ),
+        "min": Recipe(
+            arity=1,
+            arms=Arm(kind=BindingKind.COMBINER, binding=lambda: arith.minimumf),
+        ),
+        "prod": Recipe(
+            arity=1, arms=Arm(kind=BindingKind.COMBINER, binding=lambda: arith.mulf)
+        ),
         # The unary float ops whose payload is one ``spyreop`` scalar intrinsic.
         # There is no named linalg op behind any of them, so they are PAYLOADs and
         # land on ``Surface.GENERIC``: the recipe contributes the intrinsic and the
@@ -2019,13 +2041,18 @@ class KtirBuilder:
         """
         extents, elt_t, dest = self._destination(step)
 
-        def body(accumulated, element):
+# ``linalg.reduce`` binds its region as (input element, init accumulator),
+        # in that order -- MLIR's choice, not ours, and the printer names them
+        # ``%in`` and ``%init`` to say so.  The parameters are therefore named in
+        # THAT order and the fold is written acc-first, which is the order a
+        # combiner means: ``acc = combine(acc, x)``.
+        def body(element, accumulated):
             return combine(accumulated, element)
 
         # The region builder reads the block argument types off the annotations,
         # and the element type is only known here, so they are set rather than
         # written.
-        body.__annotations__ = {"accumulated": elt_t, "element": elt_t}
+        body.__annotations__ = {"element": elt_t, "accumulated": elt_t}
         return linalg.reduce(
             result=[ir.RankedTensorType.get(extents, elt_t)],
             inputs=list(ins),
@@ -2060,8 +2087,15 @@ class KtirBuilder:
         reducing = bool(step.reduce_dims)
         attrs = dict(step.attrs)
 
+# A generic's region binds one argument per input and then the ``outs``
+        # accumulator, so a reducing nest's accumulator arrives LAST.  A combiner
+        # wants it first (see ``_emit_reduce``), hence the rotation; a parallel
+        # nest drops it and keeps the inputs in the order the op names them,
+        # which is the order ``sub`` and ``realdiv`` pin.
         def body(*args):
-            return payload(*(args if reducing else args[:-1]), **attrs)
+if reducing:
+            return payload(args[-1], *args[:-1], **attrs)
+            return payload(*args[:-1], **attrs)
 
         return linalg.generic(
             inputs=list(ins),

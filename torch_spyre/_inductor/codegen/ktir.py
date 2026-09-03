@@ -112,7 +112,7 @@ def _load_dialects() -> None:
     from mlir_ktdp.dialects import spyreop as _spyreop
     from mlir_ktdp.dialects import tensor as _tensor
 
-    ir, arith, func, ktdp, linalg, scf, spyreop, tensor = (
+    ir, arith, func, ktdp, linalg, math, scf, spyreop, tensor = (
         _ir,
         _arith,
         _func,
@@ -1076,7 +1076,9 @@ class KernelPlan:
         spec tree's nesting and the emitter never has to work out the depth.
         """
         steps: list[Step] = []
-        for entry in specs:
+        # The one call into the spec-vector peepholes.  Per level, so a pair
+        # inside a LoopSpec body is reached by the recursion below.
+        for entry in _fuse_absmax(specs):
             if isinstance(entry, UnimplementedOp):
                 raise NotImplementedError(
                     f"OpSpec->KTIR: unimplemented op {entry.op!r}"
@@ -1309,6 +1311,130 @@ def build_kernel_plan(
     if not plan.buffers:
         raise NotImplementedError("OpSpec->KTIR: no OpSpec to emit")
     return plan
+
+
+# ---------------------------------------------------------------------------
+# Spec-vector peepholes
+# ---------------------------------------------------------------------------
+#
+# DELIBERATELY ISOLATED.  ``_fuse_absmax`` is reached from one line of
+# ``_steps`` and nothing downstream knows it ran: it rewrites the spec vector
+# before any step is derived, and every derivation afterwards sees an ordinary
+# one-op reduction.  Removing it is deleting the call and these two functions.
+#
+# The FUSION DECISION IS NOT MADE HERE.  The torch-spyre machinery already made
+# it, by handing the emitter one kernel holding both ops -- that vector *is* the
+# decision, so there is nothing here that weighs whether fusing is legal or
+# wanted.  What this reads off the vector is only *which pair*, and it declines
+# on anything it does not recognise rather than guessing.
+
+_ABSMAX_OP = "absmax"
+
+
+def _absmax_pair(specs: Sequence[Any], i: int) -> OpSpec | None:
+    """The fused ``absmax`` spec for ``specs[i:i+2]``, or None if that is not it.
+
+    Three facts identify the pair, all read straight off the vector:
+
+    1. an ``abs`` elementwise spec immediately followed by a ``max`` reduction;
+    2. the ``abs`` output and the ``max`` input name the same buffer (``buf_id``);
+    3. that buffer is scratchpad (``lx`` / ``hbm_pool``), which is what "threaded
+       as a value rather than stored" means -- an ``hbm`` intermediate is a real
+       buffer another kernel may read, and folding it away would lose it.
+    """
+    if i + 1 >= len(specs):
+        return None
+    first, second = specs[i], specs[i + 1]
+    if not isinstance(first, OpSpec) or not isinstance(second, OpSpec):
+        return None
+    if first.op != "abs" or first.is_reduction:
+        return None
+    if second.op != "max" or not second.is_reduction:
+        return None
+
+    # Roles are read directly rather than through ``validated_roles``, which asks
+    # ``RECIPES`` for the arity and would raise on ``abs`` -- an op with no
+    # recipe, and deliberately none, because the fused body is the only shape the
+    # device takes it in.
+    abs_ins = [a for a in first.args if a.is_input]
+    abs_outs = [a for a in first.args if not a.is_input]
+    max_ins = [a for a in second.args if a.is_input]
+    if len(abs_ins) != 1 or len(abs_outs) != 1 or len(max_ins) != 1:
+        return None
+    abs_in, abs_out, max_in = abs_ins[0], abs_outs[0], max_ins[0]
+
+    if buf_id(abs_out) != buf_id(max_in):
+        return None
+    if not ({"lx", "hbm_pool"} & set(abs_out.allocation)):
+        return None
+    # A genuine elementwise abs: same extents AND the same access, so the
+    # reduction can read the abs's source exactly where it would have read the
+    # abs's result.  Anything that moves an element is not a drop-in.
+    if list(abs_in.device_size) != list(abs_out.device_size):
+        return None
+    if list(abs_in.device_coordinates) != list(abs_out.device_coordinates):
+        return None
+
+    # Only the buffer IDENTITY moves across: the extents and coordinates stay the
+    # reduction's own, because each spec writes its coordinates against its own
+    # iteration-space symbols (the abs's in ``d0/d1``, the reduction's in
+    # ``c0/c1``) and splicing one into the other would mix the two namespaces.
+    # That is sound precisely because of the two checks above -- the abs's source
+    # and result are the same shape accessed the same way, so the reduction's own
+    # description of its input already describes the source.
+    source = dataclasses.replace(
+        max_in,
+        name=abs_in.name,
+        arg_index=abs_in.arg_index,
+        allocation=dict(abs_in.allocation),
+        device_dtype=abs_in.device_dtype,
+    )
+    return dataclasses.replace(
+        second,
+        op=_ABSMAX_OP,
+        args=[source if arg is max_in else arg for arg in second.args],
+    )
+
+
+def _fuse_absmax(specs: Sequence[Any]) -> tuple[Any, ...]:
+    """``specs`` with every ``abs``-then-``max`` pair collapsed to one ``absmax``.
+
+    The device computes ``max(|x|)`` in one instruction -- the min/max unit takes
+    the absolute value as a mode bit -- so the two ops are one reduction to it,
+    not a pointwise pass and a reduction.  Emitting them separately cannot reach
+    that: the intermediate would have to be a real vector of ``|x|``, and a
+    standalone ``math.absf`` is refused by the backend anyway.
+    """
+    fused: list[Any] = []
+    i = 0
+    while i < len(specs):
+        pair = _absmax_pair(specs, i)
+        if pair is None:
+            fused.append(specs[i])
+            i += 1
+        else:
+            fused.append(pair)
+            i += 2
+    return tuple(fused)
+
+
+def _absmax_combine(accumulated, element):
+    """``max(|acc|, |x|)``, as the three ops the device's absmax pattern matches.
+
+    The body ORDER is a pattern key, not just a computation.  The device matches
+    exactly three ops -- ``math.absf`` at [0] and [1] and ``arith.maxnumf`` at
+    [2] (``ktdf.is_reduction_kind``, ApplyDevicePatterns.cpp) -- and replaces the
+    whole generic with one ``simdreduction_minmax`` whose ``x1``/``x2`` immediates
+    put the min/max unit in its absolute-value mode.  So nothing here is lowered:
+    the abs is a mode bit on the hardware compare, and these ops exist to be
+    recognised.  Python evaluates both ``absf`` calls before the ``maxnumf``, so
+    one expression emits them in the order the match requires.
+
+    ``maxnumf``, not ``maximumf``: the bare ``max`` reduction is spelled with
+    ``maximumf`` and this one is not, and getting it wrong fails as a silent
+    non-match rather than an error.
+    """
+    return arith.maxnumf(math.absf(element), math.absf(accumulated))
 
 
 def validated_roles(spec: OpSpec) -> tuple[TensorArg, list[TensorArg]]:
@@ -1922,6 +2048,14 @@ class KtirBuilder:
         "prod": Recipe(
             arity=1, arms=Arm(kind=BindingKind.COMBINER, binding=lambda: arith.mulf)
         ),
+        # EMITTER-INTERNAL: no frontend produces this op name.  ``_fuse_absmax``
+        # invents it for an ``abs`` feeding a ``max`` reduction, which is what the
+        # device computes in one instruction.  A combiner is just a callable, so
+        # this one emits three ops instead of one and needs no new surface.
+        _ABSMAX_OP: Recipe(
+            arity=1,
+            arms=Arm(kind=BindingKind.COMBINER, binding=lambda: _absmax_combine),
+        ),
         # The unary float ops whose payload is one ``spyreop`` scalar intrinsic.
         # There is no named linalg op behind any of them, so they are PAYLOADs and
         # land on ``Surface.GENERIC``: the recipe contributes the intrinsic and the
@@ -1939,6 +2073,16 @@ class KtirBuilder:
         # Not here: the remaining integer/address intrinsics (addi64toi64,
         # idx32toaddr) and other pointwise ops the device has no intrinsic for
         # (log, tanh, erf, relufwd).
+        # Not here: ``abs``.  It is tempting as a PAYLOAD arm bound to
+        # ``math.absf``, and that does emit -- but into a generic of its OWN,
+        # which is the wrong shape for the only thing that wants it.  The device
+        # reduces along the stick with a ``ktdf.opaque simdreduction_*`` matched
+        # by a PDL pattern in ``spyre_dd2_basic.mlir`` against the BODY of one
+        # reducing ``linalg.generic``, and its ``absmax`` kind wants that body to
+        # be three ops -- ``math.absf`` on each of the two block arguments and an
+        # ``arith.maxnumf`` over the pair.  So ``abs_max`` is one fused combiner
+        # to build, not a pointwise op to thread into a separate reduction.  See
+        # the ``absmax-onstick`` case in verify.py for what that needs.
         "exp": Recipe(
             arity=1, arms=Arm(kind=BindingKind.PAYLOAD, binding=lambda: spyreop.exp)
         ),
@@ -2041,7 +2185,7 @@ class KtirBuilder:
         """
         extents, elt_t, dest = self._destination(step)
 
-# ``linalg.reduce`` binds its region as (input element, init accumulator),
+        # ``linalg.reduce`` binds its region as (input element, init accumulator),
         # in that order -- MLIR's choice, not ours, and the printer names them
         # ``%in`` and ``%init`` to say so.  The parameters are therefore named in
         # THAT order and the fold is written acc-first, which is the order a
@@ -2087,14 +2231,14 @@ class KtirBuilder:
         reducing = bool(step.reduce_dims)
         attrs = dict(step.attrs)
 
-# A generic's region binds one argument per input and then the ``outs``
+        # A generic's region binds one argument per input and then the ``outs``
         # accumulator, so a reducing nest's accumulator arrives LAST.  A combiner
         # wants it first (see ``_emit_reduce``), hence the rotation; a parallel
         # nest drops it and keeps the inputs in the order the op names them,
         # which is the order ``sub`` and ``realdiv`` pin.
         def body(*args):
-if reducing:
-            return payload(args[-1], *args[:-1], **attrs)
+            if reducing:
+                return payload(args[-1], *args[:-1], **attrs)
             return payload(*args[:-1], **attrs)
 
         return linalg.generic(

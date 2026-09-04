@@ -75,6 +75,7 @@ def make_op_spec(
     coords: list | None = None,
     coords_per_arg: list | None = None,
     dtype: DataFormats = FP16,
+    arrangements: list | None = None,
     allocations: list | None = None,
     baked: bool = False,
     advances: list | None = None,
@@ -100,6 +101,9 @@ def make_op_spec(
       arg or ``coords_per_arg`` for one list each, which a reduction needs because
       its output drops an axis.  ``coords=[]`` is a tiled arg, addressing through
       ``advances`` instead of coordinates.
+    * ``arrangements`` per arg, for a buffer whose elements are not in the
+      standard order -- ``ElementArrangement.EXX2`` is a statistic buffer holding
+      two values in one element, and the default is ``STANDARD``.
     * ``allocations`` per arg, for an ``lx`` / ``hbm_pool`` intermediate or an
       unrecognised space; ``baked=True`` for the byte HBM address the baked form
       wants, which is the same field said the other way, so not both.
@@ -148,6 +152,8 @@ def make_op_spec(
                 name=at(names, position)
                 or (f"arg{ordinal}" if is_input else f"buf{ordinal}"),
                 device_tile_advance_expr=at(advances, position),
+                element_arrangement=at(arrangements, position)
+                or ElementArrangement.STANDARD,
             )
         )
 
@@ -2385,6 +2391,26 @@ class TestRefusals(unittest.TestCase):
                     (extent, strides),
                 )
 
+    def test_a_fused_arrangement_is_a_type_and_not_a_stride(self):
+        """DECISION pinned: ``EXX2`` selects an element TYPE, nothing else.
+
+        A buffer holding two statistics to a stick keeps the rank, extent and
+        row-major strides its ``device_size`` states, because the pair is one
+        element of ``!spyreop.fp16_fused`` rather than two of ``f16``.
+
+        LIMITATION forcing it: nothing here can spell a stagger.  The staggered
+        arrangements next door are refused for exactly that reason, so an
+        arrangement that passes through has to be one whose element ORDER is the
+        standard one -- which the fused pair's is, MEASURED against
+        ``ktir-spyreop-exx2.mlir`` (``memref<256x64x!spyreop.fp16_fused>``, the
+        strides an f16 output of that reduction would have).
+        """
+        extent, strides = (256, 64), (64, 1)
+        self.assertEqual(
+            ktir._arrangement_layout(ElementArrangement.EXX2, extent, strides),
+            (extent, strides),
+        )
+
     def test_every_label_is_greppable_and_uniquely_owned(self):
         """Each label is raised from exactly one site, so grepping it is exact."""
         source = inspect.getsource(ktir)
@@ -2416,6 +2442,68 @@ class TestRefusals(unittest.TestCase):
             with self.subTest(message=message[:40]):
                 for blame in ("dbo-opt", "no consumer", "nothing lowers", "scheduler"):
                     self.assertNotIn(blame, message)
+
+
+class TestFusedElementType(unittest.TestCase):
+    """One buffer's ``element_arrangement`` decides its element TYPE.
+
+    DECISION pinned: the fused pair is a two-key lookup,
+    ``(device_dtype, element_arrangement) -> MLIR spelling``, so ``EXX2`` at
+    either fp16 format is ``!spyreop.fp16_fused``.
+
+    LIMITATION forcing it: the frontend has no dtype for the pair.  It carries the
+    fact as ``ElementArrangement.EXX2`` ("reduction mode: two values per stick"),
+    which is why the arrangement is read here and not only in the layout rule.
+    """
+
+    def test_exx2_is_the_fused_spelling_of_its_dtype(self):
+        for dtype, spelling in (
+            (DataFormats.SEN169_FP16, "!spyreop.fp16_fused"),
+            (DataFormats.IEEE_FP16, "!spyreop.fp16_fused"),
+            (DataFormats.IEEE_FP32, "!spyreop.fp32_fused"),
+        ):
+            with self.subTest(dtype=dtype):
+                fused = ktir.ElemTypes.of(dtype, ElementArrangement.EXX2)
+                self.assertEqual((fused.storage, fused.value), (spelling, spelling))
+                # The same dtype in the standard order is the plain float: the
+                # arrangement is what selects the table.
+                self.assertNotEqual(ktir.ElemTypes.of(dtype).storage, spelling)
+
+    def test_a_dtype_with_no_fused_spelling_is_refused(self):
+        """An integer pair has no spelling in the dialect, so it is not guessed:
+        reading a pair as one plain element is the wrong half of a statistic, and
+        it would compile."""
+        with self.assertRaises(NotImplementedError) as ctx:
+            ktir.ElemTypes.of(DataFormats.IEEE_INT32, ElementArrangement.EXX2)
+        self.assertIn("EXX2", str(ctx.exception))
+
+    def test_the_buffer_and_the_access_both_take_the_fused_type(self):
+        """The view and the tile agree, because one derivation answers both."""
+        specs = [
+            make_op_spec(
+                "layernormscale",
+                inputs=1,
+                arrangements=[ElementArrangement.EXX2, ElementArrangement.STANDARD],
+            )
+        ]
+        plan = ktir.build_kernel_plan(specs)
+        [step] = plan.steps
+        [(_buf_id, source)] = step.ins
+        self.assertEqual(source.elems.storage, "!spyreop.fp16_fused")
+        self.assertEqual(plan.buffers["arg0"].elems.storage, "!spyreop.fp16_fused")
+        # The pair is one element, so the extent is the arg's own device_size.
+        self.assertEqual(plan.buffers["arg0"].layout.extent, tuple(ADD_SIZE))
+        # And the OUTPUT of this op is not fused: nothing propagates the flag.
+        self.assertEqual(step.out.elems.storage, "f16")
+
+    def test_layernormscale_binds_the_fused_form_at_arity_one(self):
+        """The frontend hands this op the pair as ONE operand.
+
+        The two-operand ``spyreop.layernormscale`` is what the backend's own
+        ``dbo-unfuse-layernormscale`` produces below us, so binding it here would
+        need a second operand nobody supplies.
+        """
+        self.assertEqual(ktir.KtirBuilder.RECIPES["layernormscale"].arity, 1)
 
 
 class TestWithoutTheDialectBuild(unittest.TestCase):

@@ -200,6 +200,15 @@ class ElemTypes:
     dtypes that map to them, and the unsupported-dtype rejection are one place.
     The two fp16 device formats both map to ``f16``; extend ``NAMES`` (never fall
     through silently) as new dtypes are supported.
+
+    ``FUSED`` is the second key: ``ElementArrangement.EXX2`` -- "reduction mode:
+    two values per stick" -- is a buffer holding a mean and a mean of squares
+    TOGETHER, which the dialect spells as one element of ``!spyreop.fp16_fused``
+    rather than as two of ``f16``.  So the lookup is
+    ``(device_dtype, element_arrangement) -> spelling``: the arrangement selects
+    the table and the dtype the row.  MEASURED: ``ir.Type.parse`` resolves both
+    fused spellings once ``ktdp.register_dialects`` has run, so ``named_type``
+    needs nothing added for them.
     """
 
     NAMES: ClassVar[dict[DataFormats, str]] = {
@@ -210,20 +219,36 @@ class ElemTypes:
         DataFormats.IEEE_INT32: "i32",
     }
 
+    # Only the two formats the dialect has a fused spelling for.  An arrangement
+    # this table has no row for is refused rather than silently unfused: a pair
+    # read as a single float is the wrong half of a statistic, and it would
+    # compile.
+    FUSED: ClassVar[dict[DataFormats, str]] = {
+        DataFormats.IEEE_FP16: "!spyreop.fp16_fused",
+        DataFormats.SEN169_FP16: "!spyreop.fp16_fused",
+        DataFormats.IEEE_FP32: "!spyreop.fp32_fused",
+    }
+
     storage: str
     value: str
 
     @classmethod
-    def of(cls, dtype: DataFormats) -> ElemTypes:
-        """The storage/value pair for a device dtype, or raise.
+    def of(cls, dtype: DataFormats, arrangement: Any = None) -> ElemTypes:
+        """The storage/value pair for a device dtype and arrangement, or raise.
 
         One ``device_dtype`` means one type on both sides today; a load that
         reinterprets is why the record has two fields.
+
+        ``arrangement`` is a *type* selection and not a stride adjustment (the
+        pair is one element, so ``_arrangement_layout`` leaves the extent alone
+        for it), which is why it is read here as well as there.
         """
-        name = cls.NAMES.get(dtype)
+        table = cls.FUSED if arrangement is ElementArrangement.EXX2 else cls.NAMES
+        name = table.get(dtype)
         if name is None:
             raise NotImplementedError(
                 f"OpSpec->KTIR: unsupported device dtype {dtype!r}"
+                + (" at element arrangement EXX2" if table is cls.FUSED else "")
             )
         return cls(storage=name, value=name)
 
@@ -621,6 +646,16 @@ def _grown_extent(tile: Any, levels: Sequence[Level], steps: Sequence[int]) -> A
     return _static(extent)
 
 
+def _arrangement(arg: TensorArg) -> Any:
+    """``arg``'s element arrangement, read in one place.
+
+    ``getattr`` because the field is a late addition to ``TensorArg`` and this
+    module is handed args built by other layers; the default is the standard
+    order, which is what an arg that does not carry the field means.
+    """
+    return getattr(arg, "element_arrangement", None)
+
+
 def _arrangement_layout(
     arrangement: Any, extent: tuple[Any, ...], strides: tuple[Any, ...]
 ) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
@@ -631,8 +666,22 @@ def _arrangement_layout(
     stride selector, of the shape the SDSC path already uses for a stick split.
 
     Label: ``staggered-element-arrangement``.
+
+    ``EXX2`` passes through with STANDARD, and that is the whole of its layout
+    rule: a mean and a mean of squares held together are ONE element of
+    ``!spyreop.fp16_fused``, so the buffer has the rank, extent and row-major
+    strides its ``device_size`` states and the pair is a fact about the element
+    TYPE (``ElemTypes.of``) rather than about the addressing.  MEASURED against
+    ``ktir-spyreop-exx2.mlir``, whose fused output view is
+    ``memref<256x64x!spyreop.fp16_fused>`` -- the same 256x64 an f16 output of
+    that reduction would have, at the same strides.
     """
-    if arrangement in (None, ElementArrangement.STANDARD, ElementArrangement.QFP8CH):
+    if arrangement in (
+        None,
+        ElementArrangement.STANDARD,
+        ElementArrangement.QFP8CH,
+        ElementArrangement.EXX2,
+    ):
         return extent, strides
     if arrangement in STAGGERED_EAS:
         _unimplemented(
@@ -666,7 +715,7 @@ def _layout(
         for i in range(len(tile))
     )
     extent, strides = _arrangement_layout(
-        getattr(arg, "element_arrangement", None),
+        _arrangement(arg),
         extent,
         tuple(row_major_strides(extent)),
     )
@@ -911,7 +960,7 @@ def _access(
     return Access(
         extent=extent,
         index_coeffs=index_coeffs,
-        elems=ElemTypes.of(arg.device_dtype),
+        elems=ElemTypes.of(arg.device_dtype, _arrangement(arg)),
         buffer=buffer,
     )
 
@@ -1374,7 +1423,7 @@ class KernelPlan:
         access to that buffer points at.
         """
         layout, q = _solve_layout(arg, levels)
-        elems = ElemTypes.of(arg.device_dtype)
+        elems = ElemTypes.of(arg.device_dtype, _arrangement(arg))
         buffer = None
         if not is_internal(arg):
             buffer = self.buffers.setdefault(
@@ -2762,9 +2811,21 @@ class KtirBuilder:
         "gelufwd": Recipe(
             arity=1, arms=Arm(kind=BindingKind.PAYLOAD, binding=lambda: spyreop.gelu)
         ),
+        # The FUSED spelling, arity 1: the frontend hands this op one input
+        # carrying the (mean, mean-of-squares) pair as one element of
+        # ``!spyreop.fp16_fused``, which is what ``exx2_fused`` wrote.  The
+        # two-operand ``spyreop.layernormscale``, which takes the mean and the
+        # mean of squares apart, is what the backend's own
+        # ``dbo-unfuse-layernormscale`` produces BELOW us -- MEASURED in
+        # ``ktir-spyreop-layernormscale.mlir``, whose kernel calls the fused form
+        # and whose comment records the substitution -- so binding it here would
+        # be doing the backend's job with an operand nobody supplies.
         "layernormscale": Recipe(
             arity=1,
-            arms=Arm(kind=BindingKind.PAYLOAD, binding=lambda: spyreop.layernormscale),
+            arms=Arm(
+                kind=BindingKind.PAYLOAD,
+                binding=lambda: spyreop.layernormscale_fused,
+            ),
         ),
         "softplus": Recipe(
             arity=1,

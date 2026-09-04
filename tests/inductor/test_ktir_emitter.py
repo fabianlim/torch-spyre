@@ -31,6 +31,7 @@ from test_ktir_validate import (
     make_onstick_sum_specs,
     make_op_spec,
 )
+from torch_spyre._C import ElementArrangement
 
 
 def _mlir_ktdp_available() -> bool:
@@ -728,7 +729,8 @@ module {
             ("reciprocal", "spyreop.reciprocal"),
             # The one pair where the handler name and the op differ.
             ("gelufwd", "spyreop.gelu"),
-            ("layernormscale", "spyreop.layernormscale"),
+            # Not ``layernormscale``: its operand is a fused pair, so its text
+            # differs by more than the op name.  TestFusedElementTypeEmission.
         ):
             with self.subTest(op=op):
                 emitted = generate_ktir(
@@ -784,6 +786,73 @@ module {
             "spyreop.softplus %in beta 2.500000e+00 threshold 1.000000e+01 : f16",
             emitted,
         )
+
+
+@unittest.skipUnless(
+    _mlir_ktdp_available(),
+    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
+)
+class TestFusedElementTypeEmission(unittest.TestCase):
+    """An operand whose buffer holds two statistics per stick, read as ONE element.
+
+    DECISION pinned: a buffer flagged ``ElementArrangement.EXX2`` is viewed,
+    tiled and loaded at ``!spyreop.fp16_fused`` -- one element carrying a mean and
+    a mean of squares together -- while the extent and the strides are the ones
+    its ``device_size`` states.  Nothing propagates the flag: the result of this
+    op is plain ``f16``, which is what ``spyreop.layernormscale_fused`` returns.
+
+    LIMITATION forcing it: the frontend has no dtype for the pair, so the fused
+    element type can only be reached through the arrangement.
+
+    Pinned against ``ktir-spyreop-layernormscale.mlir``, whose compute is
+    ``spyreop.layernormscale_fused %in : !spyreop.fp16_fused -> f16`` inside a
+    ``linalg.generic``.  Its extents and its rank-reducing operand map are not
+    reachable yet (they are the broadcast and stick-head reads of later tasks);
+    the element types and the op are, and they are what this pins.
+    """
+
+    @staticmethod
+    def _fused_operand_spec():
+        """One unary op reading a fused pair and writing plain floats."""
+        return make_op_spec(
+            "layernormscale",
+            inputs=1,
+            arrangements=[ElementArrangement.EXX2, ElementArrangement.STANDARD],
+        )
+
+    def test_the_fused_pair_is_one_element_of_the_view_the_tile_and_the_load(self):
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir(
+            "ktir_fused_layernormscale_0", [self._fused_operand_spec()]
+        )
+        # The view says the pair is the element type; the extent is unchanged.
+        self.assertIn(
+            "sizes: [16, 512, 64], strides: [32768, 64, 1]",
+            emitted,
+        )
+        self.assertIn("memref<16x512x64x!spyreop.fp16_fused>", emitted)
+        self.assertIn(
+            "ktdp.load %1 : <16x512x64xindex> -> tensor<16x512x64x!spyreop.fp16_fused>",
+            emitted,
+        )
+        # And the result is plain f16: one view of each kind, not two of one.
+        self.assertEqual(emitted.count("!spyreop.fp16_fused>"), 4)
+        self.assertIn("memref<16x512x64xf16>", emitted)
+
+    def test_the_body_is_the_fused_intrinsic_and_it_returns_a_plain_float(self):
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir(
+            "ktir_fused_layernormscale_0", [self._fused_operand_spec()]
+        )
+        self.assertIn("^bb0(%in: !spyreop.fp16_fused, %out: f16):", emitted)
+        self.assertIn(
+            "spyreop.layernormscale_fused %in : !spyreop.fp16_fused -> f16", emitted
+        )
+        # NOT the two-operand form: the mean and the mean of squares are taken
+        # apart by the backend's own pass, below this emitter.
+        self.assertNotIn("spyreop.layernormscale %in", emitted)
 
 
 if __name__ == "__main__":

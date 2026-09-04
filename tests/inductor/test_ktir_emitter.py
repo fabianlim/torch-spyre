@@ -31,6 +31,7 @@ from test_ktir_validate import (
     make_nested_op_spec,
     make_onstick_sum_specs,
     make_op_spec,
+    make_statistic_reader_specs,
 )
 from torch_spyre._C import ElementArrangement
 
@@ -976,6 +977,53 @@ class TestBroadcastOperandEmission(unittest.TestCase):
 
         emitted = generate_ktir("ktir_fused_add_0", [make_op_spec()])
         self.assertEqual(emitted, TestKtirEmitter.EXPECTED_ADD_KTIR)
+
+
+@unittest.skipUnless(
+    _mlir_ktdp_available(),
+    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
+)
+class TestStatisticReadEmission(unittest.TestCase):
+    """Two stages over one statistic buffer: a stick written, a head read.
+
+    DECISION pinned: the two stages view the SAME buffer at the same extent and
+    strides, and differ in their ``access_tile_set`` -- the whole stick where the
+    reduction writes, one element where the consumer reads.
+
+    LIMITATION forcing it: the mean of squares sits sixteen bytes along the mean,
+    so a read covering the whole innermost dimension is a backend error
+    (``ktir-spyreop-layernormscale-full-stick.mlir``), while the write has to
+    cover it because the hardware writes a stick at a time.
+
+    Pinned against ``ktir-spyreop-layernorm-chain.mlir``, whose ``#set_stat_slab``
+    (24x64, the write) and ``#set_stat_one`` (24x1, the read) are the same pair at
+    that module's extents.  MEASURED on the emitted module: ``dbo-opt --from-ktir
+    --kEmitSpyreCode`` exits 0 with TWO ``module @local_schedule``s, one per
+    compute.
+    """
+
+    def test_the_write_covers_the_stick_and_the_read_covers_its_head(self):
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir("StatReader_1", make_statistic_reader_specs())
+        # One view per stage of the one statistic buffer, both at the whole stick.
+        self.assertEqual(
+            emitted.count(
+                "ktdp.construct_memory_view %arg1, sizes: [256, 64], strides: [64, 1]"
+            ),
+            2,
+        )
+        # The write tiles all 64 lanes; the read tiles the first one.
+        self.assertIn("-> !ktdp.access_tile<256x64xindex>", emitted)
+        self.assertIn("-> !ktdp.access_tile<256x1xindex>", emitted)
+        self.assertIn("ktdp.load %11 : <256x1xindex> -> tensor<256x1xf16>", emitted)
+
+    def test_the_reader_is_a_generic_over_the_statistic_map(self):
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir("StatReader_1", make_statistic_reader_specs())
+        self.assertIn("affine_map<(d0, d1, d2) -> (d1, 0)>", emitted)
+        self.assertIn("tensor<2x256x64xf16>, tensor<256x1xf16>)", emitted)
 
 
 if __name__ == "__main__":

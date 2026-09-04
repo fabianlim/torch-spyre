@@ -283,6 +283,10 @@ def make_broadcast_op_spec(form: str = "row") -> OpSpec:
       middle axis, at the head of its stick: ``(d0, d1, d2) -> (d1, 0)``.
     * ``"splat"`` -- one element read back across a whole stick:
       ``(d0, d1) -> (d0, 0)``.
+
+    The two statistic operands are described at a WHOLE STICK per statistic, which
+    is what a reduction writes; the one-element tile the map reads is derived
+    (``_reads_stick_head``), not stated here.
     """
     d0, d1, d2 = sympy.symbols("d0 d1 d2")
     zero = sympy.Integer(0)
@@ -295,18 +299,65 @@ def make_broadcast_op_spec(form: str = "row") -> OpSpec:
     if form == "stat":
         return make_op_spec(
             "realdiv",
-            sizes=[[16, 512, 64], [512, 1], [16, 512, 64]],
+            sizes=[[16, 512, 64], [512, 64], [16, 512, 64]],
             coords_per_arg=[[d0, d1, d2], [d1, zero], [d0, d1, d2]],
         )
     if form == "splat":
         return make_op_spec(
             "layernormscale",
             inputs=1,
-            sizes=[[512, 1], [512, 64]],
+            sizes=[[512, 64], [512, 64]],
             coords_per_arg=[[d0, zero], [d0, d1]],
             arrangements=[ElementArrangement.EXX2, ElementArrangement.STANDARD],
         )
     raise ValueError(f"make_broadcast_op_spec: unknown form {form!r}")
+
+
+def make_statistic_reader_specs(reader: str = "realdiv") -> list:
+    """A reduction, and a pointwise stage that READS the statistic it wrote.
+
+    Two stages over one HBM buffer, each in its own iteration-space namespace:
+
+    * stage 0 reduces ``[2, 256, 64]`` along the stick and writes ``buf0`` -- which
+      the frontend describes as ``[1, 256, 64]`` at coordinates ``[0, c0, 0]``: a
+      placeholder axis, the rows, and a whole stick per statistic at a constant
+      coordinate.
+    * stage 1 reads ``buf0`` at that same ``[1, 256, 64]`` description, alongside a
+      full-extent operand, and writes a full-extent output.
+
+    So the two ends of one buffer disagree about its rank and about how much of
+    each stick is read, which is exactly the disagreement a consumer of a
+    reduction has.  The ops are incidental: any reduction and any two-operand
+    payload state the same thing.
+    """
+    rows, reduced = sympy.symbols("c0 c1")
+    stick, lane = sympy.floor(reduced / 64), sympy.Mod(reduced, 64)
+    zero = sympy.Integer(0)
+    statistic = [zero, rows, zero]
+    produce = make_op_spec(
+        "sum",
+        is_reduction=True,
+        inputs=1,
+        names=["x0", "buf0"],
+        sizes=[[2, 256, 64], [1, 256, 64]],
+        coords_per_arg=[[stick, rows, lane], statistic],
+        space={rows: (256, 1), reduced: (128, 1)},
+    )
+    e0, e1, e2 = sympy.symbols("e0 e1 e2")
+    consume = make_op_spec(
+        reader,
+        inputs=2,
+        names=["x1", "buf0", "out0"],
+        sizes=[[2, 256, 64], [1, 256, 64], [2, 256, 64]],
+        coords_per_arg=[[e0, e1, e2], [zero, e1, zero], [e0, e1, e2]],
+        space={e0: (2, 1), e1: (256, 1), e2: (64, 1)},
+        first_arg_index=2,
+    )
+    # ``buf0`` is ONE buffer at ONE index, which the per-spec numbering cannot
+    # know; said here for the same reason ``TestAStageOwnsItsViews`` says it.
+    consume.args[1].arg_index = 1  # buf0, as stage 0 numbered it
+    consume.args[2].arg_index = 3  # out0, after x1
+    return [produce, consume]
 
 
 def make_linked_op_specs(
@@ -2561,6 +2612,59 @@ class TestBroadcastOperands(unittest.TestCase):
         plan = ktir.build_kernel_plan([make_broadcast_op_spec("row")])
         [step] = plan.steps
         self.assertEqual(step.indexing.maps[0], (0, 1, 2))
+
+
+class TestReadingAStatisticAtTheHeadOfItsStick(unittest.TestCase):
+    """A pointwise stage reading what a reduction wrote.
+
+    DECISION pinned, two halves of one rewrite:
+
+    1. the read is SQUEEZED the way the producer's output was, so the reader's
+       access has the rank of the buffer the producer registered;
+    2. the read TILES one element on the innermost axis while the VIEW keeps the
+       whole stick.
+
+    LIMITATION forcing each.  (1) is the frontend describing one buffer two ways:
+    MEASURED, the producer writes ``(256, 64)`` and the consumer's spec says
+    ``(1, 256, 64)``, and an access of the wrong rank cannot tile the registered
+    view at all.  (2) is a backend constraint with its own negative test,
+    ``ktir-spyreop-layernormscale-full-stick.mlir``: a tile covering the whole
+    innermost dimension is ``error: the tile covers more than the first element of
+    its innermost dimension``, because the mean of squares sits sixteen bytes along
+    the mean and a wider tile puts that offset on the next statistic.
+    """
+
+    def test_the_reader_has_the_rank_the_producer_registered(self):
+        plan = ktir.build_kernel_plan(make_statistic_reader_specs())
+        produce, consume = plan.steps
+        [(_x1, _full), (link, statistic)] = consume.ins
+        self.assertEqual(link, "buf0")
+        self.assertEqual(len(statistic.extent), len(produce.out.extent))
+        self.assertEqual(plan.buffers["buf0"].layout.extent, (256, 64))
+
+    def test_the_tile_is_the_stick_head_and_the_view_is_the_whole_stick(self):
+        """The negative test's constraint, stated as the two numbers it is about:
+        a wider tile is a backend error, and a narrower view would name the wrong
+        buffer."""
+        plan = ktir.build_kernel_plan(make_statistic_reader_specs())
+        _produce, consume = plan.steps
+        [_full, (_link, statistic)] = consume.ins
+        self.assertEqual(statistic.extent, (256, 1))
+        self.assertEqual(plan.buffers["buf0"].layout.extent[-1], 64)
+
+    def test_the_producer_still_writes_the_whole_stick(self):
+        """The asymmetry: the reduction's own output keeps all 64 lanes, which is
+        what the opaque reduction needs to get the pair to element 0."""
+        plan = ktir.build_kernel_plan(make_statistic_reader_specs())
+        produce, _consume = plan.steps
+        self.assertEqual(produce.out.extent, (256, 64))
+
+    def test_the_squeezed_read_derives_the_statistic_map(self):
+        """And the two capabilities meet: a rank-reduced operand at a one-element
+        tile is what makes the row ``(d1, 0)``."""
+        plan = ktir.build_kernel_plan(make_statistic_reader_specs())
+        _produce, consume = plan.steps
+        self.assertEqual(consume.indexing.maps, ((0, 1, 2), (1, None), (0, 1, 2)))
 
 
 class TestAReducingBodyThatIgnoresItsAccumulator(unittest.TestCase):

@@ -823,6 +823,34 @@ def _squeezed(arg: TensorArg, axes: Sequence[int]) -> TensorArg:
     )
 
 
+def _reads_stick_head(arg: TensorArg) -> bool:
+    """Whether this INPUT reads a statistic sitting at the head of each stick.
+
+    The signature of one: the innermost device axis carries a CONSTANT coordinate
+    -- so no iteration dim walks it -- over a whole stick of elements.  That is
+    what a reduction writes (MEASURED: our on-stick reductions produce
+    ``[.., 64]`` at coordinate ``0``, because the hardware writes a whole stick at
+    a time and the opaque reduction needs the rest of the stick to get the result
+    to element 0), and a consumer of it wants the one element at the head.
+
+    Asked of INPUTS only, and the producer is why: its output has exactly this
+    shape and must keep writing all 64 lanes.  Both ends of the same buffer, one
+    reading a stick head and one writing a stick, is the asymmetry this predicate
+    is.
+
+    Not "extent 1 already": a tile of one element is not a statistic read, it is
+    an operand somebody already described that way, and there is nothing to narrow.
+
+    A COARSE-TILED arg carries no coordinates at all (it addresses through
+    ``device_tile_advance_expr``), so there is nothing here to read and it is not
+    one of these: the question is about a coordinate, not about an extent.
+    """
+    if not arg.is_input or not len(arg.device_coordinates):
+        return False
+    coord = arg.device_coordinates[-1]
+    return not getattr(coord, "free_symbols", None) and int(arg.device_size[-1]) > 1
+
+
 def _reduce_surface(
     iters: Sequence[str], in_map: Sequence[int], out_map: Sequence[int]
 ) -> Surface:
@@ -1390,7 +1418,6 @@ class KernelPlan:
                 )
         reduce_dims: tuple[int, ...] = ()
         indexing: Indexing | None = None
-        args = list(spec.args)
         if spec.is_reduction:
             # What iteration nest a reduction wants is a fact about its operands'
             # coordinates, so it is derived here (once) and carried on the step,
@@ -1408,7 +1435,6 @@ class KernelPlan:
                 # pointwise spec can carry a unit constant axis on its inputs too,
                 # and squeezing only the output would hand ``linalg.add`` operands
                 # of two ranks.
-                args = [squeezed if arg is out else arg for arg in args]
                 out = squeezed
             surface = _reduce_surface(iters, in_map, out_map)
             reduce_dims = tuple(
@@ -1420,7 +1446,35 @@ class KernelPlan:
                 # the lane axis is reduced on the way in and kept on the way out.
                 indexing = Indexing(iters=iters, maps=(in_map, out_map))
         levels = _levels(spec, loops)
-        accesses = {buf_id(arg): self._access_of(arg, levels) for arg in args}
+        if not spec.is_reduction:
+            # A read of a statistic is squeezed the way its PRODUCER's output was,
+            # so the reader's access has the rank of the buffer the producer
+            # registered -- MEASURED, a reduction writes ``(256, 64)`` and its
+            # consumer's spec describes the same buffer as ``(1, 256, 64)``.
+            # Substituted here, once and before ``_access_of``, exactly as the
+            # reduction branch substitutes its own output, so every derivation
+            # after this point sees an arg of the rank the tile really has.
+            #
+            # Pointwise only, and ``_reduction_nest`` is the reason: it reads the
+            # INPUT's coordinates straight off the spec to derive ``in_map``, so
+            # squeezing a reduction's input here would leave the map describing a
+            # rank the loaded tensor no longer has.  Neither target reduces a
+            # statistic, so this is a boundary rather than a gap.
+            inputs = [
+                _squeezed(
+                    arg,
+                    placeholder_axes(
+                        arg.device_coordinates, [int(s) for s in arg.device_size]
+                    ),
+                )
+                if _reads_stick_head(arg)
+                else arg
+                for arg in inputs
+            ]
+        accesses = {
+            buf_id(arg): self._access_of(arg, levels, head=_reads_stick_head(arg))
+            for arg in (*inputs, out)
+        }
         if not spec.is_reduction:
             # ``align_reshape_plan`` is the SWITCH, not a refusal: ``None`` means
             # this operand's coordinates and extents are the output's, which is the
@@ -1489,13 +1543,25 @@ class KernelPlan:
             store=not is_internal(out),
         )
 
-    def _access_of(self, arg: TensorArg, levels: Sequence[Level]) -> Access:
+    def _access_of(
+        self, arg: TensorArg, levels: Sequence[Level], *, head: bool = False
+    ) -> Access:
         """``arg``'s access at this depth, registering its buffer on the way.
 
         The buffer is registered first and handed to the access, so the record
         carries its own way back to the view the builder will bind for it.  The
         first record seen for a ``buf_id`` wins, which is the one every later
         access to that buffer points at.
+
+        ``head`` narrows the TILE to one element on the innermost axis and leaves
+        the VIEW alone -- the buffer is a whole stick per statistic either way, and
+        which part of it this access reads is not a property of the buffer.  It is a
+        hard constraint and not an optimisation: MEASURED
+        (``ktir-spyreop-layernormscale-full-stick.mlir``, a negative test), a tile
+        covering the whole innermost dimension is
+        ``error: the tile covers more than the first element of its innermost
+        dimension``, because the mean of squares sits sixteen bytes along the mean
+        and a wider tile puts that offset on the next statistic.
         """
         layout, q = _solve_layout(arg, levels)
         elems = ElemTypes.of(arg.device_dtype, _arrangement(arg))
@@ -1507,6 +1573,8 @@ class KernelPlan:
             )
         # The divisions are the outermost levels, so their steps come first.
         extent, rows = _divide(arg, self._symbols, self._divisors)
+        if head:
+            extent = (*extent[:-1], 1)
         return _access(arg, extent, [*rows, *q], layout, buffer)
 
 

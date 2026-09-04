@@ -269,6 +269,46 @@ def make_onstick_sum_specs(op: str = "sum", arrangements: list | None = None) ->
     ]
 
 
+def make_broadcast_op_spec(form: str = "row") -> OpSpec:
+    """One pointwise op with a BROADCAST operand, in one of three forms.
+
+    Named for the map each form produces, not for the op that wants it.  The op is
+    whichever registered payload has the arity the form needs, and the geometry is
+    the fixture's own: a two-input ``realdiv`` for the forms with a full operand
+    beside the broadcast one, and a one-input intrinsic for the splat.
+
+    * ``"row"`` -- the operand carries one coordinate of the middle axis and the
+      axes either side of it: ``(d0, d1, d2) -> (d0, 0, d2)``.
+    * ``"stat"`` -- the operand is of LOWER rank, one value per coordinate of the
+      middle axis, at the head of its stick: ``(d0, d1, d2) -> (d1, 0)``.
+    * ``"splat"`` -- one element read back across a whole stick:
+      ``(d0, d1) -> (d0, 0)``.
+    """
+    d0, d1, d2 = sympy.symbols("d0 d1 d2")
+    zero = sympy.Integer(0)
+    if form == "row":
+        return make_op_spec(
+            "realdiv",
+            sizes=[[16, 512, 64], [16, 1, 64], [16, 512, 64]],
+            coords_per_arg=[[d0, d1, d2], [d0, zero, d2], [d0, d1, d2]],
+        )
+    if form == "stat":
+        return make_op_spec(
+            "realdiv",
+            sizes=[[16, 512, 64], [512, 1], [16, 512, 64]],
+            coords_per_arg=[[d0, d1, d2], [d1, zero], [d0, d1, d2]],
+        )
+    if form == "splat":
+        return make_op_spec(
+            "layernormscale",
+            inputs=1,
+            sizes=[[512, 1], [512, 64]],
+            coords_per_arg=[[d0, zero], [d0, d1]],
+            arrangements=[ElementArrangement.EXX2, ElementArrangement.STANDARD],
+        )
+    raise ValueError(f"make_broadcast_op_spec: unknown form {form!r}")
+
+
 def make_linked_op_specs(
     ops: tuple = ("abs", "max"),
     *,
@@ -518,10 +558,32 @@ class TestValidateRejections(unittest.TestCase):
         specs = [make_op_spec(names=["arg0", "arg1", "arg0"])]
         self._rejects(specs, "in-place ops (input aliases output)")
 
-    def test_broadcast_operand_rejected(self):
-        # A unit outer-stick extent against the output's 16: a real broadcast.
+    def test_stretched_operand_rejected(self):
+        """A unit extent on an axis the operand's coordinate says it WALKS.
+
+        Not a broadcast this can spell: the axis carries an iteration symbol, so
+        the map row for it is a dim rather than a constant, and one element under a
+        dim that runs 16 is a stretch.  A broadcast operand says so with a
+        constant coordinate instead.
+        """
         specs = [make_op_spec(sizes=[[1, 512, 64]])]
-        self._rejects(specs, "broadcast / reshape operands")
+        self._rejects(specs, "not a stretch of it")
+
+    def test_a_broadcast_operand_of_a_named_linalg_op_rejected(self):
+        """A named ``linalg`` op states its own (identity) indexing, so a derived
+        map row has nowhere to go, and the scalar spelling that would go in a
+        generic's body is not something any recipe declares."""
+        specs = [
+            make_op_spec(
+                sizes=[[16, 512, 1]],
+                coords_per_arg=[
+                    [*sympy.symbols("d0:2"), sympy.Integer(0)],
+                    sympy.symbols("d0:3"),
+                    sympy.symbols("d0:3"),
+                ],
+            )
+        ]
+        self._rejects(specs, "named linalg op, which states its own indexing")
 
     # -- per-buffer --------------------------------------------------------
 
@@ -2447,6 +2509,58 @@ class TestRefusals(unittest.TestCase):
             with self.subTest(message=message[:40]):
                 for blame in ("dbo-opt", "no consumer", "nothing lowers", "scheduler"):
                     self.assertNotIn(blame, message)
+
+
+class TestBroadcastOperands(unittest.TestCase):
+    """An operand that does not walk every axis of the output.
+
+    DECISION pinned: the operand's map row is READ OFF ITS COORDINATES, and an
+    axis it does not walk becomes a CONSTANT result position -- ``None`` in an
+    ``Indexing`` row, ``0`` in the emitted affine map.  Any such operand forces
+    ``Surface.GENERIC``, because a named ``linalg`` op states its own indexing.
+
+    LIMITATION forcing it: an ``Indexing`` row used to be bare dim indices, so a
+    constant position could not be spelled at all, and the three maps the
+    hand-written chain needs are all constant positions.
+
+    ``align_reshape_plan`` stays the SWITCH between this and the identity fast
+    path, and that is deliberate: deriving the row for an operand alignment says
+    already matches would make ``add``'s emitted form hostage to the dim-reuse
+    rule ``reduction_indexing`` needs, silently turning a ``linalg.add`` into a
+    ``linalg.generic``.
+    """
+
+    def test_each_form_derives_the_maps_the_chain_needs(self):
+        """The three rows, against the hand-written chain's three maps."""
+        for form, maps in (
+            ("row", ((0, 1, 2), (0, None, 2), (0, 1, 2))),
+            ("stat", ((0, 1, 2), (1, None), (0, 1, 2))),
+            ("splat", ((0, None), (0, 1))),
+        ):
+            with self.subTest(form=form):
+                plan = ktir.build_kernel_plan([make_broadcast_op_spec(form)])
+                [step] = plan.steps
+                self.assertIs(step.surface, ktir.Surface.GENERIC)
+                self.assertEqual(step.indexing.maps, maps)
+                # Pointwise: every iteration dim is the output's, all parallel.
+                self.assertEqual(
+                    step.indexing.iters, ("parallel",) * len(step.out.extent)
+                )
+
+    def test_an_aligned_operand_still_reaches_the_named_form(self):
+        """The fast path, asserted where the derivation would also have applied:
+        a plain ``add`` states no indexing at all and comes out as a named op."""
+        plan = ktir.build_kernel_plan([make_op_spec()])
+        [step] = plan.steps
+        self.assertIs(step.surface, ktir.Surface.BARE)
+        self.assertIsNone(step.indexing)
+
+    def test_a_broadcast_operand_beside_an_aligned_one_states_both_rows(self):
+        """``indexing_maps`` is one attribute, so the aligned operand's identity
+        row is stated too -- derived rather than assumed, and equal either way."""
+        plan = ktir.build_kernel_plan([make_broadcast_op_spec("row")])
+        [step] = plan.steps
+        self.assertEqual(step.indexing.maps[0], (0, 1, 2))
 
 
 class TestAReducingBodyThatIgnoresItsAccumulator(unittest.TestCase):

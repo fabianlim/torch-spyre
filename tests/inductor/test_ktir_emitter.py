@@ -26,6 +26,7 @@ Self-contained otherwise: no live Inductor graph, no compiler run.
 import unittest
 
 from test_ktir_validate import (
+    make_broadcast_op_spec,
     make_chained_op_specs,
     make_nested_op_spec,
     make_onstick_sum_specs,
@@ -924,6 +925,57 @@ class TestAReducingBodyThatIgnoresItsAccumulator(unittest.TestCase):
             "ktdp.store %4, %6 : tensor<256x64x!spyreop.fp16_fused>, <256x64xindex>",
             emitted,
         )
+
+
+@unittest.skipUnless(
+    _mlir_ktdp_available(),
+    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
+)
+class TestBroadcastOperandEmission(unittest.TestCase):
+    """A constant result position in an ``indexing_maps`` row, as MLIR text.
+
+    DECISION pinned: an operand axis that walks no iteration dim prints as the
+    constant ``0`` in its affine map, and the op is a ``linalg.generic`` because
+    only a generic can state a map.
+
+    LIMITATION forcing it: ``_affine_map`` built one ``AffineExpr.get_dim`` per
+    entry, so ``0`` was unspellable, and every broadcast operand was refused
+    before it.
+
+    The three maps are the hand-written chain's own -- ``#map_row``, ``#map_stat``
+    and ``#map_splat`` in ``ktir-spyreop-layernorm-chain.mlir``, and ``#map_col``
+    in ``ktir-spyreop-layernormnorm-broadcast.mlir`` -- at our extents.
+    """
+
+    def test_each_form_prints_the_map_the_chain_writes(self):
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        for form, printed in (
+            ("row", "affine_map<(d0, d1, d2) -> (d0, 0, d2)>"),
+            ("stat", "affine_map<(d0, d1, d2) -> (d1, 0)>"),
+            ("splat", "affine_map<(d0, d1) -> (d0, 0)>"),
+        ):
+            with self.subTest(form=form):
+                emitted = generate_ktir(f"k_{form}", [make_broadcast_op_spec(form)])
+                self.assertIn(printed, emitted)
+                self.assertIn("linalg.generic", emitted)
+
+    def test_the_broadcast_operand_is_loaded_at_the_shape_its_map_reads(self):
+        """The operand tensor is the tile, one element on the axis it does not
+        walk: ``tensor<512x1xf16>`` under ``(d0, d1, d2) -> (d1, 0)``."""
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir("k_stat", [make_broadcast_op_spec("stat")])
+        self.assertIn("ins(%2, %5 : tensor<16x512x64xf16>, tensor<512x1xf16>)", emitted)
+        self.assertIn('iterator_types = ["parallel", "parallel", "parallel"]', emitted)
+
+    def test_an_aligned_operand_is_untouched(self):
+        """The pointwise golden is the evidence: nothing about a plain ``add``
+        moves, because alignment is the switch and it says nothing to derive."""
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir("ktir_fused_add_0", [make_op_spec()])
+        self.assertEqual(emitted, TestKtirEmitter.EXPECTED_ADD_KTIR)
 
 
 if __name__ == "__main__":

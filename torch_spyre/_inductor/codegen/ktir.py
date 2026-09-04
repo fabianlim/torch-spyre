@@ -69,6 +69,7 @@ from torch_spyre._inductor.codegen.opspec_utils import (
     align_reshape_plan,
     buf_id,
     core_divisions,
+    operand_indexing,
     per_core_extent,
     placeholder_axes,
     reduction_indexing,
@@ -393,14 +394,24 @@ class Indexing:
     No ``extents`` field: ``linalg.generic`` infers its loop bounds from the
     operand shapes and the maps, so nothing would read one.
 
-    A row is a bare dim index per position, which is every map in scope and not
-    every map there is: a *linearised* map such as
+    ``None`` in a row is the CONSTANT 0 result position: an axis the operand does
+    not walk, read at its first element for every iteration.  It is what the three
+    broadcast forms are made of -- ``(d0,d1,d2) -> (d1, 0)`` reads a statistic at
+    the head of its stick, ``(d0,d1) -> (d0, 0)`` splats it back across one, and
+    ``(d0,d1,d2) -> (d0, 0, d2)`` reads one row of a weight for every row of the
+    output.  Zero and not an arbitrary constant, because a tile is placed by its
+    access indices and an operand axis that walks nothing is read at the tile's own
+    origin; a non-zero offset would be an addressing decision, and addressing is
+    ``Access.index_coeffs``' business.
+
+    A row is otherwise a bare dim index per position, which is every map in scope
+    and not every map there is: a *linearised* map such as
     ``(d0, d1, d2, d3, d4) -> (d0, d2 * 64 + d3, d4)`` needs (coefficient, dim)
     terms, so nothing here generalises to one for free.
     """
 
     iters: tuple[str, ...]  # PARALLEL | REDUCTION, one per iteration dim
-    maps: tuple[tuple[int, ...], ...]  # [operand][result position] -> dim
+    maps: tuple[tuple[int | None, ...], ...]  # [operand][position] -> dim or const 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -901,16 +912,15 @@ def _reduction_surface(spec: OpSpec) -> Surface:
 def _parallel_surface(
     arm: Arm, operands: int, rank: int
 ) -> tuple[Surface, Indexing | None]:
-    """Which shape carries a non-reducing payload, and what it has to state.
+    """Which shape carries a non-reducing payload whose operands are ALIGNED.
 
-    Nothing is *derived* here and nothing needs to be: the pointwise arm's
-    alignment refusal has already established that every operand's coordinates
-    and extents equal the output's, which is precisely the identity condition, so
-    the maps are known rather than read off the coordinates.  Deriving them
-    instead would make the emitted form of ``add`` hostage to the dim-reuse rule
-    ``reduction_indexing`` needs -- a coordinate list that repeated a
-    classification would yield a non-identity map and silently turn a
-    ``linalg.add`` into a ``linalg.generic``.
+    Nothing is *derived* here and nothing needs to be: ``align_reshape_plan`` has
+    already answered that every operand's coordinates and extents equal the
+    output's, which is precisely the identity condition, so the maps are known
+    rather than read off the coordinates.  Deriving them instead would make the
+    emitted form of ``add`` hostage to the dim-reuse rule ``reduction_indexing``
+    needs -- a coordinate list that repeated a classification would yield a
+    non-identity map and silently turn a ``linalg.add`` into a ``linalg.generic``.
 
     So the choice is only about spelling, and it follows from the binding: a
     ``NAMED`` builder is an op the dialect already has, which says its own
@@ -918,6 +928,9 @@ def _parallel_surface(
     maps and the all-parallel iterators itself -- which only a generic can do.
     That second arm is where a ``spyreop`` intrinsic lands: it is a scalar builder,
     so there is nothing to call it but a region.
+
+    ``_broadcast_surface`` is the other arm of the same question, for operands
+    alignment says do NOT match the output.
     """
     if arm.kind is BindingKind.NAMED:
         return Surface.BARE, None
@@ -926,6 +939,57 @@ def _parallel_surface(
         iters=(PARALLEL,) * rank,
         maps=(identity,) * (operands + 1),
     )
+
+
+def _broadcast_surface(
+    arm: Arm,
+    out: TensorArg,
+    inputs: Sequence[TensorArg],
+    accesses: dict[str, Access],
+) -> tuple[Surface, Indexing | None]:
+    """The same question for operands that do NOT all match the output.
+
+    ``align_reshape_plan`` is the switch between this and ``_parallel_surface``:
+    it answers ``None`` exactly when an operand's coordinates and extents are the
+    output's, and an operand it has something to say about is one whose map row has
+    to be read off the coordinates (``operand_indexing``).  Split that way round
+    on purpose -- an aligned operand keeps the identity fast path it always had, so
+    a plain ``add`` cannot change shape because a *different* operand needed a map.
+
+    Every row is derived, including the aligned operands' (which come back as the
+    identity), because ``indexing_maps`` is one attribute: a generic states a row
+    per operand or none at all.  The result's row is the identity, because a
+    pointwise op writes every element of its output once.
+
+    The extents compared are the TILE extents from ``accesses``, not the buffers':
+    a ``linalg`` operand's shape is what was loaded, and a broadcast operand is
+    loaded at one element on the axis it does not walk.
+    """
+    out_extent = accesses[buf_id(out)].extent
+    rank = len(out_extent)
+    rows = tuple(
+        operand_indexing(
+            list(arg.device_coordinates),
+            accesses[buf_id(arg)].extent,
+            list(out.device_coordinates),
+            out_extent,
+        )
+        for arg in inputs
+    )
+    if arm.kind is BindingKind.NAMED:
+        # A named linalg op states its own indexing, which is the identity, so
+        # there is nowhere to put a derived row.  Refused rather than forced into a
+        # generic: what would go in that generic's body is a scalar spelling of the
+        # op (``arith.subf`` for ``linalg.sub``) that no recipe declares, and
+        # calling a whole-op builder with two scalars does not build.
+        raise NotImplementedError(
+            f"OpSpec->KTIR: operand of {out.name!r}'s op is broadcast against the "
+            f"output ({rows}), but the op is a named linalg op, which states its "
+            "own indexing; broadcast operands are supported on ops whose payload "
+            "is a scalar builder"
+        )
+    identity = tuple(range(rank))
+    return Surface.GENERIC, Indexing(iters=(PARALLEL,) * rank, maps=(*rows, identity))
 
 
 def _access(
@@ -1315,7 +1379,6 @@ class KernelPlan:
         emission has nothing left to derive.
         """
         out, inputs = validated_roles(spec)
-        out_extents = [int(s) for s in out.device_size]
         dtype = dtype_of(spec)
         recipe = KtirBuilder.RECIPES[spec.op]
         arm = recipe.arm(dtype)
@@ -1356,25 +1419,37 @@ class KernelPlan:
                 # travel with the step: the input covers three of four dims and
                 # the lane axis is reduced on the way in and kept on the way out.
                 indexing = Indexing(iters=iters, maps=(in_map, out_map))
-        else:
-            surface, indexing = _parallel_surface(arm, len(inputs), len(out_extents))
-            for arg in inputs:
-                # Reject broadcast / transpose operands: only operands whose
-                # device axes already match the output tile exactly are supported.
-                if (
-                    align_reshape_plan(
-                        list(arg.device_coordinates),
-                        [int(s) for s in arg.device_size],
-                        list(out.device_coordinates),
-                        out_extents,
-                    )
-                    is not None
-                ):
-                    raise NotImplementedError(
-                        "OpSpec->KTIR: broadcast / reshape operands not supported yet"
-                    )
         levels = _levels(spec, loops)
         accesses = {buf_id(arg): self._access_of(arg, levels) for arg in args}
+        if not spec.is_reduction:
+            # ``align_reshape_plan`` is the SWITCH, not a refusal: ``None`` means
+            # this operand's coordinates and extents are the output's, which is the
+            # identity condition ``_parallel_surface`` is entitled to assume, and
+            # anything else is an operand whose map row has to be read off the
+            # coordinates.  Asked of every operand before either arm is taken,
+            # because the surface is a property of the whole op: one broadcast
+            # operand makes the op a generic, and the aligned operands then need
+            # their (identity) rows stated alongside it.
+            #
+            # After the accesses, because a map row is about the TILE extents --
+            # a broadcast operand is loaded at one element on the axis it does not
+            # walk, and its buffer is the whole thing either way.
+            broadcast = any(
+                align_reshape_plan(
+                    list(arg.device_coordinates),
+                    [int(s) for s in arg.device_size],
+                    list(out.device_coordinates),
+                    [int(s) for s in out.device_size],
+                )
+                is not None
+                for arg in inputs
+            )
+            if broadcast:
+                surface, indexing = _broadcast_surface(arm, out, inputs, accesses)
+            else:
+                surface, indexing = _parallel_surface(
+                    arm, len(inputs), len(accesses[buf_id(out)].extent)
+                )
         # Every division must move this op's output: cores divide work by writing
         # different elements, so a division no output axis follows is cores
         # duplicating each other rather than sharing.  An *input* may legitimately
@@ -2375,7 +2450,7 @@ class KtirBuilder:
         return self.val(arith.ConstantOp(self.index_t, int(value)))
 
     @staticmethod
-    def _affine_map(rank: int, row: Sequence[int]):
+    def _affine_map(rank: int, row: Sequence[int | None]):
         """One ``Indexing`` row as a projection of a ``rank``-dim iteration nest.
 
         ``(0, 1, 2)`` of rank 4 is ``(d0, d1, d2, d3) -> (d0, d1, d2)``: the row is
@@ -2383,9 +2458,21 @@ class KtirBuilder:
         symbols, and one expression per entry.  Returns the map itself and not an
         ``ir.AffineMapAttr`` -- ``indexing_maps`` takes maps, and an attribute
         raises there.
+
+        ``None`` is the constant 0 position, so ``(1, None)`` of rank 3 is
+        ``(d0, d1, d2) -> (d1, 0)``: a broadcast operand read at the head of the
+        axis it does not walk.  ``get_constant`` is the mechanism ``coord_set``
+        already builds its bounds out of.
         """
         return ir.AffineMap.get(
-            rank, 0, [ir.AffineExpr.get_dim(int(dim)) for dim in row]
+            rank,
+            0,
+            [
+                ir.AffineExpr.get_constant(0)
+                if dim is None
+                else ir.AffineExpr.get_dim(int(dim))
+                for dim in row
+            ],
         )
 
     # -- module scaffolding ------------------------------------------------

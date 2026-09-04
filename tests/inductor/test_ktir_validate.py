@@ -1374,6 +1374,76 @@ class TestLoopDerivations(unittest.TestCase):
         self.assertIn("not a whole number of steps", str(ctx.exception))
 
 
+class TestStagesAreNumbered(unittest.TestCase):
+    """``_stages`` hands each ``ComputeStep`` its own stage, over the whole tree.
+
+    DECISION pinned: one compute is one stage, and the numbering is the walk's --
+    not the emitter's, which sees a loop body as a fresh insertion point and
+    could not tell a body's first step from the kernel's.
+
+    LIMITATION forcing per-stage numbers at all: two stages cannot share one
+    memory view (the backend's ``ComputeGroupExtraction`` aborts on
+    ``op->use_empty()``), so the emitter has to ask "which stage" before it can
+    answer with a view -- and the answer has to be unique per compute.
+    """
+
+    @staticmethod
+    def _two_stages_in_one_body() -> LoopSpec:
+        """``(a + b) * c`` at one row per iteration of a two-level nest.
+
+        Tiled rather than coordinate-addressed, because a spec in a loop body is,
+        and the point of the fixture is that the body's stages are numbered by
+        the same counter as a top-level one's.
+        """
+        n_stick, m = sympy.symbols("n_stick m")
+        tiled = {
+            "coords": [],
+            "space": {},
+            "tiled": [[m], [n_stick]],  # innermost-first
+            "trips": {n_stick: 2, m: 256},
+            "size": [1, 1, 64],
+            "advances": [16384 * n_stick + 64 * m] * 3,
+        }
+        return LoopSpec(
+            count=2,
+            body=[
+                LoopSpec(
+                    count=256,
+                    body=[
+                        make_op_spec(
+                            "add",
+                            names=["arg0", "arg1", "buf0"],
+                            allocations=[None, None, {"lx": 0}],
+                            **tiled,
+                        ),
+                        make_op_spec(
+                            "mul",
+                            names=["buf0", "arg2", "buf1"],
+                            allocations=[{"lx": 0}, None, None],
+                            first_arg_index=2,
+                            **tiled,
+                        ),
+                    ],
+                )
+            ],
+        )
+
+    def test_one_op_is_stage_zero(self):
+        [step] = ktir.build_kernel_plan([make_op_spec()]).steps
+        self.assertEqual(step.stage, 0)
+
+    def test_each_op_in_a_chain_is_its_own_stage(self):
+        steps = ktir.build_kernel_plan(make_chained_op_specs(("add", "mul"))).steps
+        self.assertEqual([step.stage for step in steps], [0, 1])
+
+    def test_a_loop_body_continues_the_kernels_count(self):
+        """The counter is the plan's, so recursion cannot restart it at zero."""
+        plan = ktir.build_kernel_plan([self._two_stages_in_one_body()])
+        [outer] = plan.steps
+        [inner] = outer.body
+        self.assertEqual([step.stage for step in inner.body], [0, 1])
+
+
 _TABLE_DEFAULT = object()
 
 
@@ -1768,11 +1838,12 @@ class TestFusionReport(FusionCase):
 
     DECISION: report per kernel and per buffer, at ``debug`` in detail and at
     ``warning`` in summary, and reclaim nothing.
-    LIMITATION: memory placement runs long before this does and this emitter
-    cannot issue a device allocate, so an abandoned reservation cannot be given
-    back; a predicted-runtime figure is computed from the pre-fusion vector and
-    this runs too late to correct it.  Reporting is the whole of what is
-    available.
+    LIMITATION: memory placement runs long before this does, and this emitter
+    never issues the device allocate that would carry a placement out, so what a
+    fusion drops is planning's STRATEGY for the buffer and not a reservation --
+    there is nothing to give back because nothing was held.  A predicted-runtime
+    figure is computed from the pre-fusion vector and this runs too late to
+    correct it.  Reporting is the whole of what is available.
     """
 
     def setUp(self):
@@ -1781,14 +1852,16 @@ class TestFusionReport(FusionCase):
         self._warn.start()
         self.addCleanup(self._warn.stop)
 
-    def test_shape_a_concedes_one_reservation_and_one_price(self):
+    def test_shape_a_concedes_one_strategy_and_one_price(self):
         """DECISION: name the buffer, the space and the exact byte count.
 
-        LIMITATION forcing it: nothing reclaims the reservation, so the report is
-        the entire discharge of the concession -- and an unattributed modelling
-        error is indistinguishable from an unnoticed one.  Real numbers, both
-        spaces: if the size or the space drifts, the log keeps printing
-        confidently and the figure it prints is no longer one anybody measured.
+        LIMITATION forcing it: nothing carries the placement out and nothing
+        reclaims it, so the report is the entire discharge of the concession --
+        and an unattributed modelling error is indistinguishable from an
+        unnoticed one.  Real numbers, both spaces: if the size or the space
+        drifts, the log keeps printing confidently and the figure it prints is no
+        longer one anybody measured.  The figure is planning bookkeeping, not
+        device capacity: this path issues no allocate for either space.
         """
         cases = {
             # Off-stick: the link is [64, 256, 64] fp16 in the HBM pool.
@@ -1803,13 +1876,13 @@ class TestFusionReport(FusionCase):
                 self.assertEqual(
                     [(item.kind, item.buf_id) for item in report.concessions],
                     [
-                        (ktir.ConcessionKind.ABANDONED_RESERVATION, link),
+                        (ktir.ConcessionKind.ABANDONED_STRATEGY, link),
                         (ktir.ConcessionKind.STRANDED_COST, link),
                     ],
                 )
-                [reservation] = report.of(ktir.ConcessionKind.ABANDONED_RESERVATION)
-                self.assertIn(f"{nbytes} bytes of {space}", reservation.detail)
-                self.assertIn("not reclaimed", reservation.detail)
+                [strategy] = report.of(ktir.ConcessionKind.ABANDONED_STRATEGY)
+                self.assertIn(f"in {space} at {nbytes} bytes", strategy.detail)
+                self.assertIn("no memory was held to reclaim", strategy.detail)
                 [price] = report.of(ktir.ConcessionKind.STRANDED_COST)
                 self.assertIn(repr(pair[0].op), price.detail)
         self.assertEqual(cases["hbm_pool"][1], 2097152)
@@ -1886,13 +1959,13 @@ class TestFusionReport(FusionCase):
 
         LIMITATION forcing the level: every concession here is raised by a
         SUCCESSFUL fusion, so the summary fires on every working absmax compile,
-        and what it names may cost nothing -- an abandoned reservation is
-        capacity, not time, and none has yet been measured to displace anything.
-        A warning on every working compile, naming nothing actionable, is how a
-        project teaches people to ignore warnings. Promote it the day an
-        abandoned reservation is shown to change a placement; until then this
-        test is what pins the level, and its wording still must not read as a
-        fault.
+        and what it names costs nothing measurable -- an abandoned strategy is a
+        placement this emitter never carries out for any internal buffer, so no
+        memory is held and none is lost.  A warning on every working compile,
+        naming nothing actionable, is how a project teaches people to ignore
+        warnings.  Promote it the day an abandoned strategy is shown to change a
+        placement decision elsewhere; until then this test is what pins the
+        level, and its wording still must not read as a fault.
         """
         report = fuse_report(make_absmax_pair())
         with self.assertLogs(ktir.logger, level="DEBUG") as captured:
@@ -1905,7 +1978,7 @@ class TestFusionReport(FusionCase):
         self.assertEqual(len(details), len(report.concessions))
         self.assertEqual(len(summaries), 1)
         summary = summaries[0].getMessage()
-        self.assertIn("ABANDONED_RESERVATION", summary)
+        self.assertIn("ABANDONED_STRATEGY", summary)
         self.assertIn("STRANDED_COST", summary)
         self.assertIn("TORCH_SPYRE_PLAN_FUSION_WARN=0", summary)
         self.assertIn("Nothing is wrong with the kernel", summary)

@@ -402,6 +402,17 @@ class ComputeStep:
     the order the builder is called with them.  A tuple rather than a dict so the
     record stays hashable and frozen like every other field, and empty for every
     op that is a pure function of its operands, which is almost all of them.
+
+    ``stage`` is this step's position in the kernel's stage order, counted over
+    the whole step tree (loop bodies included) by ``KernelPlan._stages``.  One
+    compute is one stage, which is the backend's own granularity: the
+    hand-written softmax chain's six computes become six ``local_schedule``
+    modules, MEASURED.  It is on the step because the memory views a step tiles
+    are per stage -- sharing one view between two stages aborts the backend's
+    ``ComputeGroupExtraction`` (``op->use_empty()``, MEASURED on the softmax
+    chain: deduping its seven duplicate views aborts, the duplicates compile) --
+    so the emitter needs to know which stage is asking before it can answer with
+    a view.
     """
 
     op: str  # a KtirBuilder.RECIPES key
@@ -410,6 +421,7 @@ class ComputeStep:
     out: Access
     out_buf_id: str
     store: bool
+    stage: int = 0
     reduce_dims: tuple[int, ...] = ()
     indexing: Indexing | None = None
     attrs: tuple[tuple[str, float], ...] = ()
@@ -908,8 +920,8 @@ def _access(
 # KernelPlan: everything the builder is given
 # ---------------------------------------------------------------------------
 #
-# The plan is the whole instruction list: the grid, the buffers whose views and
-# func parameters the kernel opens with, and the step tree that goes in its body.
+# The plan is the whole instruction list: the grid, the buffers whose func
+# parameters the kernel opens with, and the step tree that goes in its body.
 # It is built by one walk of the spec tree, which is where the derivations run
 # and therefore where every rejection is raised.  Emission consumes the plan and
 # reads no spec, so it cannot discover a reason to refuse half-way through.
@@ -1075,6 +1087,10 @@ class KernelPlan:
         self._divisors: dict = {}
         self.buffers: dict[str, Buffer] = {}
         self.steps: tuple[Step, ...] = ()
+        # Handed out by ``_stages``, one per ``ComputeStep``, across the whole
+        # tree: a step in a loop body is as much a stage as a top-level one, and
+        # the count is what says how many stages the kernel has.
+        self._next_stage = 0
         # Empty until ``add_specs`` fuses; a plan that was never filled conceded
         # nothing, which is what an empty report says.
         self.fusion_report = FusionReport()
@@ -1102,7 +1118,7 @@ class KernelPlan:
         # division, and the two specs of an absmax pair name theirs in different
         # symbol namespaces, so a divided pair is self-contradictory right up
         # until the fusion deletes one of them.  The result is held, so
-        # ``_steps`` walks the same vector ``_divisions`` saw and there are never
+        # ``_stages`` walks the same vector ``_divisions`` saw and there are never
         # two vectors in flight.  This plan owns the report because the
         # concessions name this kernel's buffers, and it is logged here because
         # this is the one place that knows the whole kernel has been fused.
@@ -1117,7 +1133,8 @@ class KernelPlan:
         for division in self.divisions:
             cores *= division.div
         self.grid = (cores,)
-        self.steps = self._steps(specs, ())
+        self._next_stage = 0
+        self.steps = self._stages(specs, ())
         self._check_threaded_buffers(self.steps)
 
     def _check_threaded_buffers(self, steps: Sequence[Step]) -> None:
@@ -1170,13 +1187,19 @@ class KernelPlan:
                 "materialised"
             )
 
-    def _steps(self, specs, loops: Sequence[LoopSpec]) -> tuple[Step, ...]:
+    def _stages(self, specs, loops: Sequence[LoopSpec]) -> tuple[Step, ...]:
         """Recursive: the steps for one spec list, inside the ``loops`` chain.
 
         ``loops`` is the enclosing ``LoopSpec`` chain, outermost-first, which is
         what ``_levels`` zips ``OpSpec.tiled_symbols`` against.  A nested list
         becomes a nested ``LoopStep.body``, so the step tree's nesting is the
         spec tree's nesting and the emitter never has to work out the depth.
+
+        Named for the stage rather than the step because numbering the stages is
+        what this walk does that emission cannot: a spec is a stage, and only the
+        walk sees the specs in one order across the nesting.  ``self._next_stage``
+        rather than a parameter, so the recursion cannot restart the count in a
+        loop body and hand two stages the same number.
         """
         steps: list[Step] = []
         # The vector is walked as it is given: fusion happened in ``add_specs``,
@@ -1197,7 +1220,7 @@ class KernelPlan:
                         "a symbolic trip count is not supported yet"
                     )
                 steps.append(
-                    LoopStep(trip=trip, body=self._steps(entry.body, [*loops, entry]))
+                    LoopStep(trip=trip, body=self._stages(entry.body, [*loops, entry]))
                 )
                 continue
             if not isinstance(entry, OpSpec):
@@ -1227,10 +1250,14 @@ class KernelPlan:
                     f"{arm.kind.name} but this spec asks for "
                     f"{'a reduction' if entry.is_reduction else 'an elementwise op'}"
                 )
-            steps.append(self._compute_step(entry, loops))
+            stage = self._next_stage
+            self._next_stage += 1
+            steps.append(self._compute_step(entry, loops, stage))
         return tuple(steps)
 
-    def _compute_step(self, spec: OpSpec, loops: Sequence[LoopSpec]) -> ComputeStep:
+    def _compute_step(
+        self, spec: OpSpec, loops: Sequence[LoopSpec], stage: int
+    ) -> ComputeStep:
         """One op: roles/arity, aliasing, alignment, its buffers and its accesses.
 
         Every derivation for this op runs here, once: the layout and per-level
@@ -1328,6 +1355,7 @@ class KernelPlan:
             ins=tuple((buf_id(arg), accesses[buf_id(arg)]) for arg in inputs),
             out=accesses[buf_id(out)],
             out_buf_id=buf_id(out),
+            stage=stage,
             reduce_dims=reduce_dims,
             indexing=indexing,
             attrs=attrs,
@@ -1468,15 +1496,27 @@ class ConcessionKind(enum.Enum):
     concedes is a message nobody has read, and it looks like coverage.
     """
 
-    #: Memory planning reserved space for a buffer that no longer exists, and
-    #: nothing here gives it back: placement runs long before this does, and
-    #: this emitter cannot issue the device allocate that would let it own an
-    #: address itself.  Costs CAPACITY and not runtime -- no traffic, no time,
-    #: nothing the emitted kernel does differently -- so it says something was
-    #: left on the floor, not that anything got worse.  Whether it is worth
-    #: saying at all is open: it fires on every successful fusion, and nobody
-    #: has yet shown an abandoned reservation changing a placement decision.
-    ABANDONED_RESERVATION = enum.auto()
+    #: Memory planning chose a placement -- a space, an offset and a size -- for
+    #: a buffer that no longer exists, and this kernel does not carry it out.
+    #:
+    #: What is abandoned is the STRATEGY, not a reservation: on this path the
+    #: allocation that would have turned it into one is never issued.
+    #: ``async_compile.ktir()`` takes no ``pool_size`` and emits no
+    #: ``sdscbundle.device_mem_allocate`` -- the SDSC path does, sized from the
+    #: pool's high-water mark -- and ``frontend_pool_allocation`` is rejected
+    #: outright for this emitter (``spyre_kernel.py``), so no device memory is
+    #: ever held on a plan's behalf here.  The byte count below measures PLANNING
+    #: BOOKKEEPING, not device capacity: nothing is left on the floor, because
+    #: nothing was ever picked up.
+    #:
+    #: Nor is the fusion what abandons it.  This emitter leaves every internal
+    #: buffer's placement unexecuted, fused or not -- the same fact that makes a
+    #: SURVIVING intermediate have no address and need promotion.  A fusion only
+    #: makes the abandonment moot for the one buffer it deletes, which is the
+    #: most benign form the situation takes.  Reported because it is the only
+    #: visible trace that planning and emission disagree about a buffer, not
+    #: because the kernel is worse for it.
+    ABANDONED_STRATEGY = enum.auto()
 
     #: A predicted-runtime report (``SPYRE_DUMP_COST``) prices an op the emitted
     #: kernel does not contain.  The prediction is made from the pre-fusion
@@ -1552,20 +1592,21 @@ class FusionReport:
             if self.of(kind)
         )
         # ``info`` and not ``warning``: this fires on EVERY successful fusion, and
-        # what it names may cost nothing at all -- an abandoned reservation is
-        # capacity, not time, and no abandoned reservation has yet been shown to
-        # change a placement.  A warning on every working compile, describing
-        # nothing actionable, is how a project teaches people to ignore warnings.
-        # Promote it if an abandoned reservation is ever measured to displace
-        # something real.
+        # what it names costs nothing measurable -- an abandoned strategy is a
+        # placement this emitter does not carry out for any internal buffer,
+        # fused or not, so no memory is held and none is lost.  A warning on every
+        # working compile, describing nothing actionable, is how a project teaches
+        # people to ignore warnings.  Promote it if an abandoned strategy is ever
+        # measured to displace something real.
         logger.info(
             "A plan-time fusion rewrote this kernel's OpSpec vector, conceding: "
             "%s. Nothing is wrong with the kernel -- these are accounting notes, "
             "not defects: no memory is left unwritten and no runtime cost is "
             "added. What they record is that there is no KTIR cost model, so the "
             "rewrite came from a hand-written table rather than from a cost "
-            "comparison, and that resources planning committed to the ops it "
-            "deleted stay committed. Log %s at debug for the per-buffer detail, "
+            "comparison, and that the placements planning chose for the ops it "
+            "deleted are not carried out. Log %s at debug for the per-buffer "
+            "detail, "
             "or set TORCH_SPYRE_PLAN_FUSION_WARN=0 to silence this.",
             tally,
             logger.name,
@@ -1582,7 +1623,7 @@ class PlanFusion:
                    not where conditions live.
     ``result_op``  what the collapsed span is called.  A ``RECIPES`` key if the
                    kernel is to emit, but nothing here checks that: an
-                   unemittable result is ``_steps``' refusal to make, and it
+                   unemittable result is ``_stages``' refusal to make, and it
                    names the op.
     ``viable``     ``(fused) -> bool``: is the form about to be emitted one the
                    device computes CORRECTLY?  Separate from the rewrite because
@@ -1686,7 +1727,7 @@ def _collapse_producer(
     The one rewrite the table has, and it is shared: ``span`` is a producer and
     the consumer that survives it, and the only thing an entry contributes is
     the name the survivor comes out under.  None DECLINES, which is not an
-    error: a span that is not this shape reaches ``_steps``, whose per-op refusal
+    error: a span that is not this shape reaches ``_stages``, whose per-op refusal
     ("op 'abs' is not supported yet") is the truth about it.
 
     The producer is DELETED, not threaded.  The device primitive standing behind
@@ -1812,7 +1853,7 @@ def apply_plan_fusions(
 
     Recurses into ``LoopSpec`` bodies because ``_divisions`` reads every op at
     every depth (``_op_specs``) and this runs before it -- where the peephole
-    this replaces was re-invoked per level by ``_steps``' own recursion and so
+    this replaces was re-invoked per level by ``_stages``' own recursion and so
     never had to.  No case in the absmax matrix nests a fusable pair today; a
     coarse-tiled shape is what would.
 
@@ -1966,11 +2007,13 @@ def _concede(
                 # keys (``hbm``/``lx``/``hbm_pool``), so the first names the space.
                 space = next(iter(arg.allocation or {}), "?")
                 report.concede(
-                    ConcessionKind.ABANDONED_RESERVATION,
+                    ConcessionKind.ABANDONED_STRATEGY,
                     buf_id(arg),
-                    f"{_nbytes(arg)} bytes of {space} reserved by planning are "
-                    f"unused (not reclaimed); fusion {fusion.name!r} collapsed op "
-                    f"{spec.op!r} and the buffer ceased to exist",
+                    f"planning placed this buffer in {space} at {_nbytes(arg)} "
+                    f"bytes; fusion {fusion.name!r} collapsed op {spec.op!r} and "
+                    f"the buffer ceased to exist, so that placement is not "
+                    f"carried out -- and this emitter issues no device allocate "
+                    f"for it either way, so no memory was held to reclaim",
                 )
             report.concede(
                 ConcessionKind.STRANDED_COST,
@@ -2228,7 +2271,11 @@ class KtirBuilder:
         # Requires the live context entered by create().
         self.index_t = ir.IndexType.get()
         self.block_args: list = []
-        self.views: dict[str, Any] = {}
+        # ``(stage, buf_id) -> view``, filled by ``view()`` on demand: one view
+        # per stage that tiles the buffer, never one per buffer.
+        self.views: dict[tuple[int, str], Any] = {}
+        # ``buf_id -> base address``, bound once by ``open_kernel``.
+        self.bases: dict[str, Any] = {}
         self.c0 = None
         self._text: str | None = None
 
@@ -2296,18 +2343,24 @@ class KtirBuilder:
 
     @contextlib.contextmanager
     def open_kernel(self, kernel_name: str) -> Iterator[None]:
-        """Open the kernel func with its views bound, and emit its body into it.
+        """Open the kernel func with its bases bound, and emit its body into it.
 
-        ``module { func.func @kernel_name(...) { %c0, one memory view per buffer,
-        <body>, return } }``.  The signature and the views are two faces of one
-        decision -- where a base address comes from -- so they are made together
-        here rather than in two functions a caller has to order correctly.  All of
-        it comes off ``self.plan``, the plan this builder was created for.
+        ``module { func.func @kernel_name(...) { %c0, <body>, return } }``.  The
+        signature and the base addresses are two faces of one decision -- where a
+        base address comes from -- so they are made together here rather than in
+        two functions a caller has to order correctly.  All of it comes off
+        ``self.plan``, the plan this builder was created for.
 
         Baked bases need no func arguments and appear as ``arith.constant``s;
         symbolic bases are one ``index`` parameter each, in ``plan.parameters``
         order.  Deleting the baked arm reverts the dataflow-scheduler#65
         workaround.
+
+        The bases, and not the views: a view belongs to the stage that tiles it
+        (``view()``), because two stages sharing one view abort the backend
+        (``ComputeStep.stage``).  A base is per buffer and shared by every stage,
+        which is why it stays here -- one func parameter or one constant per
+        buffer either way, whatever the stages then do with it.
         """
         baked = self.plan.options.bake_addresses
         buffers = self.plan.parameters
@@ -2339,7 +2392,7 @@ class KtirBuilder:
                                 f"baked plan without an address for {buffer.buf_id}"
                             )
                             base = self.icst_index(buffer.base_elements)
-                        self.views[buffer.buf_id] = self.memory_view(base, buffer)
+                        self.bases[buffer.buf_id] = base
                     yield
                     func.ReturnOp([])  # no operands, matching the signature
             # Printed while the context is still alive.
@@ -2427,7 +2480,7 @@ class KtirBuilder:
         second one being forgotten.
         """
         arm = self.RECIPES[step.op].arm(step.dtype)
-        ins = [self.operand(buf_id, access) for buf_id, access in step.ins]
+        ins = [self.operand(buf_id, access, step.stage) for buf_id, access in step.ins]
         match step.surface:
             case Surface.BARE:
                 value = self._emit_bare(arm.binding(), ins, step)
@@ -2437,7 +2490,9 @@ class KtirBuilder:
                 value = self._emit_generic(arm.binding(), ins, step)
             case _:
                 raise AssertionError(f"unplanned surface {step.surface} of {step.op!r}")
-        self.result(step.out_buf_id, step.out if step.store else None, value)
+        self.result(
+            step.out_buf_id, step.out if step.store else None, value, step.stage
+        )
 
     # -- ktdp shapes -------------------------------------------------------
 
@@ -2480,8 +2535,30 @@ class KtirBuilder:
             )
         )
 
-    def access_tile(self, access: Access):
-        """``ktdp.construct_access_tile`` for ``access``, into its buffer's view.
+    def view(self, stage: int, buffer: Buffer):
+        """``stage``'s memory view of ``buffer``, emitted at first use in it.
+
+        One view per (stage, buffer) and not one per buffer: sharing a view
+        between two stages aborts the backend's ``ComputeGroupExtraction`` --
+        MEASURED on the hand-written softmax chain, where deduping its seven
+        duplicate views onto four aborts on ``op->use_empty()`` while the
+        duplicates it ships with compile clean.  A stage's schedule is extracted
+        into its own module, and the view has to go with it, so a second stage's
+        use of the same view is a use the extraction cannot erase.
+
+        At first use rather than up front, so a stage emits views for the buffers
+        it tiles and no others.  A stage is one ``ComputeStep``, all of whose ops
+        are emitted contiguously at one insertion point, so the view a stage
+        emits dominates every tile that reads it -- including inside a loop body,
+        where the whole stage lives.
+        """
+        key = (stage, buffer.buf_id)
+        if key not in self.views:
+            self.views[key] = self.memory_view(self.bases[buffer.buf_id], buffer)
+        return self.views[key]
+
+    def access_tile(self, access: Access, stage: int):
+        """``ktdp.construct_access_tile`` for ``access``, into ``stage``'s view.
 
         The per-dim index is ``sum_l coeffs[i][l] * iv_l`` over the induction
         variables of the loops this builder has open -- the record holds the
@@ -2513,7 +2590,7 @@ class KtirBuilder:
         return self.val(
             ktdp.construct_access_tile(
                 result=ktdp.AccessTileType.get(sizes, ir.IndexType.get()),
-                base=self.views[access.buffer.buf_id],
+                base=self.view(stage, access.buffer),
                 # How the view is indexed, and the order of the tile's own axes.
                 # Both identity: the tile covers the view one-to-one.
                 base_map=identity,
@@ -2525,7 +2602,7 @@ class KtirBuilder:
             )
         )
 
-    def operand(self, buf_id: str, access: Access):
+    def operand(self, buf_id: str, access: Access, stage: int):
         """An input operand's value: a live produced value, or an access + load.
 
         Reusing a produced value is what register-threaded fused intermediates
@@ -2539,10 +2616,10 @@ class KtirBuilder:
             list(access.extent), self.named_type(access.elems.value)
         )
         return self.val(
-            ktdp.load(result=tensor_t, access_tile=self.access_tile(access))
+            ktdp.load(result=tensor_t, access_tile=self.access_tile(access, stage))
         )
 
-    def result(self, buf_id: str, access: Access | None, value) -> None:
+    def result(self, buf_id: str, access: Access | None, value, stage: int) -> None:
         """Dispose of an op's result: thread it, or store it through ``access``.
 
         The mirror of ``operand`` on the way out.  ``access is None`` is an
@@ -2552,7 +2629,7 @@ class KtirBuilder:
         if access is None:
             self.env.bind_produced(buf_id, value)
         else:
-            ktdp.store(data_tile=value, access_tile=self.access_tile(access))
+            ktdp.store(data_tile=value, access_tile=self.access_tile(access, stage))
 
     # -- compute -----------------------------------------------------------
     #

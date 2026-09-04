@@ -301,7 +301,21 @@ class Layout:
 
 @dataclasses.dataclass(frozen=True)
 class Buffer:
-    """One unique buffer referenced by the kernel; sole input to a memory view."""
+    """One ACCESS's view of a buffer; sole input to a memory view.
+
+    Two kinds of field, and the difference is why there is a record per access
+    rather than one per buffer: ``buf_id``, ``arg_index`` and ``base_elements``
+    are IDENTITY and ADDRESS, which every access to the buffer shares (they key
+    ``plan.parameters`` and ``KtirBuilder.bases``), while ``layout``, ``elems`` and
+    ``space`` are how THIS access views it, and two stages legitimately differ.
+    MEASURED, the layernorm chain views one ``%base_pair`` as
+    ``memref<48x64x!spyreop.fp16_fused>`` in the stage that writes the pair and as
+    ``memref<48x64xf16>`` in the stage that reads the mean out of each stick head.
+
+    ``KernelPlan.buffers`` holds one of these per ``buf_id`` -- the first seen --
+    and what it is held for is the identity half: the signature has one parameter
+    per buffer however many ways the stages view it.
+    """
 
     buf_id: str  # opspec_utils.buf_id(arg)
     arg_index: int  # position in the kernel call; -1 => not a kernel argument
@@ -1477,15 +1491,29 @@ class KernelPlan:
         # Positions are the inputs in operand order and then the result, which is
         # what ``Recipe.unfused`` names: the element type an access reads a buffer
         # AT is the op's business, not the buffer's arrangement (see ``unfused``).
-        accesses = {
-            buf_id(arg): self._access_of(
+        accesses: dict[str, Access] = {}
+        for position, arg in enumerate((*inputs, out)):
+            access = self._access_of(
                 arg,
                 levels,
                 head=_reads_stick_head(arg),
                 unfused=position in recipe.unfused,
             )
-            for position, arg in enumerate((*inputs, out))
-        }
+            earlier = accesses.get(buf_id(arg))
+            if earlier is not None and earlier.elems != access.elems:
+                # Two accesses to one buffer at two element types WITHIN ONE STAGE.
+                # The views are keyed ``(stage, buf_id)``, so the second would
+                # silently take the first's view and load the wrong element type --
+                # refused rather than keyed more finely, because neither target
+                # needs it: the chain's stage 2 reads the pair base only as f16,
+                # and the two types it does need are in two different stages.
+                raise NotImplementedError(
+                    f"OpSpec->KTIR: op {spec.op!r} reads buffer {buf_id(arg)!r} as "
+                    f"both {earlier.elems.storage} and {access.elems.storage} in one "
+                    "stage; a stage has one view per buffer, so two element types "
+                    "in one stage are not supported"
+                )
+            accesses[buf_id(arg)] = access
         if not spec.is_reduction:
             # ``align_reshape_plan`` is the SWITCH, not a refusal: ``None`` means
             # this operand's coordinates and extents are the output's, which is the
@@ -1564,10 +1592,11 @@ class KernelPlan:
     ) -> Access:
         """``arg``'s access at this depth, registering its buffer on the way.
 
-        The buffer is registered first and handed to the access, so the record
-        carries its own way back to the view the builder will bind for it.  The
-        first record seen for a ``buf_id`` wins, which is the one every later
-        access to that buffer points at.
+        The buffer record is built here and handed to the access, so the record
+        carries its own way back to the view the builder will bind for it.  Each
+        access gets its OWN record; ``self.buffers`` keeps the first one seen for a
+        ``buf_id``, and what it is kept for is identity and the func signature --
+        one parameter per buffer however many ways the stages view it.
 
         ``head`` narrows the TILE to one element on the innermost axis and leaves
         the VIEW alone -- the buffer is a whole stick per statistic either way, and
@@ -1587,10 +1616,21 @@ class KernelPlan:
         elems = ElemTypes.of(arg.device_dtype, None if unfused else _arrangement(arg))
         buffer = None
         if not is_internal(arg):
-            buffer = self.buffers.setdefault(
-                buf_id(arg),
-                _buffer(arg, layout, elems, bake_addresses=self.options.bake_addresses),
+            # A ``Buffer`` PER ACCESS, built from this arg's own layout and element
+            # types, and the registry keeps the first one.  The record does double
+            # duty -- identity and address, which must be shared because
+            # ``plan.parameters`` and ``KtirBuilder.bases`` are keyed by ``buf_id``;
+            # geometry and element type, which are per access -- and sharing both
+            # through one ``setdefault`` is what made every stage's view of a buffer
+            # take the FIRST stage's element type.  MEASURED, the layernorm chain
+            # needs two: ``%base_pair`` is viewed as
+            # ``memref<48x64x!spyreop.fp16_fused>`` where ``exx2_fused`` writes the
+            # pair and as ``memref<48x64xf16>`` where ``layernormnorm`` reads the
+            # mean out of the stick head.
+            buffer = _buffer(
+                arg, layout, elems, bake_addresses=self.options.bake_addresses
             )
+            self.buffers.setdefault(buf_id(arg), buffer)
         # The divisions are the outermost levels, so their steps come first.
         extent, rows = _divide(arg, self._symbols, self._divisors)
         if head:
@@ -3063,15 +3103,19 @@ class KtirBuilder:
         # is ``spyreop.layernormnorm %x squares %sq scale %sc weight %w bias %b``,
         # and the builder takes them in that order.
         #
-        # ``squares`` (position 1) is read UNFUSED: it names the very buffer
-        # ``exx2_fused`` wrote as a pair, and this op reads only the mean out of
-        # the head of each stick, as ``f16``.  MEASURED in
+        # ``squares`` (1) and ``scale`` (2) are read UNFUSED, and MEASURED on the
+        # real ``F.layer_norm`` vector both of their args carry ``EXX2``: the flag
+        # follows the BUFFER (``exx2``'s pair, and ``layernormscale``'s output,
+        # which is flagged although the op returns ``f16``), and it is propagated
+        # to every arg naming one.  This op reads a plain ``f16`` out of the head of
+        # each stick in both cases -- MEASURED in
         # ``ktir-spyreop-layernorm-chain.mlir``, where ``%view_sq`` is a
-        # ``memref<48x64xf16>`` over the same ``%base_pair`` the fused view covers.
+        # ``memref<48x64xf16>`` over the same ``%base_pair`` the fused view covers
+        # and ``%view_sc_in`` is a ``memref<48x64xf16>`` too.
         "layernormnorm": Recipe(
             arity=5,
             arms=Arm(kind=BindingKind.PAYLOAD, binding=lambda: spyreop.layernormnorm),
-            unfused=(1,),
+            unfused=(1, 2),
         ),
         "softplus": Recipe(
             arity=1,

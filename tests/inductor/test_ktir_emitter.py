@@ -32,6 +32,7 @@ from test_ktir_validate import (
     make_onstick_sum_specs,
     make_op_spec,
     make_statistic_reader_specs,
+    make_two_element_type_specs,
 )
 from torch_spyre._C import ElementArrangement
 
@@ -1086,6 +1087,71 @@ class TestArityBeyondTwoEmission(unittest.TestCase):
             "bias %in_3 : f32",
             emitted,
         )
+
+
+@unittest.skipUnless(
+    _mlir_ktdp_available(),
+    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
+)
+class TestOneBufferViewedAtTwoElementTypesEmission(unittest.TestCase):
+    """One base address, two memref element types, one func parameter.
+
+    DECISION pinned: the two views of one buffer are emitted from the two
+    ACCESSES' own records, so the stage that writes fused statistics views the
+    base as ``!spyreop.fp16_fused`` and the stage that reads a mean out of each
+    stick head views the same base as ``f16``.
+
+    LIMITATION forcing it: ``Buffer`` was registered first-wins per ``buf_id``, so
+    every stage's view took the first stage's element type -- and the element type
+    is not the arrangement's to give either, so the two views also differ by what
+    the RECIPE says each operand reads.
+
+    Pinned against ``ktir-spyreop-layernorm-chain.mlir``'s ``%view_pair`` /
+    ``%view_sq`` over one ``%base_pair``.  MEASURED on the emitted module:
+    ``dbo-opt --from-ktir --kEmitSpyreCode`` exits 0 with TWO ``module
+    @local_schedule``s.
+    """
+
+    def test_one_base_is_viewed_at_two_element_types(self):
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir("TwoElementTypes_1", make_two_element_type_specs())
+        views = [
+            line
+            for line in emitted.splitlines()
+            if "construct_memory_view %arg1," in line
+        ]
+        self.assertEqual(len(views), 2)
+        # Same base, same sizes and strides; different element type.
+        for view in views:
+            self.assertIn("sizes: [256, 64], strides: [64, 1]", view)
+        self.assertEqual(
+            sum("memref<256x64x!spyreop.fp16_fused>" in view for view in views), 1
+        )
+        self.assertEqual(sum(view.endswith("memref<256x64xf16>") for view in views), 1)
+
+    def test_the_two_views_are_one_parameter_and_one_address(self):
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir("TwoElementTypes_1", make_two_element_type_specs())
+        # Seven buffers, seven parameters: the pair is ONE of them.
+        self.assertIn(
+            "func.func @TwoElementTypes_1(%arg0: index, %arg1: index, %arg2: index, "
+            "%arg3: index, %arg4: index, %arg5: index, %arg6: index)",
+            emitted,
+        )
+
+    def test_the_fused_write_covers_the_stick_and_the_plain_read_its_head(self):
+        """The element type and the tile are two different facts about one buffer,
+        and both differ between the stages."""
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir("TwoElementTypes_1", make_two_element_type_specs())
+        self.assertIn(
+            "ktdp.store %4, %6 : tensor<256x64x!spyreop.fp16_fused>, <256x64xindex>",
+            emitted,
+        )
+        self.assertIn("ktdp.load %11 : <256x1xindex> -> tensor<256x1xf16>", emitted)
 
 
 if __name__ == "__main__":

@@ -360,6 +360,52 @@ def make_statistic_reader_specs(reader: str = "realdiv") -> list:
     return [produce, consume]
 
 
+def make_two_element_type_specs() -> list:
+    """Two stages over ONE buffer, each reading it at a different element type.
+
+    Stage 0 reduces and writes ``pair`` as fused statistics -- two values in one
+    element, which the buffer's ``ElementArrangement.EXX2`` says.  Stage 1 reads
+    that same buffer as one of its five operands, and the recipe declares THAT
+    operand unfused, so the read is a plain float out of the head of each stick.
+    Every other operand of stage 1 is a full-extent HBM arg, so the only thing the
+    vector is about is the one buffer with two element types.
+    """
+    rows, reduced = sympy.symbols("c0 c1")
+    stick, lane = sympy.floor(reduced / 64), sympy.Mod(reduced, 64)
+    zero = sympy.Integer(0)
+    fused = ElementArrangement.EXX2
+    produce = make_op_spec(
+        "exx2",
+        is_reduction=True,
+        inputs=1,
+        names=["x0", "pair"],
+        sizes=[[2, 256, 64], [1, 256, 64]],
+        coords_per_arg=[[stick, rows, lane], [zero, rows, zero]],
+        arrangements=[None, fused],
+        space={rows: (256, 1), reduced: (128, 1)},
+    )
+    e0, e1, e2 = sympy.symbols("e0 e1 e2")
+    full, statistic = [e0, e1, e2], [zero, e1, zero]
+    consume = make_op_spec(
+        "layernormnorm",
+        inputs=5,
+        names=["x1", "pair", "s2", "s3", "s4", "out0"],
+        sizes=[[2, 256, 64], [1, 256, 64], *([[2, 256, 64]] * 4)],
+        coords_per_arg=[full, statistic, full, full, full, full],
+        # The flag is on the BUFFER, so the reader's arg carries it too; that the
+        # read is nonetheless f16 is the recipe's word and not the arg's.
+        arrangements=[None, fused, None, None, None, None],
+        space={e0: (2, 1), e1: (256, 1), e2: (64, 1)},
+        first_arg_index=2,
+    )
+    # ``pair`` is ONE buffer at ONE index, which the per-spec numbering cannot
+    # know; the args after it close the gap that leaves.
+    consume.args[1].arg_index = 1  # pair, as stage 0 numbered it
+    for position, index in enumerate((3, 4, 5, 6), start=2):
+        consume.args[position].arg_index = index
+    return [produce, consume]
+
+
 def make_linked_op_specs(
     ops: tuple = ("abs", "max"),
     *,
@@ -2622,6 +2668,65 @@ class TestBroadcastOperands(unittest.TestCase):
         self.assertEqual(step.indexing.maps[0], (0, 1, 2))
 
 
+class TestOneBufferViewedAtTwoElementTypes(unittest.TestCase):
+    """Two stages, one buffer, two element types -- and one address.
+
+    DECISION pinned: a ``Buffer`` record belongs to an ACCESS, built from that
+    arg's own layout and element types, while ``KernelPlan.buffers`` keeps one per
+    ``buf_id`` for identity and the signature.  So two stages can view one base
+    two ways and the func still takes one parameter for it.
+
+    LIMITATION forcing it: the record did double duty.  Identity and address MUST
+    be shared (they key ``plan.parameters`` and ``KtirBuilder.bases``); geometry and
+    element type are per access -- and one ``setdefault`` shared both, so every
+    stage's view took the FIRST stage's element type.
+
+    MEASURED requirement: ``ktir-spyreop-layernorm-chain.mlir`` views one
+    ``%base_pair`` as ``memref<48x64x!spyreop.fp16_fused>`` where the pair is
+    written and as ``memref<48x64xf16>`` where the mean is read out of each stick
+    head.
+    """
+
+    def test_each_access_carries_its_own_element_type_on_one_buf_id(self):
+        plan = ktir.build_kernel_plan(make_two_element_type_specs())
+        produce, consume = plan.steps
+        [(link, statistic)] = [pair for pair in consume.ins if pair[0] == "pair"]
+        self.assertEqual((produce.out_buf_id, link), ("pair", "pair"))
+        self.assertEqual(produce.out.elems.storage, "!spyreop.fp16_fused")
+        self.assertEqual(statistic.elems.storage, "f16")
+        # One buffer, so one geometry: the views differ in element type only.
+        self.assertEqual(produce.out.buffer.layout, statistic.buffer.layout)
+        self.assertEqual(
+            (produce.out.buffer.arg_index, statistic.buffer.arg_index), (1, 1)
+        )
+
+    def test_the_signature_still_lists_the_buffer_once(self):
+        """The dedup by ``buf_id`` is what keeps the signature right while the
+        views diverge: one ``index`` parameter per buffer, not per view."""
+        plan = ktir.build_kernel_plan(make_two_element_type_specs())
+        self.assertEqual([b.buf_id for b in plan.parameters].count("pair"), 1)
+        self.assertEqual(
+            [b.buf_id for b in plan.parameters],
+            ["x0", "pair", "x1", "s2", "s3", "s4", "out0"],
+        )
+
+    def test_two_element_types_for_one_buffer_in_one_stage_are_refused(self):
+        """Refused, not keyed more finely: the views are per ``(stage, buf_id)``,
+        so the second access would silently take the first's view and load the
+        wrong element type.  Neither target needs it."""
+        specs = make_two_element_type_specs()
+        consume = specs[1]
+        # Operand 3, which the recipe does not name and which therefore reads its
+        # buffer at the buffer's fused arrangement, now names the very buffer
+        # operand 1 reads unfused.
+        consume.args[3] = dataclasses.replace(
+            consume.args[1], element_arrangement=ElementArrangement.EXX2
+        )
+        with self.assertRaises(NotImplementedError) as ctx:
+            ktir.build_kernel_plan(specs)
+        self.assertIn("two element types in one stage", str(ctx.exception))
+
+
 class TestArityBeyondTwoAndPerOperandElementTypes(unittest.TestCase):
     """An op with five operands, and one of them read at another element type.
 
@@ -2655,17 +2760,25 @@ class TestArityBeyondTwoAndPerOperandElementTypes(unittest.TestCase):
         self.assertEqual(step.indexing.maps, ((0, 1, 2),) * 6)
 
     def test_the_recipe_and_not_the_arrangement_types_an_operand(self):
-        """Two operands whose buffers both hold fused pairs; the recipe says only
-        ONE of them is read as a pair, and that is the one that is."""
+        """Three operands whose buffers all hold fused statistics; the recipe says
+        which of them are nonetheless READ as plain floats.
+
+        MEASURED on the real ``F.layer_norm`` vector: ``layernormnorm``'s
+        ``squares`` and ``scale`` args both carry ``EXX2`` -- the flag follows the
+        buffer and is propagated to every arg naming one -- and the chain reads
+        both through an ``f16`` view of the stick head.  So the two positions the
+        recipe names are unfused and any other operand's arrangement still stands.
+        """
         recipe = ktir.KtirBuilder.RECIPES["layernormnorm"]
-        self.assertEqual(recipe.unfused, (1,))  # squares, read as f16
+        self.assertEqual(recipe.unfused, (1, 2))  # squares and scale, as f16
         fused = ElementArrangement.EXX2
         plan = ktir.build_kernel_plan(
-            [self._five_inputs([None, fused, fused, None, None, None])]
+            [self._five_inputs([None, fused, fused, fused, None, None])]
         )
         [step] = plan.steps
         self.assertEqual(step.ins[1][1].elems.storage, "f32")
-        self.assertEqual(step.ins[2][1].elems.storage, "!spyreop.fp32_fused")
+        self.assertEqual(step.ins[2][1].elems.storage, "f32")
+        self.assertEqual(step.ins[3][1].elems.storage, "!spyreop.fp32_fused")
 
     def test_the_result_can_be_the_unfused_position(self):
         """``layernormscale_fused`` returns a plain float out of a buffer the

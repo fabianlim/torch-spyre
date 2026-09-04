@@ -1026,5 +1026,67 @@ class TestStatisticReadEmission(unittest.TestCase):
         self.assertIn("tensor<2x256x64xf16>, tensor<256x1xf16>)", emitted)
 
 
+@unittest.skipUnless(
+    _mlir_ktdp_available(),
+    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
+)
+class TestArityBeyondTwoEmission(unittest.TestCase):
+    """Five operands in one ``linalg.generic``, every one a func argument.
+
+    DECISION pinned: arity is not a shape.  Five inputs cost one recipe -- six
+    identity maps, six block arguments, the payload called with five of them in
+    operand order -- and no emitter change.
+
+    LIMITATION forcing the test: every ``RECIPES`` entry was arity 1 or 2, so
+    nothing had ever exercised the generic arity of ``validated_roles``,
+    ``_parallel_surface`` and ``_emit_generic``'s block.
+
+    Pinned against ``ktir-spyreop-layernormnorm.mlir``, at that module's own
+    extents and format.  MEASURED on the emitted module: ``dbo-opt --from-ktir
+    --kEmitSpyreCode`` exits 0 with ONE ``module @local_schedule``, that module's
+    own count.
+    """
+
+    @staticmethod
+    def _five_input_spec():
+        from torch_spyre._C import DataFormats
+
+        return make_op_spec(
+            "layernormnorm", inputs=5, size=[12, 64, 64], dtype=DataFormats.IEEE_FP32
+        )
+
+    def test_the_generic_states_one_map_per_operand_and_one_for_the_result(self):
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir("LayerNormNorm_1", [self._five_input_spec()])
+        self.assertIn(
+            "indexing_maps = [#map, #map, #map, #map, #map, #map], "
+            'iterator_types = ["parallel", "parallel", "parallel"]',
+            emitted,
+        )
+        self.assertIn(
+            "^bb0(%in: f32, %in_0: f32, %in_1: f32, %in_2: f32, "
+            "%in_3: f32, %out: f32):",
+            emitted,
+        )
+        # Six index parameters, one per operand and one for the result.
+        self.assertIn(
+            "func.func @LayerNormNorm_1(%arg0: index, %arg1: index, %arg2: index, "
+            "%arg3: index, %arg4: index, %arg5: index)",
+            emitted,
+        )
+
+    def test_the_payload_is_called_with_its_operands_in_order(self):
+        """The spelling is positional, so operand order is the whole contract."""
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir("LayerNormNorm_1", [self._five_input_spec()])
+        self.assertIn(
+            "spyreop.layernormnorm %in squares %in_0 scale %in_1 weight %in_2 "
+            "bias %in_3 : f32",
+            emitted,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

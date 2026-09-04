@@ -334,7 +334,9 @@ class Access:
 
     ``elems`` is the access's own element type pair: a tile of an internal buffer
     has no ``Buffer`` to read one from, and a load that reinterprets would differ
-    from its buffer's storage type anyway.
+    from its buffer's storage type anyway.  Its DERIVATION is the buffer's
+    arrangement unless the recipe says the operand reads the buffer unfused
+    (``Recipe.unfused``), which is why it is passed in rather than read off the arg.
 
     ``buffer`` is what the access is a tile *of*, so a record carries its own way
     back to the view; ``None`` for an internal (threaded) buffer, which has no
@@ -1025,6 +1027,7 @@ def _access(
     extent: Sequence[Any],
     rows: Sequence[Sequence[int]],
     layout: Layout,
+    elems: ElemTypes,
     buffer: Buffer | None = None,
 ) -> Access:
     """The access record for one ``(OpSpec, TensorArg)``.
@@ -1052,7 +1055,7 @@ def _access(
     return Access(
         extent=extent,
         index_coeffs=index_coeffs,
-        elems=ElemTypes.of(arg.device_dtype, _arrangement(arg)),
+        elems=elems,
         buffer=buffer,
     )
 
@@ -1471,9 +1474,17 @@ class KernelPlan:
                 else arg
                 for arg in inputs
             ]
+        # Positions are the inputs in operand order and then the result, which is
+        # what ``Recipe.unfused`` names: the element type an access reads a buffer
+        # AT is the op's business, not the buffer's arrangement (see ``unfused``).
         accesses = {
-            buf_id(arg): self._access_of(arg, levels, head=_reads_stick_head(arg))
-            for arg in (*inputs, out)
+            buf_id(arg): self._access_of(
+                arg,
+                levels,
+                head=_reads_stick_head(arg),
+                unfused=position in recipe.unfused,
+            )
+            for position, arg in enumerate((*inputs, out))
         }
         if not spec.is_reduction:
             # ``align_reshape_plan`` is the SWITCH, not a refusal: ``None`` means
@@ -1544,7 +1555,12 @@ class KernelPlan:
         )
 
     def _access_of(
-        self, arg: TensorArg, levels: Sequence[Level], *, head: bool = False
+        self,
+        arg: TensorArg,
+        levels: Sequence[Level],
+        *,
+        head: bool = False,
+        unfused: bool = False,
     ) -> Access:
         """``arg``'s access at this depth, registering its buffer on the way.
 
@@ -1562,9 +1578,13 @@ class KernelPlan:
         ``error: the tile covers more than the first element of its innermost
         dimension``, because the mean of squares sits sixteen bytes along the mean
         and a wider tile puts that offset on the next statistic.
+
+        ``unfused`` is the recipe's word that THIS operand reads the buffer at its
+        plain element type although the buffer holds fused statistics -- the mean
+        out of the head of a pair's stick, as ``f16``.
         """
         layout, q = _solve_layout(arg, levels)
-        elems = ElemTypes.of(arg.device_dtype, _arrangement(arg))
+        elems = ElemTypes.of(arg.device_dtype, None if unfused else _arrangement(arg))
         buffer = None
         if not is_internal(arg):
             buffer = self.buffers.setdefault(
@@ -1575,7 +1595,7 @@ class KernelPlan:
         extent, rows = _divide(arg, self._symbols, self._divisors)
         if head:
             extent = (*extent[:-1], 1)
-        return _access(arg, extent, [*rows, *q], layout, buffer)
+        return _access(arg, extent, [*rows, *q], layout, elems, buffer)
 
 
 def _base_address_elements(arg: TensorArg) -> int:
@@ -2341,6 +2361,22 @@ class Recipe:
     # the thirteen entries, and a stray missing comma turns a tuple into an ``Arm``
     # silently.
     arms: Arm | tuple[Arm, ...]
+    # Which operand positions this op reads (or writes) at the buffer's PLAIN
+    # element type although the buffer's ``element_arrangement`` says it holds
+    # fused statistics.  Positions are the inputs in operand order and then the
+    # result last -- the order ``Indexing.maps`` takes -- so ``arity`` is the
+    # result's position.
+    #
+    # It is on the RECIPE because it is a fact about the op and not about the
+    # buffer.  MEASURED on the real layernorm vector, ``element_arrangement``
+    # answers this question wrongly twice: it is propagated to every arg naming a
+    # statistic buffer ("this holds two values to a stick"), and it does not say
+    # how an operand READS it.  ``layernormscale_fused`` takes the pair as one
+    # element and returns ``f16`` (``... : !spyreop.fp16_fused -> f16``), and
+    # ``layernormnorm`` reads only the mean out of the stick head, as ``f16``, from
+    # the very buffer ``exx2_fused`` wrote as a pair.  So the arrangement is the
+    # default and the recipe has the last word.
+    unfused: tuple[int, ...] = ()
     # How to read the op's scalar arguments out of a spec's ``op_info``, for the
     # few ops whose builder takes more than operands (softplus).  ``None`` when
     # the op is a pure function of its operands, which is almost all of them.
@@ -2363,6 +2399,12 @@ class Recipe:
             raise ValueError(
                 "OpSpec->KTIR: two arms claim the same format: "
                 f"{sorted({d.name for d in claimed if claimed.count(d) > 1})}"
+            )
+        if any(not 0 <= position <= self.arity for position in self.unfused):
+            raise ValueError(
+                f"OpSpec->KTIR: unfused positions {self.unfused} name an operand "
+                f"an arity-{self.arity} op does not have (the result is "
+                f"{self.arity})"
             )
         object.__setattr__(self, "arms", arms)
 
@@ -3009,6 +3051,27 @@ class KtirBuilder:
                 kind=BindingKind.PAYLOAD,
                 binding=lambda: spyreop.layernormscale_fused,
             ),
+            # The RESULT (position 1, arity being 1) is a plain float, whatever the
+            # output buffer's arrangement says.  MEASURED: the frontend flags that
+            # buffer ``EXX2`` too -- it propagates the flag to every arg naming a
+            # statistic buffer -- and the op is
+            # ``... : !spyreop.fp16_fused -> f16``.
+            unfused=(1,),
+        ),
+        # The normalisation itself: five operands, positional, no attributes.
+        # MEASURED against ``ktir-spyreop-layernormnorm.mlir`` -- the printed form
+        # is ``spyreop.layernormnorm %x squares %sq scale %sc weight %w bias %b``,
+        # and the builder takes them in that order.
+        #
+        # ``squares`` (position 1) is read UNFUSED: it names the very buffer
+        # ``exx2_fused`` wrote as a pair, and this op reads only the mean out of
+        # the head of each stick, as ``f16``.  MEASURED in
+        # ``ktir-spyreop-layernorm-chain.mlir``, where ``%view_sq`` is a
+        # ``memref<48x64xf16>`` over the same ``%base_pair`` the fused view covers.
+        "layernormnorm": Recipe(
+            arity=5,
+            arms=Arm(kind=BindingKind.PAYLOAD, binding=lambda: spyreop.layernormnorm),
+            unfused=(1,),
         ),
         "softplus": Recipe(
             arity=1,

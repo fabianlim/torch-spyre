@@ -1464,7 +1464,11 @@ class TestLoopDerivations(unittest.TestCase):
         a, c = spec.args
 
         a_layout, a_q = ktir._solve_layout(a, levels)
-        a_access = ktir._access(a, a.device_size, a_q, a_layout)
+        # ``elems`` is the CALLER's answer: which element type an access reads a
+        # buffer at is the op's business (``Recipe.unfused``), not the arg's.
+        a_access = ktir._access(
+            a, a.device_size, a_q, a_layout, ktir.ElemTypes.of(a.device_dtype)
+        )
         # The tile extent is device_size, which is what tiling already baked in.
         self.assertEqual(a_access.extent, (1, 1, 64))
         # Per view dim, the step each level takes: dim 0 <- n_stick, dim 1 <- m,
@@ -1472,7 +1476,9 @@ class TestLoopDerivations(unittest.TestCase):
         self.assertEqual(a_access.index_coeffs, ((1, 0), (0, 1), (0, 0)))
 
         c_layout, c_q = ktir._solve_layout(c, levels)
-        c_access = ktir._access(c, c.device_size, c_q, c_layout)
+        c_access = ktir._access(
+            c, c.device_size, c_q, c_layout, ktir.ElemTypes.of(c.device_dtype)
+        )
         self.assertEqual(c_access.extent, (1, 64))
         self.assertEqual(c_access.index_coeffs, ((1, 0), (0, 0)))
 
@@ -1482,7 +1488,9 @@ class TestLoopDerivations(unittest.TestCase):
         layout, q = ktir._solve_layout(arg, [])
         self.assertEqual(layout.extent, (16, 512, 64))
         self.assertEqual(q, [])
-        access = ktir._access(arg, arg.device_size, q, layout)
+        access = ktir._access(
+            arg, arg.device_size, q, layout, ktir.ElemTypes.of(arg.device_dtype)
+        )
         # One empty sum per dim: every index expression is zero.
         self.assertEqual(access.index_coeffs, ((), (), ()))
 
@@ -2612,6 +2620,82 @@ class TestBroadcastOperands(unittest.TestCase):
         plan = ktir.build_kernel_plan([make_broadcast_op_spec("row")])
         [step] = plan.steps
         self.assertEqual(step.indexing.maps[0], (0, 1, 2))
+
+
+class TestArityBeyondTwoAndPerOperandElementTypes(unittest.TestCase):
+    """An op with five operands, and one of them read at another element type.
+
+    DECISION pinned: arity is generic (nothing in the plan counts to two), and the
+    element type an access reads a buffer AT belongs to the RECIPE
+    (``Recipe.unfused``), positions being the inputs in order and then the result.
+
+    LIMITATION forcing the second half: ``element_arrangement`` cannot answer it.
+    MEASURED on the real normalisation vector, the flag is propagated to every arg
+    naming a statistic buffer -- so it says "this buffer holds two values to a
+    stick", which is true, and not "this operand reads them as a pair", which is
+    false for two of the four args that carry it.
+    """
+
+    @staticmethod
+    def _five_inputs(arrangements=None):
+        return make_op_spec(
+            "layernormnorm",
+            inputs=5,
+            size=[12, 64, 64],
+            dtype=DataFormats.IEEE_FP32,
+            arrangements=arrangements,
+        )
+
+    def test_five_operands_plan_with_one_map_each_and_one_for_the_result(self):
+        plan = ktir.build_kernel_plan([self._five_inputs()])
+        [step] = plan.steps
+        self.assertEqual(len(step.ins), 5)
+        self.assertEqual(len(plan.parameters), 6)
+        self.assertIs(step.surface, ktir.Surface.GENERIC)
+        self.assertEqual(step.indexing.maps, ((0, 1, 2),) * 6)
+
+    def test_the_recipe_and_not_the_arrangement_types_an_operand(self):
+        """Two operands whose buffers both hold fused pairs; the recipe says only
+        ONE of them is read as a pair, and that is the one that is."""
+        recipe = ktir.KtirBuilder.RECIPES["layernormnorm"]
+        self.assertEqual(recipe.unfused, (1,))  # squares, read as f16
+        fused = ElementArrangement.EXX2
+        plan = ktir.build_kernel_plan(
+            [self._five_inputs([None, fused, fused, None, None, None])]
+        )
+        [step] = plan.steps
+        self.assertEqual(step.ins[1][1].elems.storage, "f32")
+        self.assertEqual(step.ins[2][1].elems.storage, "!spyreop.fp32_fused")
+
+    def test_the_result_can_be_the_unfused_position(self):
+        """``layernormscale_fused`` returns a plain float out of a buffer the
+        frontend flags fused, so the position named is the result."""
+        self.assertEqual(ktir.KtirBuilder.RECIPES["layernormscale"].unfused, (1,))
+        plan = ktir.build_kernel_plan(
+            [
+                make_op_spec(
+                    "layernormscale",
+                    inputs=1,
+                    arrangements=[ElementArrangement.EXX2, ElementArrangement.EXX2],
+                )
+            ]
+        )
+        [step] = plan.steps
+        self.assertEqual(step.ins[0][1].elems.storage, "!spyreop.fp16_fused")
+        self.assertEqual(step.out.elems.storage, "f16")
+
+    def test_an_unfused_position_the_op_does_not_have_is_a_typo(self):
+        """A recipe is source, so a position past the result fails where it is
+        written rather than typing some other operand by accident."""
+        with self.assertRaises(ValueError) as ctx:
+            ktir.Recipe(
+                arity=1,
+                arms=ktir.Arm(
+                    kind=ktir.BindingKind.PAYLOAD, binding=lambda: None, dtypes=()
+                ),
+                unfused=(2,),
+            )
+        self.assertIn("does not have", str(ctx.exception))
 
 
 class TestReadingAStatisticAtTheHeadOfItsStick(unittest.TestCase):

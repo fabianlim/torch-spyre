@@ -233,8 +233,12 @@ def make_nested_op_spec(*, levels: list, **overrides) -> tuple:
     return loops[0], spec, loops
 
 
-def make_onstick_sum_specs() -> list:
+def make_onstick_sum_specs(op: str = "sum", arrangements: list | None = None) -> list:
     """``sum(x[256, 128], dim=-1)`` on one core, as the frontend projects it.
+
+    ``op`` names the reduction and ``arrangements`` is passed straight through, so
+    the same vector serves any arity-1 reduction over the stick -- the shape is the
+    fixture's contribution and the op is the caller's.
 
     The reduction runs along the *stick*, so it consumes both halves of the
     reduced symbol -- the outer-stick chunk index ``floor(c1 / 64)`` and the
@@ -251,9 +255,10 @@ def make_onstick_sum_specs() -> list:
     stick, lane = sympy.floor(reduced / 64), sympy.Mod(reduced, 64)
     return [
         make_op_spec(
-            "sum",
+            op,
             is_reduction=True,
             inputs=1,
+            arrangements=arrangements,
             sizes=[[2, 256, 64], [1, 256, 64]],
             coords_per_arg=[
                 [stick, rows, lane],
@@ -2442,6 +2447,43 @@ class TestRefusals(unittest.TestCase):
             with self.subTest(message=message[:40]):
                 for blame in ("dbo-opt", "no consumer", "nothing lowers", "scheduler"):
                     self.assertNotIn(blame, message)
+
+
+class TestAReducingBodyThatIgnoresItsAccumulator(unittest.TestCase):
+    """A reduction registered ``COMBINER`` whose binding ignores ``accumulated``.
+
+    DECISION pinned: this needs no mechanism.  The kind says only that the op
+    REDUCES -- which is the bit ``_stages`` compares against ``is_reduction`` --
+    so a binding that does not use its accumulator reaches the ordinary reducing
+    generic, and the plan records exactly what a bare ``sum`` over the stick
+    records.
+
+    LIMITATION forcing it: what the body is FOR is a device pattern that replaces
+    the whole generic.  Nothing here can check that the pattern matches, so the
+    recipe is the only place that can say so, and it does.
+    """
+
+    def test_it_reduces_and_is_registered_as_a_combiner(self):
+        """Both statements of the one bit agree, so the equality check passes."""
+        recipe = ktir.KtirBuilder.RECIPES["exx2"]
+        self.assertEqual(recipe.arity, 1)
+        self.assertIs(recipe.arm(FP16).kind, ktir.BindingKind.COMBINER)
+
+    def test_the_plan_is_the_ordinary_on_stick_reduction(self):
+        specs = make_onstick_sum_specs(
+            "exx2", arrangements=[ElementArrangement.STANDARD, ElementArrangement.EXX2]
+        )
+        plan = ktir.build_kernel_plan(specs)
+        [step] = plan.steps
+        self.assertIs(step.surface, ktir.Surface.GENERIC)
+        self.assertEqual(
+            step.indexing.iters, ("reduction", "parallel", "reduction", "parallel")
+        )
+        self.assertEqual(step.indexing.maps, ((0, 1, 2), (1, 3)))
+        # The accumulator's type is the output buffer's, and that is the pair:
+        # ``exx2_fused`` returns it, so nothing else has to be told.
+        self.assertEqual(step.out.elems.value, "!spyreop.fp16_fused")
+        self.assertEqual(step.out.extent, (256, 64))
 
 
 class TestFusedElementType(unittest.TestCase):

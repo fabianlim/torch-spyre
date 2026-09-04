@@ -855,5 +855,76 @@ class TestFusedElementTypeEmission(unittest.TestCase):
         self.assertNotIn("spyreop.layernormscale %in", emitted)
 
 
+@unittest.skipUnless(
+    _mlir_ktdp_available(),
+    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
+)
+class TestAReducingBodyThatIgnoresItsAccumulator(unittest.TestCase):
+    """A reduction whose body reads only the element, never the accumulator.
+
+    DECISION pinned: such an op needs no new ``BindingKind`` and no new surface.
+    It is registered ``COMBINER`` -- because it reduces, which is the bit the
+    plan's equality check compares against ``is_reduction`` -- and its binding
+    simply does not use its first parameter.  The generic that comes out is the
+    ordinary on-stick reducing one, with a body of a single ``spyreop`` op.
+
+    LIMITATION forcing it: the body is a MARKER FOR A DEVICE PATTERN, not a fold.
+    The device replaces the whole generic with the two reductions the op stands
+    for, so what is written here is recognised rather than lowered -- and if the
+    pattern does not match, "the last element wins" is what the text means, which
+    fails as a non-match rather than as an error.
+
+    Pinned against ``ktir-spyreop-exx2.mlir``, which is written at our extents.
+    MEASURED on the emitted module: ``dbo-opt --from-ktir --kEmitSpyreCode`` exits
+    0 and produces one ``module @local_schedule``, that module's own count.
+    """
+
+    @staticmethod
+    def _reducing_vector():
+        """An arity-1 on-stick reduction whose output holds a fused pair."""
+        return make_onstick_sum_specs(
+            "exx2",
+            arrangements=[ElementArrangement.STANDARD, ElementArrangement.EXX2],
+        )
+
+    def test_the_nest_is_the_ordinary_on_stick_reduction(self):
+        """Same iterators and same maps as a bare ``sum`` over the stick: the
+        binding is the only thing this op contributes."""
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir("exx2_onstick_1core", self._reducing_vector())
+        self.assertIn("#map1 = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2)>", emitted)
+        self.assertIn("#map2 = affine_map<(d0, d1, d2, d3) -> (d1, d3)>", emitted)
+        self.assertIn(
+            'indexing_maps = [#map1, #map2], iterator_types = ["reduction", '
+            '"parallel", "reduction", "parallel"]',
+            emitted,
+        )
+
+    def test_the_body_reads_the_element_and_not_the_accumulator(self):
+        """The whole capability, in one assertion: ``%out`` types the result and
+        is not an operand of anything."""
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir("exx2_onstick_1core", self._reducing_vector())
+        self.assertIn("^bb0(%in: f16, %out: !spyreop.fp16_fused):", emitted)
+        [body] = [line for line in emitted.splitlines() if "spyreop.exx2_fused" in line]
+        self.assertIn("spyreop.exx2_fused %in : f16 -> !spyreop.fp16_fused", body)
+        self.assertNotIn("%out", body)
+
+    def test_the_pair_is_stored_as_one_element_per_statistic(self):
+        """A whole stick per statistic, viewed at the fused type: rank 2, 256x64,
+        which is what the opaque reduction needs to get the pair to element 0."""
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir("exx2_onstick_1core", self._reducing_vector())
+        self.assertIn("sizes: [256, 64], strides: [64, 1]", emitted)
+        self.assertIn("memref<256x64x!spyreop.fp16_fused>", emitted)
+        self.assertIn(
+            "ktdp.store %4, %6 : tensor<256x64x!spyreop.fp16_fused>, <256x64xindex>",
+            emitted,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

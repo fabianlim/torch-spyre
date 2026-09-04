@@ -2767,6 +2767,34 @@ class KtirBuilder:
                 ),
             ),
         ),
+        # The reduction that leaves a mean and a mean of squares in one element.
+        #
+        # Registered COMBINER because it reduces, and the equality check in
+        # ``_stages`` is what ties those two statements together -- but the
+        # binding IGNORES ``accumulated``, which no other combiner does.  That is
+        # the same category as ``absmax`` above and carries the same warning: the
+        # body is a MARKER FOR A DEVICE PATTERN, not a fold.  MEASURED, the
+        # device's ``dbo-unfuse-mean-and-squares`` replaces this op with the two
+        # reductions it stands for -- the value accumulated and its square, each
+        # scaled by one over the count on the way in -- so nothing below lowers
+        # the generic as written.  If that pattern does not match, the generic
+        # means "the last element wins", and it fails as a NON-MATCH rather than
+        # as an error.
+        #
+        # The accumulator is still what types the result: ``%out`` is
+        # ``!spyreop.fp16_fused`` because the output buffer's arrangement says so
+        # (EXX2), and ``spyreop.exx2_fused`` returns exactly that from an f16.
+        # ``spyreop.exx2``, the unfused two-result form, is a different op and is
+        # not registered.
+        "exx2": Recipe(
+            arity=1,
+            arms=Arm(
+                kind=BindingKind.COMBINER,
+                binding=_written_here(
+                    lambda accumulated, element: spyreop.exx2_fused(element)
+                ),
+            ),
+        ),
         # The unary float ops whose payload is one ``spyreop`` scalar intrinsic.
         # There is no named linalg op behind any of them, so they are PAYLOADs and
         # land on ``Surface.GENERIC``: the recipe contributes the intrinsic and the

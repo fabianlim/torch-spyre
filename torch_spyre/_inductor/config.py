@@ -83,6 +83,15 @@ ktir_emitter: bool = os.environ.get("TORCH_SPYRE_KTIR", "0") == "1"
 # A .mlir declaring the target device, passed to the backend compiler.
 ktir_device_mlir: str = os.environ.get("KTIR_DEVICE_MLIR", "")
 
+# Whether the KTIR emitter warns, once per kernel, that its ``PlanFusion`` table
+# rewrote that kernel and what the rewrite conceded. On by default: the table
+# picks a kernel by hand rather than from a cost model, and abandons resources
+# planning already reserved, so a user is entitled to know. Set to 0 to silence
+# it; the per-buffer detail is at debug either way.
+plan_fusion_warn: bool = os.environ.get(
+    "TORCH_SPYRE_PLAN_FUSION_WARN", "1"
+).strip().lower() not in ("0", "false", "off")
+
 # Enable certified LX ownership changes.
 # Set SPYRE_LX_PLANNER_RELAYOUT=0 to disable these optional optimizations, not
 # ownership validation. This does not change the allocator or LX memory budget.

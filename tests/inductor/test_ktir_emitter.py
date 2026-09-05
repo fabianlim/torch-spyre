@@ -239,7 +239,7 @@ class TestAStageOwnsItsViews(unittest.TestCase):
     LIMITATION forcing it: two stages cannot share one view.  MEASURED on a
     hand-written reference chain of six computes, which ships seven duplicate views
     of four bases: as written it compiles (exit 0, six ``local_schedule`` modules
-    for its six computes), and deduping the duplicates ABORTS ``dbo-opt`` rather
+    for its six computes), and deduping the duplicates ABORTS the backend compiler rather
     than refusing.  A stage's compute is extracted into a module of its own
     and its view goes with it, so a second stage's use of that view is a use the
     extraction cannot erase.
@@ -893,7 +893,7 @@ class TestAReducingBodyThatIgnoresItsAccumulator(unittest.TestCase):
     fails as a non-match rather than as an error.
 
     Pinned against a hand-written reference module for this op, at our extents.
-    MEASURED on the emitted module: ``dbo-opt --from-ktir --kEmitSpyreCode`` exits
+    MEASURED on the emitted module: the backend compiler exits
     0 and produces one ``module @local_schedule``, that module's own count.
     """
 
@@ -1011,7 +1011,7 @@ class TestStatisticReadEmission(unittest.TestCase):
 
     Pinned against a hand-written reference chain, whose ``#set_stat_slab``
     (24x64, the write) and ``#set_stat_one`` (24x1, the read) are the same pair at
-    that module's extents.  MEASURED on the emitted module: ``dbo-opt --from-ktir
+    that module's extents.  MEASURED on the emitted module: the backend compiler
     --kEmitSpyreCode`` exits 0 with TWO ``module @local_schedule``s, one per
     compute.
     """
@@ -1056,7 +1056,7 @@ class TestArityBeyondTwoEmission(unittest.TestCase):
     ``_parallel_surface`` and ``_emit_generic``'s block.
 
     Pinned against a hand-written reference module for this op, at that module's
-    own extents and format.  MEASURED on the emitted module: ``dbo-opt --from-ktir
+    own extents and format.  MEASURED on the emitted module: the backend compiler
     --kEmitSpyreCode`` exits 0 with ONE ``module @local_schedule``, that module's
     own count.
     """
@@ -1121,7 +1121,7 @@ class TestOneBufferViewedAtTwoElementTypesEmission(unittest.TestCase):
 
     Pinned against a hand-written reference chain's two views, at two element
     types, over one paired base.  MEASURED on the emitted module:
-    ``dbo-opt --from-ktir --kEmitSpyreCode`` exits 0 with TWO ``module
+    the backend compiler exits 0 with TWO ``module
     @local_schedule``s.
     """
 
@@ -1183,7 +1183,7 @@ class TestAnAccessOnlySpecEmitsNothing(unittest.TestCase):
     can carry out; and emitting it as a compute would be a copy of a buffer to
     itself at a different address, which the hardware does not need.
 
-    MEASURED on the emitted module: ``dbo-opt --from-ktir --kEmitSpyreCode`` exits
+    MEASURED on the emitted module: the backend compiler exits
     0, and a hand-written reference chain likewise views its input directly in two
     stages with no staging op anywhere in it.
     """

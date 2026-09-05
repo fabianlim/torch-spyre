@@ -1818,7 +1818,7 @@ class TestAThreadedValueMayNotCrossAStage(unittest.TestCase):
     correctly with no emitter change.
 
     LIMITATION forcing the refusal rather than the emission: a value cannot cross a
-    compute stage, and the backend does not decline it -- MEASURED, ``dbo-opt``
+    compute stage, and the backend does not decline it -- MEASURED, the backend compiler
     *aborts*. So emitting it trades a message for a crash.
     """
 
@@ -2171,7 +2171,7 @@ class TestPlanFusionDeclines(FusionCase):
 
         LIMITATION forcing it, and it is measured: the backend does NOT catch
         the result.  A broadcasting producer fuses into a reduction whose memory
-        view is [2, 256, 64] over a 128-element buffer, and dbo-opt accepts it --
+        view is [2, 256, 64] over a 128-element buffer, and the backend compiler accepts it --
         a silent out-of-bounds read.  So this condition is the only thing between
         a broadcast and a wrong answer, and it has to be here.
         """
@@ -2761,7 +2761,7 @@ class TestRefusals(unittest.TestCase):
 
     A label is a token shared by the raise and this test, so grepping it finds
     both.  No message here claims a consumer is the blocker: this repository
-    cannot run dbo-opt or the scheduler, so what they accept is not observable
+    cannot run the backend compiler or the scheduler, so what they accept is not observable
     from these tests, and two labels that used to claim it were both wrong.
     """
 
@@ -2819,7 +2819,7 @@ class TestRefusals(unittest.TestCase):
         """A refusal says what is missing here, not what someone else rejects.
 
         Checked over the ``_unimplemented`` messages rather than the whole file:
-        naming dbo-opt is legitimate where it explains why an *option* exists
+        naming the backend is legitimate where it explains why an *option* exists
         (baking addresses), but not as the reason a capability is refused, which
         this repository cannot observe.
         """
@@ -3181,7 +3181,7 @@ class TestFusedElementType(unittest.TestCase):
         """The frontend hands this op the pair as ONE operand.
 
         The two-operand ``spyreop.layernormscale`` is what the backend's own
-        ``dbo-unfuse-layernormscale`` produces below us, so binding it here would
+        the backend's own unfusing produces below us, so binding it here would
         need a second operand nobody supplies.
         """
         self.assertEqual(ktir.KtirBuilder.RECIPES["layernormscale"].arity, 1)

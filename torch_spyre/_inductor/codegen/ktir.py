@@ -155,7 +155,7 @@ def dialect_available() -> bool:
 #
 # A message never claims a consumer is the blocker, because a consumer's answer
 # is not a property of this file: the same emitted text is accepted or rejected
-# depending on which dbo-opt build and which device.mlir it meets (``verify.py``
+# depending on which backend build and which device spec it meets (``verify.py``
 # is where that is observed, against a real one).  A refusal here says what this
 # emitter does not build.
 #
@@ -1179,7 +1179,7 @@ class PlanOptions:
     instead of a func argument, because ``ktdp.load`` requires a static memref
     offset, which a constant base gives only when the consumer is a ``linalg``
     op.  Canonical KTIR is symbolic; baking is the dataflow-scheduler#65
-    workaround that dbo-opt requires.  The SDSC path makes the same choice from
+    workaround that the backend compiler requires.  The SDSC path makes the same choice from
     ``config.bundle_symbolic_args``.
     """
 
@@ -1317,7 +1317,7 @@ class KernelPlan:
         silently write nowhere, and an unproduced consumer has no value to read.
 
         Both ends present is not sufficient: a threaded value must also not cross
-        a COMPUTE STAGE, which is asked here too.  MEASURED: ``dbo-opt`` *aborts*
+        a COMPUTE STAGE, which is asked here too.  MEASURED: the backend compiler *aborts*
         on such a kernel rather than refusing it, so letting one through returns a
         crash rather than a diagnosis.
 
@@ -2092,7 +2092,7 @@ def _access_preserving(source: TensorArg, result: TensorArg) -> bool:
     Measured necessary, and it is the one condition whose absence is silent:
     without it a BROADCASTING ``abs`` fuses, and the ``absmax`` that comes out
     carries a [2, 256, 64] memory view over a 128-element buffer -- which
-    dbo-opt ACCEPTS. An out-of-bounds read that compiles is worse than any
+    the backend compiler ACCEPTS. An out-of-bounds read that compiles is worse than any
     refusal, so this is checked here and not left to a consumer.
     """
     return (
@@ -3283,7 +3283,7 @@ class KtirBuilder:
         # binding IGNORES ``accumulated``, which no other combiner does.  That is
         # the same category as ``absmax`` above and carries the same warning: the
         # body is a MARKER FOR A DEVICE PATTERN, not a fold.  MEASURED, the
-        # device's ``dbo-unfuse-mean-and-squares`` replaces this op with the two
+        # device's own unfusing pass replaces this op with the two
         # reductions it stands for -- the value accumulated and its square, each
         # scaled by one over the count on the way in -- so nothing below lowers
         # the generic as written.  If that pattern does not match, the generic
@@ -3350,7 +3350,7 @@ class KtirBuilder:
         # carrying the (mean, mean-of-squares) pair as one element of
         # ``!spyreop.fp16_fused``, which is what ``exx2_fused`` wrote.  The
         # two-operand ``spyreop.layernormscale``, which takes the mean and the mean
-        # of squares apart, is what the backend's own ``dbo-unfuse-layernormscale``
+        # of squares apart, is what the backend's own unfusing pass
         # produces BELOW us -- MEASURED against a hand-written reference module for
         # this op -- so binding it here would be doing the backend's job with an
         # operand nobody supplies.

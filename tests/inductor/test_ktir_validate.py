@@ -1327,10 +1327,12 @@ _TABLE_DEFAULT = object()
 
 
 def fuse(specs, table=_TABLE_DEFAULT) -> tuple:
-    """``apply_plan_fusions``, with the shipped table left as the default."""
+    """``apply_plan_fusions``'s specs half, with the shipped table as default."""
     if table is _TABLE_DEFAULT:
-        return ktir.apply_plan_fusions(specs)
-    return ktir.apply_plan_fusions(specs, table)
+        vector, _dropped = ktir.apply_plan_fusions(specs)
+    else:
+        vector, _dropped = ktir.apply_plan_fusions(specs, table)
+    return vector
 
 
 class FusionCase(unittest.TestCase):
@@ -1528,6 +1530,40 @@ class TestPlanFusionStructure(FusionCase):
         self.assertEqual(plan.grid, (32,))
         self.assertEqual(plan.divisions, (ktir.Division(symbol="e1", div=32, inner=1),))
         self.assertEqual([step.op for step in plan.steps], ["absmax"])
+
+
+class TestPlanFusionDroppedBuffer(FusionCase):
+    """REGRESSION: a fused-away link that is a real kernel argument.
+
+    With the planners off, the link is a plain HBM buffer the wrapper still
+    allocates and passes; deleting its producer must not shift the positional
+    binding of every argument after it (issue: wrong answer on device).
+    """
+
+    def test_a_dropped_link_still_reserves_its_argument_slot(self):
+        pair = make_absmax_pair(link={"hbm": None})
+        link = pair[0].args[-1]
+        self.assertGreaterEqual(link.arg_index, 0)
+        # The pre-fusion count: one arg_index per distinct buf_id, first seen.
+        pre_fusion: dict[str, int] = {}
+        for spec in pair:
+            for arg in spec.args:
+                if arg.arg_index >= 0:
+                    pre_fusion.setdefault(ktir.buf_id(arg), arg.arg_index)
+
+        plan = ktir.build_kernel_plan(pair)
+        self.assertEqual(len(plan.parameters), len(pre_fusion))
+        self.assertIn(link.arg_index, [buffer.arg_index for buffer in plan.parameters])
+
+    def test_the_dropped_buffer_is_recorded_but_never_accessed(self):
+        pair = make_absmax_pair(link={"hbm": None})
+        link_id = ktir.buf_id(pair[0].args[-1])
+
+        plan = ktir.build_kernel_plan(pair)
+        self.assertIn(link_id, plan.dropped)
+        for step in plan.steps:
+            self.assertNotEqual(step.out_buf_id, link_id)
+            self.assertNotIn(link_id, [read_id for read_id, _ in step.ins])
 
 
 class TestGenuineAbsmaxRecipe(unittest.TestCase):

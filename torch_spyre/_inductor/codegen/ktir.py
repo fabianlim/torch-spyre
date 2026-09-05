@@ -1064,6 +1064,10 @@ class KernelPlan:
         self._symbols: list[Any] = []  # the divided symbols, outermost-first
         self._divisors: dict = {}
         self.buffers: dict[str, Buffer] = {}
+        # buf_ids a plan-time fusion deleted the producer of, but that are still
+        # declared as parameters -- see ``add_specs``.  No access is ever built
+        # for one, which is why this lives on the plan and not on ``Buffer``.
+        self.dropped: set[str] = set()
         self.steps: tuple[Step, ...] = ()
 
     @property
@@ -1074,10 +1078,11 @@ class KernelPlan:
         passes to ``.run(...)``, so the emitted func signature lines up with
         that binding.
 
-        KNOWN GAP: a plan-time fusion can delete a buffer the caller still
-        passes, so with the planners off this list can be one shorter than the
-        call site's argument list.  Invisible on the path that runs, whose bases
-        are baked constants and whose func takes no arguments.
+        A plan-time fusion can delete a buffer the caller still allocates and
+        passes.  That buffer stays in this list (``add_specs`` re-registers it as
+        a parameter-only entry, see ``KernelPlan.dropped``), so the call site's
+        positional argument list and this list's length always agree; the
+        buffer's ``buf_id`` is in ``self.dropped`` and nothing ever writes it.
         """
         return sorted(
             (e for e in self.buffers.values() if e.arg_index >= 0),
@@ -1092,7 +1097,20 @@ class KernelPlan:
         # theirs in different symbol namespaces, so a divided pair is
         # self-contradictory right up until the fusion deletes one of them.  The
         # result is held, so ``_steps`` walks the same vector ``_divisions`` saw.
-        specs = apply_plan_fusions(specs)
+        specs, dropped = apply_plan_fusions(specs)
+        for arg in dropped:
+            link = buf_id(arg)
+            self.dropped.add(link)
+            if link in self.buffers:
+                continue
+            # Same derivations ``_access_of`` runs for a normal parameter: the
+            # producer this arg belonged to already ran them once, so they
+            # cannot fail here either.
+            layout, _ = _solve_layout(arg, [])
+            elems = ElemTypes.of(arg.device_dtype)
+            self.buffers[link] = _buffer(
+                arg, layout, elems, bake_addresses=self.options.bake_addresses
+            )
         self._symbols, self.divisions = _divisions(specs)
         self._divisors = {
             symbol: division.div
@@ -1658,8 +1676,8 @@ PLAN_FUSIONS: tuple[PlanFusion, ...] = (
 
 def apply_plan_fusions(
     specs: Sequence[Any], table: Sequence[PlanFusion] = PLAN_FUSIONS
-) -> tuple[Any, ...]:
-    """``specs`` with every table match collapsed.
+) -> tuple[tuple[Any, ...], tuple[TensorArg, ...]]:
+    """``specs`` with every table match collapsed, and every arg thereby orphaned.
 
     Recurses into ``LoopSpec`` bodies because ``_divisions`` reads every op at
     every depth (``_op_specs``) and this runs before it.
@@ -1671,22 +1689,31 @@ def apply_plan_fusions(
     declined to make.  Adjacency is therefore not relied on for soundness: the
     condition it used to stand in for -- one reader of the link buffer -- is
     checked directly by the rewrite.
+
+    The second element is every output arg of a collapsed span that the fused
+    spec does not write and that the caller still passes (``arg_index >= 0``):
+    a real kernel argument whose producer just got deleted.  ``KernelPlan.
+    add_specs`` re-declares it, which is the whole point of returning it rather
+    than letting it vanish here.
     """
     out: list[Any] = []
+    dropped: list[TensorArg] = []
     i = 0
     while i < len(specs):
         entry = specs[i]
         if isinstance(entry, LoopSpec):
             # ``LoopSpec.body`` is declared a list, so the rebuilt body is one:
             # this is the contract's own type and not a copy taken for safety.
-            body = apply_plan_fusions(entry.body, table)
+            body, nested_dropped = apply_plan_fusions(entry.body, table)
             out.append(dataclasses.replace(entry, body=list(body)))
+            dropped.extend(nested_dropped)
             i += 1
             continue
         for fusion in table:
             fused = _apply(fusion, specs, i)
             if fused is None:
                 continue
+            span = specs[i : i + len(fusion.pattern)]
             logger.debug(
                 "plan fusion %r collapsed op %r into %r; buffer %s ceased to exist",
                 fusion.name,
@@ -1694,13 +1721,32 @@ def apply_plan_fusions(
                 fused.op,
                 ", ".join(buf_id(a) for a in entry.args if not a.is_input),
             )
+            fused_writes = {buf_id(a) for a in fused.args if not a.is_input}
+            for spec in span:
+                for arg in spec.args:
+                    if arg.is_input or buf_id(arg) in fused_writes:
+                        continue
+                    if arg.arg_index < 0:
+                        continue  # never passed; nothing to keep declaring
+                    logger.warning(
+                        "plan fusion %r deleted op %r, whose output buffer %s "
+                        "(arg_index %d) the caller still allocates and passes; "
+                        "the kernel keeps declaring it to preserve positional "
+                        "argument binding, but nothing in the fused kernel "
+                        "writes it",
+                        fusion.name,
+                        spec.op,
+                        buf_id(arg),
+                        arg.arg_index,
+                    )
+                    dropped.append(arg)
             out.append(fused)
             i += len(fusion.pattern)
             break
         else:
             out.append(entry)
             i += 1
-    return tuple(out)
+    return tuple(out), tuple(dropped)
 
 
 def _apply(fusion: PlanFusion, specs: Sequence[Any], i: int) -> OpSpec | None:
@@ -2087,6 +2133,11 @@ class KtirBuilder:
                     self.c0 = self.icst_index(0)
                     self.env.bind_ivs(self.core_portions())
                     for position, buffer in enumerate(buffers):
+                        if buffer.buf_id in self.plan.dropped:
+                            # Declared above as one of ``params`` (its block arg
+                            # position must still be consumed); nothing else
+                            # accesses it, so it gets no view.
+                            continue
                         if not baked:
                             base = self.block_args[position]
                         else:

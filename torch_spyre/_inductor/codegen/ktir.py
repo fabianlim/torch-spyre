@@ -482,6 +482,14 @@ class ComputeStep:
     # no spec.  The format rather than the arm itself, because an arm holds a
     # deferred dialect reference and a step stays dialect-free.
     dtype: DataFormats | None = None
+    # Whether any operand was broadcast against the output.  Carried for exactly
+    # the reason ``dtype`` is: emission re-resolves the arm and has no spec in
+    # reach to ask.  The two fields together are the ``Request`` the plan
+    # dispatched on, so the arm emission resolves is the arm the surface on this
+    # step was chosen from -- and neither field pulls a dialect handle onto the
+    # step.  It is not derivable from ``surface`` alone: a GENERIC step is what a
+    # broadcast operand forces, but also what any scalar PAYLOAD needs.
+    broadcast: bool = False
 
 
 def dtype_of(spec: OpSpec) -> DataFormats:
@@ -1457,11 +1465,24 @@ class KernelPlan:
                     f"OpSpec->KTIR: op {entry.op!r} is not supported yet "
                     f"(registered: {sorted(KtirBuilder.RECIPES)})"
                 )
-            # One question about the op name, then one about its format: whether
-            # the op exists at all is the table's business, and which of its
-            # spellings this request reaches is the recipe's.
-            arm = KtirBuilder.RECIPES[entry.op].arm(dtype_of(entry))
-            if (arm.kind is BindingKind.COMBINER) != bool(entry.is_reduction):
+            # One question about the op name, then one about the family: whether
+            # the op exists at all is the table's business, and whether it
+            # accumulates is the recipe's.
+            #
+            # The RECIPE and not an arm, deliberately.  Reduction-ness is an op
+            # fact -- ``__post_init__`` makes every arm agree on it -- and asking
+            # it without an arm is what lets the ONE arm selection happen later, in
+            # ``_compute_step``, once the operands have been squeezed and it is
+            # known whether any of them is broadcast.  Selecting here as well would
+            # be two selections from two different requests, free to disagree.
+            #
+            # ``dtype_of(entry)`` is gone with the arm.  It was called here only
+            # for the mixed-format refusal it raises on the way, and
+            # ``_compute_step`` calls it as its second statement -- before any
+            # derivation and before any buffer is registered -- so a mixed request
+            # is still refused by the plan, one step later and no further.
+            recipe = KtirBuilder.RECIPES[entry.op]
+            if recipe.reduces != bool(entry.is_reduction):
                 # Two independent statements of one bit -- what the recipe's
                 # binding accumulates, and what the frontend labelled the request
                 # -- and both directions are silent if unchecked.  An 'add' asked
@@ -1470,9 +1491,14 @@ class KernelPlan:
                 # a 'sum' asked for elementwise would reach a two-operand scalar
                 # combiner with one operand and fail inside emission, which is the
                 # one thing the plan/emission split exists to rule out.
+                #
+                # The kind NAMED here is the first arm's, and naming a kind at all
+                # is only a spelling of the bit that failed: every arm agrees on
+                # whether it is a COMBINER, so which arm is quoted cannot change
+                # the answer, only which of the two non-reducing kinds is shown.
                 raise NotImplementedError(
                     f"OpSpec->KTIR: op {entry.op!r} is registered as "
-                    f"{arm.kind.name} but this spec asks for "
+                    f"{_arms(recipe.arms)[0].kind.name} but this spec asks for "
                     f"{'a reduction' if entry.is_reduction else 'an elementwise op'}"
                 )
             stage = self._next_stage
@@ -1590,7 +1616,6 @@ class KernelPlan:
         out, inputs = validated_roles(spec)
         dtype = dtype_of(spec)
         recipe = KtirBuilder.RECIPES[spec.op]
-        arm = recipe.arm(dtype)
         for arg in inputs:
             # In-place (input buffer aliases the output) is not supported yet.
             if buf_id(arg) == buf_id(out):
@@ -1627,6 +1652,7 @@ class KernelPlan:
                 # the lane axis is reduced on the way in and kept on the way out.
                 indexing = Indexing(iters=iters, maps=(in_map, out_map))
         levels = _levels(spec, loops)
+        broadcast = False
         if not spec.is_reduction:
             # A read of a statistic is squeezed the way its PRODUCER's output was,
             # so the reader's access has the rank of the buffer the producer
@@ -1652,6 +1678,39 @@ class KernelPlan:
                 else arg
                 for arg in inputs
             ]
+            # ``align_reshape_plan`` is the SWITCH, not a refusal: ``None`` means
+            # this operand's coordinates and extents are the output's, which is the
+            # identity condition ``_parallel_surface`` is entitled to assume, and
+            # anything else is an operand whose map row has to be read off the
+            # coordinates.  Asked of every operand, because it is a property of the
+            # whole op: one broadcast operand makes the op a generic, and the
+            # aligned operands then need their (identity) rows stated alongside it.
+            #
+            # Here rather than below the accesses, because the ARM is chosen on it
+            # and the surface is chosen from the arm.  It reads only
+            # ``device_coordinates`` and ``device_size``, both of them squeezed
+            # just above and neither of them touched by ``_access_of``, so nothing
+            # it needs arrives later.  (What does need the accesses is
+            # ``_broadcast_surface``: a map ROW is about the TILE extents, since a
+            # broadcast operand is loaded at one element on the axis it does not
+            # walk while its buffer is the whole thing either way.  That call stays
+            # below them.)
+            broadcast = any(
+                align_reshape_plan(
+                    list(arg.device_coordinates),
+                    [int(s) for s in arg.device_size],
+                    list(out.device_coordinates),
+                    [int(s) for s in out.device_size],
+                )
+                is not None
+                for arg in inputs
+            )
+        # The op's spelling, chosen ONCE, from the whole request: the format, plus
+        # whether an operand is broadcast (never, for a reduction -- a reduction's
+        # nest comes from ``_reduction_nest`` and its shape from ``_reduce_surface``,
+        # so the arm is asked for here only so that an op that does not exist at
+        # this format is refused by the plan whether it reduces or not).
+        arm = recipe.arm(dtype, broadcast=broadcast)
         # Positions are the inputs in operand order and then the result, which is
         # what ``Recipe.unfused`` names: the element type an access reads a buffer
         # AT is the op's business, not the buffer's arrangement (see ``unfused``).
@@ -1679,28 +1738,9 @@ class KernelPlan:
                 )
             accesses[buf_id(arg)] = access
         if not spec.is_reduction:
-            # ``align_reshape_plan`` is the SWITCH, not a refusal: ``None`` means
-            # this operand's coordinates and extents are the output's, which is the
-            # identity condition ``_parallel_surface`` is entitled to assume, and
-            # anything else is an operand whose map row has to be read off the
-            # coordinates.  Asked of every operand before either arm is taken,
-            # because the surface is a property of the whole op: one broadcast
-            # operand makes the op a generic, and the aligned operands then need
-            # their (identity) rows stated alongside it.
-            #
-            # After the accesses, because a map row is about the TILE extents --
-            # a broadcast operand is loaded at one element on the axis it does not
-            # walk, and its buffer is the whole thing either way.
-            broadcast = any(
-                align_reshape_plan(
-                    list(arg.device_coordinates),
-                    [int(s) for s in arg.device_size],
-                    list(out.device_coordinates),
-                    [int(s) for s in out.device_size],
-                )
-                is not None
-                for arg in inputs
-            )
+            # The two shapes a pointwise op can take, on the same bit that chose
+            # the arm: the arm says what can be spelled, ``broadcast`` says what
+            # has to be.
             if broadcast:
                 surface, indexing = _broadcast_surface(arm, out, inputs, accesses)
             else:
@@ -1741,6 +1781,7 @@ class KernelPlan:
             indexing=indexing,
             attrs=attrs,
             dtype=dtype,
+            broadcast=broadcast,
             # An internal buffer never reaches memory: it is threaded as a value,
             # so it gets no store, no func parameter, no view and no address.
             store=not is_internal(out),
@@ -2530,9 +2571,14 @@ class BindingKind(enum.Enum):
 
     No separate ``reduces`` flag: reducing *is* ``kind is COMBINER``, because a
     named linalg op is elementwise and a parallel-body payload does not
-    accumulate.  The kind belongs to the ``Arm`` and not to the ``Recipe``
-    because it varies with the format: ``add`` is a named ``linalg`` op at floats
-    and a ``spyreop`` payload at four-byte integers.
+    accumulate.  (``Recipe.reduces`` reads it off an arm for the whole op, which
+    is sound because every arm of an op must agree on it.)
+
+    The kind belongs to the ``Arm`` and not to the ``Recipe`` because it varies
+    with what is asked for: ``add`` is a named ``linalg`` op at floats, a
+    ``spyreop`` payload at four-byte integers, and an ``arith`` payload whenever
+    an operand is broadcast, since only a generic's region can state a derived map
+    row (``request_scalar_when_broadcast``).
     """
 
     NAMED = enum.auto()
@@ -2591,6 +2637,107 @@ def _arms(arms: Arm | tuple[Arm, ...]) -> tuple[Arm, ...]:
 
 
 @dataclasses.dataclass(frozen=True)
+class Request:
+    """What a spec asks of an op, in the terms an arm can be chosen on.
+
+    Every field is derivable from the SPEC ALONE -- no layout, no level, no core
+    count -- and that invariant is what keeps selection orderable: the plan can
+    answer all of them before it needs an arm, and a step can carry them so
+    emission resolves the same arm with no spec in reach.  A discriminant that
+    needed a layout could only be asked after the accesses were built, which is
+    after the arm is needed to choose the surface those accesses feed.
+    """
+
+    dtype: DataFormats | None
+    # Whether any operand is broadcast against the output -- that is,
+    # ``align_reshape_plan`` has something to say about one of them.  A broadcast
+    # operand's map row has to be STATED, and only a generic can state one, so
+    # this bit decides whether a whole-op ``NAMED`` arm can serve the request at
+    # all.
+    broadcast: bool = False
+
+
+# How a recipe picks among its arms, given what the spec asks for.  A dispatcher
+# may only NARROW -- it returns one of the arms it was handed -- which
+# ``Recipe.arm`` asserts, so a dispatcher cannot invent a spelling the table does
+# not declare.
+Dispatch = Callable[[tuple[Arm, ...], Request], Arm]
+
+
+def request_by_dtype(arms: tuple[Arm, ...], request: Request) -> Arm:
+    """The default: the arm claiming the format, else the one claiming the rest.
+
+    A format nothing claims falls to an arm with an empty ``dtypes``; if no arm
+    takes the unlisted formats either, the op does not exist at this one.
+
+    With more than one such arm -- which ``Recipe.__post_init__`` allows only for
+    arms of DIFFERENT kinds, one channel each -- the FIRST wins, so an entry lists
+    the spelling it wants by default first.  ``add``'s ``linalg.add`` is ahead of
+    its ``arith.addf`` for exactly that reason.
+    """
+    dtype = request.dtype
+    for candidate in arms:
+        if dtype is not None and dtype in candidate.dtypes:
+            return candidate
+    for candidate in arms:
+        if not candidate.dtypes:
+            return candidate
+    raise NotImplementedError(
+        f"OpSpec->KTIR: no arm for {dtype.name if dtype else 'an unknown format'} "
+        f"(registered: {sorted(d.name for a in arms for d in a.dtypes)})"
+    )
+
+
+# The device formats an ``arith`` FLOAT scalar cannot take, out of the formats
+# ``ElemTypes.NAMES`` supports (one, today: the ``i32`` row).  Kept in step with
+# that table by ``TestArmDispatch``.
+#
+# Named here rather than spelled as ``Arm.dtypes`` on the float scalars, because
+# ``dtypes`` is a POSITIVE claim and an explicit claim beats a dtype-less one
+# (``request_by_dtype``): a scalar arm that listed the float formats would
+# out-claim the dtype-less ``NAMED`` arm on the ALIGNED path and turn every
+# ``linalg.add`` into a generic.  So the scalar arms stay dtype-less, and what a
+# dtype-less scalar arm does not serve is stated once, here, where it is read.
+_INTEGER_FORMATS: tuple[DataFormats, ...] = (DataFormats.IEEE_INT32,)
+
+
+def request_scalar_when_broadcast(arms: tuple[Arm, ...], request: Request) -> Arm:
+    """``request_by_dtype``, but a broadcast operand may not reach a NAMED arm.
+
+    Filtered on ``kind`` rather than on a new ``Arm`` flag, because ``kind`` IS
+    the distinction being made: a ``NAMED`` builder states its own (identity)
+    indexing and has nowhere to put a derived map row, while a ``PAYLOAD`` scalar
+    goes in a generic's region, which states every row.  An ``Arm.broadcast``
+    flag would instead be a claim that ``request_by_dtype`` silently ignored.
+
+    It DELEGATES rather than replacing, so the format still picks among what is
+    left: an int32 broadcast ``add`` lands on ``spyreop.addi32toi32`` and not on
+    ``arith.addf``.  And it filters only when the request really is broadcast, so
+    an aligned operand keeps the named op it always had.
+
+    A dtype-less scalar arm is an ``arith`` float builder (``_INTEGER_FORMATS``),
+    so it is not eligible for an integer request: ``arith.subf`` of two ``i32``
+    values does not verify, and letting one through would emit invalid IR for a
+    request the plan could have refused.  ``sub`` has no integer intrinsic to fall
+    to, so at int32 nothing survives the filter at all.
+
+    ``and eligible`` is that case: the whole set goes through, the named arm comes
+    back, and ``_broadcast_surface`` refuses naming the reason (an op whose only
+    spelling states its own indexing) -- a better answer than "no arm for
+    IEEE_INT32" for an op that plainly has one at that format.
+    """
+    eligible = tuple(
+        arm
+        for arm in arms
+        if arm.kind is not BindingKind.NAMED
+        and (arm.dtypes or request.dtype not in _INTEGER_FORMATS)
+    )
+    return request_by_dtype(
+        eligible if request.broadcast and eligible else arms, request
+    )
+
+
+@dataclasses.dataclass(frozen=True)
 class Recipe:
     # Both ``arity`` and ``attrs`` are properties of the *op*, invariant across
     # formats, which is why they sit here and not on an arm: 'add' takes two
@@ -2627,6 +2774,18 @@ class Recipe:
     # A reader rather than the values themselves, because where they live in
     # ``op_info`` is the op's own business and the plan should not have to know.
     attrs: Callable[[dict[str, Any]], dict[str, float]] | None = None
+    # How this op picks among its arms.  The default is the format alone, which is
+    # what every op wanted while the format was the only discriminant; an op whose
+    # spelling also turns on whether an operand is broadcast says so here, and
+    # this ``dispatch=`` on the entry is the only place that second discriminant
+    # is visible.
+    #
+    # A plain function and not a ``staticmethod``: the generated ``__init__``
+    # binds it as an INSTANCE attribute, and instance attributes are not
+    # descriptors, so ``self.dispatch(arms, request)`` passes no ``self``.
+    #
+    # Last, so every existing entry is unaffected by its arrival.
+    dispatch: Dispatch = request_by_dtype
 
     def __post_init__(self) -> None:
         if self.arity < 1:
@@ -2634,15 +2793,31 @@ class Recipe:
         arms = _arms(self.arms)
         if not arms:
             raise ValueError("OpSpec->KTIR: a recipe needs at least one arm")
-        if sum(1 for arm in arms if not arm.dtypes) > 1:
+        # Ambiguity is per KIND, not per recipe.  Two arms of the SAME kind with
+        # the same claim are genuinely ambiguous -- nothing tells them apart, so
+        # which one wins would be a fact about declaration order.  Two of
+        # different kinds are the two channels a dispatcher discriminates on: fp16
+        # ``add`` needs both a dtype-less ``linalg.add`` and a dtype-less
+        # ``arith.addf``, one for aligned operands and one for broadcast.
+        for kind in {arm.kind for arm in arms}:
+            of_kind = [arm for arm in arms if arm.kind is kind]
+            if sum(1 for arm in of_kind if not arm.dtypes) > 1:
+                raise ValueError(
+                    "OpSpec->KTIR: at most one arm may claim the unlisted formats"
+                )
+            claimed = [dtype for arm in of_kind for dtype in arm.dtypes]
+            if len(claimed) != len(set(claimed)):
+                raise ValueError(
+                    "OpSpec->KTIR: two arms claim the same format: "
+                    f"{sorted({d.name for d in claimed if claimed.count(d) > 1})}"
+                )
+        # Reduction-ness is asked of the RECIPE (``reduces``), before any arm is
+        # chosen, so every arm has to answer it the same way or the property is
+        # reading one arm and speaking for the others.
+        if len({arm.kind is BindingKind.COMBINER for arm in arms}) > 1:
             raise ValueError(
-                "OpSpec->KTIR: at most one arm may claim the unlisted formats"
-            )
-        claimed = [dtype for arm in arms for dtype in arm.dtypes]
-        if len(claimed) != len(set(claimed)):
-            raise ValueError(
-                "OpSpec->KTIR: two arms claim the same format: "
-                f"{sorted({d.name for d in claimed if claimed.count(d) > 1})}"
+                "OpSpec->KTIR: an op's arms must agree on whether it reduces, but "
+                f"{sorted({arm.kind.name for arm in arms})} do not"
             )
         if any(not 0 <= position <= self.arity for position in self.unfused):
             raise ValueError(
@@ -2652,23 +2827,38 @@ class Recipe:
             )
         object.__setattr__(self, "arms", arms)
 
-    def arm(self, dtype: DataFormats | None) -> Arm:
-        """The arm \\p dtype reaches, or raise.
+    @property
+    def reduces(self) -> bool:
+        """Whether this op accumulates -- an op fact, not an arm fact.
 
-        A format nothing claims falls to the arm with an empty ``dtypes``; if no
-        arm takes the unlisted formats either, the op does not exist at this one.
+        Sound because ``__post_init__`` makes every arm agree on it, so any arm
+        answers for the recipe.  It exists because the family check in ``_stages``
+        only ever needed this one bit, and needing a whole arm for one bit is what
+        would otherwise force the plan to select an arm before it knows whether an
+        operand is broadcast -- i.e. to select twice, from two different requests,
+        and to disagree with itself silently when they differ.
+        """
+        return _arms(self.arms)[0].kind is BindingKind.COMBINER
+
+    def arm(self, dtype: DataFormats | None, *, broadcast: bool = False) -> Arm:
+        """The arm this request reaches, or raise.
+
+        ``dtype`` stays positional because it is the one discriminant every op
+        has; the rest of the request is keyword-only with a default, so an op that
+        does not care about a new discriminant -- and a caller that has not derived
+        it yet -- is unaffected by its arrival.
         """
         arms = _arms(self.arms)
-        for candidate in arms:
-            if dtype is not None and dtype in candidate.dtypes:
-                return candidate
-        for candidate in arms:
-            if not candidate.dtypes:
-                return candidate
-        raise NotImplementedError(
-            f"OpSpec->KTIR: no arm for {dtype.name if dtype else 'an unknown format'} "
-            f"(registered: {sorted(d.name for a in arms for d in a.dtypes)})"
+        chosen = self.dispatch(arms, Request(dtype=dtype, broadcast=broadcast))
+        # A dispatcher may narrow, never invent.  Identity rather than equality:
+        # what is being asserted is that the arm came from THIS recipe, and two
+        # structurally equal arms are two declarations rather than one.  An
+        # assertion because a dispatcher is code in this module, so failing it is a
+        # bug here and not an unsupported request.
+        assert any(chosen is candidate for candidate in arms), (
+            f"dispatcher {self.dispatch!r} returned an arm this recipe does not hold"
         )
+        return chosen
 
 
 # ---------------------------------------------------------------------------
@@ -2969,7 +3159,10 @@ class KtirBuilder:
         (a method and an arm), and a test parses this ``match`` to catch the
         second one being forgotten.
         """
-        arm = self.RECIPES[step.op].arm(step.dtype)
+        # The step's whole ``Request``, so this resolves the arm the plan chose the
+        # surface from: an op with two spellings would otherwise get the default
+        # one here and a body the surface below does not fit.
+        arm = self.RECIPES[step.op].arm(step.dtype, broadcast=step.broadcast)
         ins = [self.operand(buf_id, access, step.stage) for buf_id, access in step.ins]
         match step.surface:
             case Surface.BARE:
@@ -3132,15 +3325,31 @@ class KtirBuilder:
     #
     # A repeated key here is ruff F601, so an op cannot be declared twice.
     RECIPES: ClassVar[dict[str, Recipe]] = {
-        # ``add`` and ``mul`` are the two ops with more than one spelling: a named
-        # linalg op at floats, and a ``spyreop`` intrinsic at four-byte integers
-        # that splits its operands into halves and finds the carry with a pair of
-        # scale factors.  The float arm lists no formats, so it takes every format
-        # the integer arm does not claim.
+        # ``add``, ``mul`` and ``sub`` are the ops with more than one spelling, on
+        # two discriminants at once:
+        #
+        #   * the FORMAT -- a named linalg op at floats, and a ``spyreop``
+        #     intrinsic at four-byte integers that splits its operands into halves
+        #     and finds the carry with a pair of scale factors.  A float arm lists
+        #     no formats, so it takes every format the integer arm does not claim.
+        #   * whether an operand is BROADCAST -- a named linalg op states its own
+        #     identity indexing, so a broadcast operand's derived map row has
+        #     nowhere to go (``_broadcast_surface``).  The ``arith`` scalar goes in
+        #     a generic's region, which states every row, so
+        #     ``request_scalar_when_broadcast`` reaches for it exactly then.
+        #     MEASURED: this is what softmax's ``x - rowmax`` needs, and with it
+        #     the KTIR path matches SDSC to 1.9e-4 at (256, 128) fp16.
+        #
+        # The named arm is FIRST in each entry because two dtype-less arms of
+        # different kinds resolve in declaration order (``request_by_dtype``), and
+        # the aligned operands that keep the named op are the common case: every
+        # emitter golden is a named ``add``.
         "add": Recipe(
             arity=2,
+            dispatch=request_scalar_when_broadcast,
             arms=(
                 Arm(kind=BindingKind.NAMED, binding=lambda: linalg.add),
+                Arm(kind=BindingKind.PAYLOAD, binding=lambda: arith.addf),
                 Arm(
                     kind=BindingKind.PAYLOAD,
                     binding=lambda: spyreop.addi32toi32,
@@ -3150,8 +3359,10 @@ class KtirBuilder:
         ),
         "mul": Recipe(
             arity=2,
+            dispatch=request_scalar_when_broadcast,
             arms=(
                 Arm(kind=BindingKind.NAMED, binding=lambda: linalg.mul),
+                Arm(kind=BindingKind.PAYLOAD, binding=lambda: arith.mulf),
                 Arm(
                     kind=BindingKind.PAYLOAD,
                     binding=lambda: spyreop.muli32toi32,
@@ -3159,8 +3370,17 @@ class KtirBuilder:
                 ),
             ),
         ),
+        # No integer arm: there is no ``subi32toi32`` intrinsic, so an int32
+        # broadcast ``sub`` still reaches ``_broadcast_surface``'s refusal -- the
+        # scalar arm it would need does not exist at that format.  A missing op,
+        # not a dispatch gap.
         "sub": Recipe(
-            arity=2, arms=Arm(kind=BindingKind.NAMED, binding=lambda: linalg.sub)
+            arity=2,
+            dispatch=request_scalar_when_broadcast,
+            arms=(
+                Arm(kind=BindingKind.NAMED, binding=lambda: linalg.sub),
+                Arm(kind=BindingKind.PAYLOAD, binding=lambda: arith.subf),
+            ),
         ),
         "sum": Recipe(
             arity=1, arms=Arm(kind=BindingKind.COMBINER, binding=lambda: arith.addf)

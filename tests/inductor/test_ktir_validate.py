@@ -715,10 +715,24 @@ class TestValidateRejections(unittest.TestCase):
 
     def test_a_broadcast_operand_of_a_named_linalg_op_rejected(self):
         """A named ``linalg`` op states its own (identity) indexing, so a derived
-        map row has nowhere to go, and the scalar spelling that would go in a
-        generic's body is not something any recipe declares."""
+        map row has nowhere to go, and a whole-op builder called with two scalars
+        does not build.
+
+        Asserted on an INJECTED named-only recipe, deliberately.  ``add``, ``mul``
+        and ``sub`` were the only named entries, and each now declares an ``arith``
+        scalar arm that ``request_scalar_when_broadcast`` reaches for in exactly
+        this case, so no registered op reaches this refusal at a float format.  The
+        refusal is kept for the next named op someone adds -- and that is what an
+        injected recipe pins, rather than pinning which registered ops happen to
+        lack a scalar arm today.
+        """
+        named_only = ktir.Recipe(
+            arity=2,
+            arms=ktir.Arm(kind=ktir.BindingKind.NAMED, binding=lambda: None),
+        )
         specs = [
             make_op_spec(
+                "named_only",
                 sizes=[[16, 512, 1]],
                 coords_per_arg=[
                     [*sympy.symbols("d0:2"), sympy.Integer(0)],
@@ -727,7 +741,8 @@ class TestValidateRejections(unittest.TestCase):
                 ],
             )
         ]
-        self._rejects(specs, "named linalg op, which states its own indexing")
+        with mock.patch.dict(ktir.KtirBuilder.RECIPES, {"named_only": named_only}):
+            self._rejects(specs, "named linalg op, which states its own indexing")
 
     # -- per-buffer --------------------------------------------------------
 
@@ -1171,6 +1186,208 @@ class TestRecipes(unittest.TestCase):
             ktir.KtirBuilder.emit(None, [UnimplementedOp(op="atan2")])
 
 
+class TestArmDispatch(unittest.TestCase):
+    """Selecting an arm on MORE than the format: the second discriminant.
+
+    ``sub`` binds ``linalg.sub``, which states its own identity indexing, so a
+    broadcast operand had nowhere to put its derived map row and was refused --
+    and softmax's ``x - rowmax`` reads the max at the stick head, so it was
+    refused.  A ``Recipe`` now carries a ``dispatch``, and ``add``/``mul``/``sub``
+    use ``request_scalar_when_broadcast``: the named op for aligned operands, the
+    ``arith`` scalar in a generic when one is broadcast.
+
+    MEASURED end to end: ``torch.softmax`` at (256, 128) fp16 on the KTIR path
+    comes out at 1.9e-4 max abs diff, 0 of 256 rows wrong, matching SDSC.
+
+    The invariant holding it all together: a ``Request``'s fields are derivable
+    from the SPEC ALONE, so all of them are known before an arm is needed and the
+    selection happens exactly once.
+    """
+
+    @staticmethod
+    def _arm(kind=ktir.BindingKind.NAMED, *dtypes):
+        return ktir.Arm(kind=kind, binding=lambda: None, dtypes=tuple(dtypes))
+
+    def test_the_default_dispatcher_is_the_format_alone(self):
+        """Every entry that did not ask for the new discriminant ignores it.
+
+        The pure-refactor pin: ``Recipe.dispatch`` defaults to
+        ``request_by_dtype``, which reads ``request.dtype`` and nothing else, so
+        for those entries ``broadcast`` cannot change an answer.  Asserted over the
+        whole table because the failure mode is one entry silently changing
+        spelling.
+        """
+        for op, recipe in ktir.KtirBuilder.RECIPES.items():
+            if recipe.dispatch is not ktir.request_by_dtype:
+                continue
+            for dtype in (*ktir.ElemTypes.NAMES, None):
+                with self.subTest(op=op, dtype=dtype):
+                    self.assertIs(recipe.arm(dtype), recipe.arm(dtype, broadcast=True))
+
+    def test_a_dispatcher_may_not_return_a_foreign_arm(self):
+        """A dispatcher narrows; it does not invent.
+
+        An arm the recipe does not hold would be a spelling the table never
+        declared -- so it is an assertion (a bug in this module) and not a
+        rejection.
+        """
+        foreign = self._arm()
+        recipe = ktir.Recipe(
+            arity=1, arms=self._arm(), dispatch=lambda arms, request: foreign
+        )
+        with self.assertRaises(AssertionError):
+            recipe.arm(FP16)
+
+    def test_two_default_arms_are_one_kind_ambiguous_and_two_kinds_a_channel_each(
+        self,
+    ):
+        """The one-default-arm rule is per KIND, and why it has to be.
+
+        Two arms of the same kind claiming the unlisted formats are genuinely
+        ambiguous: nothing tells them apart, so which won would be a fact about
+        declaration order.  Two of DIFFERENT kinds are the two channels a
+        dispatcher discriminates on -- fp16 ``add`` needs a dtype-less
+        ``linalg.add`` and a dtype-less ``arith.addf`` both -- and declaration
+        order is then the documented default (the named arm first).
+        """
+        with self.assertRaises(ValueError):
+            ktir.Recipe(arity=1, arms=(self._arm(), self._arm()))
+        recipe = ktir.Recipe(
+            arity=1,
+            arms=(self._arm(), self._arm(ktir.BindingKind.PAYLOAD)),
+            dispatch=ktir.request_scalar_when_broadcast,
+        )
+        self.assertIs(recipe.arm(FP16).kind, ktir.BindingKind.NAMED)
+        self.assertIs(recipe.arm(FP16, broadcast=True).kind, ktir.BindingKind.PAYLOAD)
+
+    def test_all_arms_of_an_op_must_agree_on_whether_it_reduces(self):
+        """What makes ``Recipe.reduces`` sound, and it is asked before any arm.
+
+        The property reads one arm and speaks for the recipe, so a recipe whose
+        arms disagree is unconstructible rather than merely unlucky.
+        """
+        with self.assertRaises(ValueError):
+            ktir.Recipe(
+                arity=1,
+                arms=(self._arm(), self._arm(ktir.BindingKind.COMBINER, FP16)),
+            )
+        # And the two shapes that do agree are fine, whichever way they agree.
+        self.assertFalse(
+            ktir.Recipe(
+                arity=1,
+                arms=(self._arm(), self._arm(ktir.BindingKind.PAYLOAD, FP16)),
+            ).reduces
+        )
+        self.assertTrue(
+            ktir.Recipe(arity=1, arms=self._arm(ktir.BindingKind.COMBINER)).reduces
+        )
+
+    def test_a_reduction_mismatch_is_refused_before_any_arm_is_chosen(self):
+        """The early family check asks the RECIPE, and asks nothing else.
+
+        Pinned by a dispatcher that fails if it runs at all: the check needs one
+        bit, that bit is an op fact, and it is asked at a point where the operands
+        have not been squeezed yet -- so choosing an arm here would be a second
+        selection, from a request missing its ``broadcast``, free to disagree with
+        the real one.  The message is unchanged from when it read an arm's kind.
+        """
+
+        def never(arms, request):
+            raise AssertionError("the family check chose an arm")
+
+        recipe = dataclasses.replace(ktir.KtirBuilder.RECIPES["add"], dispatch=never)
+        with mock.patch.dict(ktir.KtirBuilder.RECIPES, {"add": recipe}):
+            with self.assertRaises(NotImplementedError) as ctx:
+                ktir.build_kernel_plan([make_op_spec(is_reduction=True)])
+        self.assertIn("is registered as NAMED", str(ctx.exception))
+        self.assertIn("a reduction", str(ctx.exception))
+
+    def test_a_broadcast_operand_takes_the_scalar_arm_and_an_aligned_one_the_named(
+        self,
+    ):
+        """The three entries' resolution table, and how it composes with format.
+
+        Composition is the constraint that matters: the dispatcher DELEGATES to
+        ``request_by_dtype`` after filtering, so an int32 broadcast ``add`` lands
+        on its ``spyreop`` intrinsic rather than on ``arith.addf``.  ``sub`` has no
+        integer intrinsic, so at int32 nothing survives the filter and the named
+        arm comes back -- ``_broadcast_surface`` then refuses, naming the reason.
+        That is a missing op, not a dispatch defect.
+        """
+        for op in ("add", "mul", "sub"):
+            recipe = ktir.KtirBuilder.RECIPES[op]
+            with self.subTest(op=op):
+                self.assertIs(recipe.arm(FP16).kind, ktir.BindingKind.NAMED)
+                self.assertIs(
+                    recipe.arm(FP16, broadcast=True).kind, ktir.BindingKind.PAYLOAD
+                )
+        int32 = DataFormats.IEEE_INT32
+        for op in ("add", "mul"):
+            with self.subTest(op=op):
+                arm = ktir.KtirBuilder.RECIPES[op].arm(int32, broadcast=True)
+                self.assertIs(arm.kind, ktir.BindingKind.PAYLOAD)
+                self.assertEqual(arm.dtypes, (int32,))
+        self.assertIs(
+            ktir.KtirBuilder.RECIPES["sub"].arm(int32, broadcast=True).kind,
+            ktir.BindingKind.NAMED,
+        )
+        # The float scalars are dtype-less, so what they do NOT serve is listed
+        # once, in ``_INTEGER_FORMATS``.  Kept in step with the supported-format
+        # table here, because a new integer format added to ``NAMES`` alone would
+        # silently resolve to ``arith.addf``.
+        for dtype, spelling in ktir.ElemTypes.NAMES.items():
+            with self.subTest(dtype=dtype):
+                self.assertEqual(
+                    spelling.startswith("i"), dtype in ktir._INTEGER_FORMATS
+                )
+
+    def test_the_broadcast_flag_is_derived_from_coordinates_alone_and_reaches_step(
+        self,
+    ):
+        """``broadcast`` is on the step for the reason ``dtype`` is.
+
+        Emission re-resolves the arm and has no spec in reach, so the two fields
+        together are the ``Request`` the plan dispatched on -- without them the
+        emitter would resolve the default arm and fill a body the planned surface
+        does not fit.
+        """
+        for form in ("row", "stat", "splat"):
+            with self.subTest(form=form):
+                [step] = ktir.build_kernel_plan([make_broadcast_op_spec(form)]).steps
+                self.assertTrue(step.broadcast)
+        [aligned] = ktir.build_kernel_plan([make_op_spec()]).steps
+        self.assertFalse(aligned.broadcast)
+
+    def test_a_broadcast_sub_is_a_generic_and_an_aligned_one_is_still_the_named_op(
+        self,
+    ):
+        """The gap this closes, end to end through the plan.
+
+        The broadcast form is softmax's ``x - rowmax``: the max sits at the head of
+        its stick, map row ``(0, None, 2)``, which only a generic can state.  The
+        aligned form is the one every emitter golden holds, and it must not have
+        moved: BARE, no indexing record, nothing derived.
+        """
+        d0, d1, d2 = sympy.symbols("d0 d1 d2")
+        broadcast = make_op_spec(
+            "sub",
+            sizes=[[16, 512, 64], [16, 1, 64], [16, 512, 64]],
+            coords_per_arg=[
+                [d0, d1, d2],
+                [d0, sympy.Integer(0), d2],
+                [d0, d1, d2],
+            ],
+        )
+        [step] = ktir.build_kernel_plan([broadcast]).steps
+        self.assertIs(step.surface, ktir.Surface.GENERIC)
+        self.assertEqual(step.indexing.maps, ((0, 1, 2), (0, None, 2), (0, 1, 2)))
+        for op in ("add", "mul", "sub"):
+            with self.subTest(op=op):
+                [aligned] = ktir.build_kernel_plan([make_op_spec(op)]).steps
+                self.assertIs(aligned.surface, ktir.Surface.BARE)
+                self.assertIsNone(aligned.indexing)
+
+
 class TestReduceSurface(unittest.TestCase):
     """Which of the two reduction shapes a loop nest can be emitted as.
 
@@ -1359,13 +1576,10 @@ class TestAPayloadWithNoNamedOpGetsAGeneric(unittest.TestCase):
         """
         for op, recipe in ktir.KtirBuilder.RECIPES.items():
             # A reduction wants coordinates that actually reduce, which its own
-            # fixtures own; the claim here is about the pointwise ops.
-            # ``arm(None)`` is the arm an unlisted format reaches, which is the one
-            # ``make_op_spec``'s fp16 args resolve to.
-            if (
-                recipe.attrs is not None
-                or recipe.arm(None).kind is ktir.BindingKind.COMBINER
-            ):
+            # fixtures own; the claim here is about the pointwise ops.  Asked of
+            # the recipe rather than of an arm, because whether an op reduces is an
+            # op fact and needs no format to answer.
+            if recipe.attrs is not None or recipe.reduces:
                 continue
             with self.subTest(op=op):
                 spec = make_op_spec(op, inputs=recipe.arity)

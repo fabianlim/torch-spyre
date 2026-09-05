@@ -147,22 +147,7 @@ class TestKtirBakedAddresses(unittest.TestCase):
     "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
 )
 class TestAChainRoundTripsItsIntermediate(unittest.TestCase):
-    """``(a + b) * c`` in one kernel: the add stores, the mul loads.
-
-    DECISION pinned: a stage boundary goes through MEMORY. ``buf0`` is an ordinary
-    HBM buffer with an ``arg_index``, so it gets a func parameter, a view in each
-    stage that touches it, a store from the add and a load into the mul.
-
-    LIMITATION forcing it: a value cannot cross a compute stage -- MEASURED, the
-    backend *aborts* on one rather than refusing it. Two specs are two stages, so a
-    threaded intermediate always crosses one and is refused (see
-    ``TestAThreadedValueMayNotCrossAStage``).
-
-    What makes the round-trip available is a configuration fact, not new
-    machinery: with ``LX_PLANNING=0 HBM_POOL_PLANNING=0`` memory planning leaves
-    the intermediate in HBM, the wrapper allocates and passes it, and MEASURED, a
-    two-stage kernel then compiles and RUNS correctly with no emitter change.
-    """
+    """``(a + b) * c`` in one kernel: the add stores, the mul loads."""
 
     EXPECTED_CHAIN_KTIR = """\
 #map = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
@@ -209,12 +194,7 @@ module {
         self.assertEqual(emitted, self.EXPECTED_CHAIN_KTIR)
 
     def test_the_intermediate_round_trips_through_memory(self):
-        """The golden's point, as counts so it cannot be read past.
-
-        Five buffers, five parameters: four loads (a, b, c and buf0 read back)
-        and two stores (buf0 and buf1). The mul's first operand is a LOAD, not
-        the add's result -- that is the whole difference from threading.
-        """
+        """The golden's point, as counts so it cannot be read past."""
         from torch_spyre._inductor.codegen.ktir import generate_ktir
 
         emitted = generate_ktir("ktir_fused_add_mul_0", self._chain())
@@ -231,23 +211,7 @@ module {
     "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
 )
 class TestAStageOwnsItsViews(unittest.TestCase):
-    """``(a + b) * a``: one buffer, read by two stages, viewed twice.
-
-    DECISION pinned: a memory view belongs to the stage that tiles it, so a
-    buffer two stages read is viewed once in each.
-
-    LIMITATION forcing it: two stages cannot share one view.  MEASURED on a
-    hand-written reference chain of six computes, which ships seven duplicate views
-    of four bases: as written it compiles (exit 0, six ``local_schedule`` modules
-    for its six computes), and deduping the duplicates ABORTS the backend compiler rather
-    than refusing.  A stage's compute is extracted into a module of its own
-    and its view goes with it, so a second stage's use of that view is a use the
-    extraction cannot erase.
-
-    Would be unnecessary if: that abort were fixed, at which point one view per
-    buffer becomes a choice about how much text to emit rather than the
-    difference between a kernel and a crash.
-    """
+    """``(a + b) * a``: one buffer, read by two stages, viewed twice."""
 
     @staticmethod
     def _two_stages_over_one_buffer() -> list:
@@ -811,23 +775,7 @@ module {
     "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
 )
 class TestFusedElementTypeEmission(unittest.TestCase):
-    """An operand whose buffer holds two statistics per stick, read as ONE element.
-
-    DECISION pinned: a buffer flagged ``ElementArrangement.EXX2`` is viewed,
-    tiled and loaded at ``!spyreop.fp16_fused`` -- one element carrying a mean and
-    a mean of squares together -- while the extent and the strides are the ones
-    its ``device_size`` states.  Nothing propagates the flag: the result of this
-    op is plain ``f16``, which is what ``spyreop.layernormscale_fused`` returns.
-
-    LIMITATION forcing it: the frontend has no dtype for the pair, so the fused
-    element type can only be reached through the arrangement.
-
-    Pinned against a hand-written reference module for this op, whose compute is
-    ``spyreop.layernormscale_fused %in : !spyreop.fp16_fused -> f16`` inside a
-    ``linalg.generic``.  Its extents and its rank-reducing operand map are not
-    reachable yet (they are the broadcast and stick-head reads of later tasks);
-    the element types and the op are, and they are what this pins.
-    """
+    """An operand whose buffer holds two statistics per stick, read as ONE element."""
 
     @staticmethod
     def _fused_operand_spec():
@@ -878,24 +826,7 @@ class TestFusedElementTypeEmission(unittest.TestCase):
     "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
 )
 class TestAReducingBodyThatIgnoresItsAccumulator(unittest.TestCase):
-    """A reduction whose body reads only the element, never the accumulator.
-
-    DECISION pinned: such an op needs no new ``BindingKind`` and no new surface.
-    It is registered ``COMBINER`` -- because it reduces, which is the bit the
-    plan's equality check compares against ``is_reduction`` -- and its binding
-    simply does not use its first parameter.  The generic that comes out is the
-    ordinary on-stick reducing one, with a body of a single ``spyreop`` op.
-
-    LIMITATION forcing it: the body is a MARKER FOR A DEVICE PATTERN, not a fold.
-    The device replaces the whole generic with the two reductions the op stands
-    for, so what is written here is recognised rather than lowered -- and if the
-    pattern does not match, "the last element wins" is what the text means, which
-    fails as a non-match rather than as an error.
-
-    Pinned against a hand-written reference module for this op, at our extents.
-    MEASURED on the emitted module: the backend compiler exits
-    0 and produces one ``module @local_schedule``, that module's own count.
-    """
+    """A reduction whose body reads only the element, never the accumulator."""
 
     @staticmethod
     def _reducing_vector():
@@ -906,8 +837,7 @@ class TestAReducingBodyThatIgnoresItsAccumulator(unittest.TestCase):
         )
 
     def test_the_nest_is_the_ordinary_on_stick_reduction(self):
-        """Same iterators and same maps as a bare ``sum`` over the stick: the
-        binding is the only thing this op contributes."""
+        """Same iterators and same maps as a bare ``sum`` over the stick: the"""
         from torch_spyre._inductor.codegen.ktir import generate_ktir
 
         emitted = generate_ktir("exx2_onstick_1core", self._reducing_vector())
@@ -920,8 +850,7 @@ class TestAReducingBodyThatIgnoresItsAccumulator(unittest.TestCase):
         )
 
     def test_the_body_reads_the_element_and_not_the_accumulator(self):
-        """The whole capability, in one assertion: ``%out`` types the result and
-        is not an operand of anything."""
+        """The whole capability, in one assertion: ``%out`` types the result and"""
         from torch_spyre._inductor.codegen.ktir import generate_ktir
 
         emitted = generate_ktir("exx2_onstick_1core", self._reducing_vector())
@@ -931,8 +860,7 @@ class TestAReducingBodyThatIgnoresItsAccumulator(unittest.TestCase):
         self.assertNotIn("%out", body)
 
     def test_the_pair_is_stored_as_one_element_per_statistic(self):
-        """A whole stick per statistic, viewed at the fused type: rank 2, 256x64,
-        which is what the opaque reduction needs to get the pair to element 0."""
+        """A whole stick per statistic, viewed at the fused type: rank 2, 256x64,"""
         from torch_spyre._inductor.codegen.ktir import generate_ktir
 
         emitted = generate_ktir("exx2_onstick_1core", self._reducing_vector())
@@ -949,19 +877,7 @@ class TestAReducingBodyThatIgnoresItsAccumulator(unittest.TestCase):
     "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
 )
 class TestBroadcastOperandEmission(unittest.TestCase):
-    """A constant result position in an ``indexing_maps`` row, as MLIR text.
-
-    DECISION pinned: an operand axis that walks no iteration dim prints as the
-    constant ``0`` in its affine map, and the op is a ``linalg.generic`` because
-    only a generic can state a map.
-
-    LIMITATION forcing it: ``_affine_map`` built one ``AffineExpr.get_dim`` per
-    entry, so ``0`` was unspellable, and every broadcast operand was refused
-    before it.
-
-    The three maps are a hand-written reference chain's own -- ``#map_row``,
-    ``#map_stat``, ``#map_splat`` and ``#map_col`` -- at our extents.
-    """
+    """A constant result position in an ``indexing_maps`` row, as MLIR text."""
 
     def test_each_form_prints_the_map_the_chain_writes(self):
         from torch_spyre._inductor.codegen.ktir import generate_ktir
@@ -977,8 +893,7 @@ class TestBroadcastOperandEmission(unittest.TestCase):
                 self.assertIn("linalg.generic", emitted)
 
     def test_the_broadcast_operand_is_loaded_at_the_shape_its_map_reads(self):
-        """The operand tensor is the tile, one element on the axis it does not
-        walk: ``tensor<512x1xf16>`` under ``(d0, d1, d2) -> (d1, 0)``."""
+        """The operand tensor is the tile, one element on the axis it does not"""
         from torch_spyre._inductor.codegen.ktir import generate_ktir
 
         emitted = generate_ktir("k_stat", [make_broadcast_op_spec("stat")])
@@ -986,8 +901,7 @@ class TestBroadcastOperandEmission(unittest.TestCase):
         self.assertIn('iterator_types = ["parallel", "parallel", "parallel"]', emitted)
 
     def test_an_aligned_operand_is_untouched(self):
-        """The pointwise golden is the evidence: nothing about a plain ``add``
-        moves, because alignment is the switch and it says nothing to derive."""
+        """The pointwise golden is the evidence: nothing about a plain ``add``"""
         from torch_spyre._inductor.codegen.ktir import generate_ktir
 
         emitted = generate_ktir("ktir_fused_add_0", [make_op_spec()])
@@ -999,22 +913,7 @@ class TestBroadcastOperandEmission(unittest.TestCase):
     "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
 )
 class TestStatisticReadEmission(unittest.TestCase):
-    """Two stages over one statistic buffer: a stick written, a head read.
-
-    DECISION pinned: the two stages view the SAME buffer at the same extent and
-    strides, and differ in their ``access_tile_set`` -- the whole stick where the
-    reduction writes, one element where the consumer reads.
-
-    LIMITATION forcing it: the mean of squares sits sixteen bytes along the mean,
-    so a read covering the whole innermost dimension is a backend error, while the
-    write has to cover it because the hardware writes a stick at a time.
-
-    Pinned against a hand-written reference chain, whose ``#set_stat_slab``
-    (24x64, the write) and ``#set_stat_one`` (24x1, the read) are the same pair at
-    that module's extents.  MEASURED on the emitted module: the backend compiler
-    --kEmitSpyreCode`` exits 0 with TWO ``module @local_schedule``s, one per
-    compute.
-    """
+    """Two stages over one statistic buffer: a stick written, a head read."""
 
     def test_the_write_covers_the_stick_and_the_read_covers_its_head(self):
         from torch_spyre._inductor.codegen.ktir import generate_ktir
@@ -1045,21 +944,7 @@ class TestStatisticReadEmission(unittest.TestCase):
     "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
 )
 class TestArityBeyondTwoEmission(unittest.TestCase):
-    """Five operands in one ``linalg.generic``, every one a func argument.
-
-    DECISION pinned: arity is not a shape.  Five inputs cost one recipe -- six
-    identity maps, six block arguments, the payload called with five of them in
-    operand order -- and no emitter change.
-
-    LIMITATION forcing the test: every ``RECIPES`` entry was arity 1 or 2, so
-    nothing had ever exercised the generic arity of ``validated_roles``,
-    ``_parallel_surface`` and ``_emit_generic``'s block.
-
-    Pinned against a hand-written reference module for this op, at that module's
-    own extents and format.  MEASURED on the emitted module: the backend compiler
-    --kEmitSpyreCode`` exits 0 with ONE ``module @local_schedule``, that module's
-    own count.
-    """
+    """Five operands in one ``linalg.generic``, every one a func argument."""
 
     @staticmethod
     def _five_input_spec():
@@ -1107,23 +992,7 @@ class TestArityBeyondTwoEmission(unittest.TestCase):
     "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
 )
 class TestOneBufferViewedAtTwoElementTypesEmission(unittest.TestCase):
-    """One base address, two memref element types, one func parameter.
-
-    DECISION pinned: the two views of one buffer are emitted from the two
-    ACCESSES' own records, so the stage that writes fused statistics views the
-    base as ``!spyreop.fp16_fused`` and the stage that reads a mean out of each
-    stick head views the same base as ``f16``.
-
-    LIMITATION forcing it: ``Buffer`` was registered first-wins per ``buf_id``, so
-    every stage's view took the first stage's element type -- and the element type
-    is not the arrangement's to give either, so the two views also differ by what
-    the RECIPE says each operand reads.
-
-    Pinned against a hand-written reference chain's two views, at two element
-    types, over one paired base.  MEASURED on the emitted module:
-    the backend compiler exits 0 with TWO ``module
-    @local_schedule``s.
-    """
+    """One base address, two memref element types, one func parameter."""
 
     def test_one_base_is_viewed_at_two_element_types(self):
         from torch_spyre._inductor.codegen.ktir import generate_ktir
@@ -1155,8 +1024,7 @@ class TestOneBufferViewedAtTwoElementTypesEmission(unittest.TestCase):
         )
 
     def test_the_fused_write_covers_the_stick_and_the_plain_read_its_head(self):
-        """The element type and the tile are two different facts about one buffer,
-        and both differ between the stages."""
+        """The element type and the tile are two different facts about one buffer,"""
         from torch_spyre._inductor.codegen.ktir import generate_ktir
 
         emitted = generate_ktir("TwoElementTypes_1", make_two_element_type_specs())
@@ -1172,21 +1040,7 @@ class TestOneBufferViewedAtTwoElementTypesEmission(unittest.TestCase):
     "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
 )
 class TestAnAccessOnlySpecEmitsNothing(unittest.TestCase):
-    """The placed buffer appears nowhere; both readers view the source.
-
-    DECISION pinned: an access-only spec emits no compute, no view, no store and
-    no parameter.  Its two readers each view the SOURCE's base -- once each, since
-    a view belongs to the stage that tiles it.
-
-    LIMITATION forcing it: KTIR cannot issue the allocate that would give the
-    placed buffer an address, so "stage this in LX" is not a request this emitter
-    can carry out; and emitting it as a compute would be a copy of a buffer to
-    itself at a different address, which the hardware does not need.
-
-    MEASURED on the emitted module: the backend compiler exits
-    0, and a hand-written reference chain likewise views its input directly in two
-    stages with no staging op anywhere in it.
-    """
+    """The placed buffer appears nowhere; both readers view the source."""
 
     def test_both_readers_view_the_source_and_the_link_is_absent(self):
         from torch_spyre._inductor.codegen.ktir import generate_ktir

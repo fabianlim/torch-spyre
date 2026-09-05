@@ -305,13 +305,7 @@ class TestPlaceholderAxes(unittest.TestCase):
 
 
 class TestOperandIndexing(unittest.TestCase):
-    """One pointwise operand's map row, read off the coordinates.
-
-    The three broadcast forms the hand-written normalisation chain is built out
-    of, and they are one rule: an operand axis walks the output axis it shares a
-    ``_dim_info`` classification with, or -- carrying no symbol and one element --
-    walks nothing and reads the constant 0.
-    """
+    """One pointwise operand's map row, read off the coordinates."""
 
     def test_a_row_broadcast_keeps_the_axes_either_side_of_it(self):
         """``#map_row``: a weight read at one coordinate of the middle dim."""
@@ -324,8 +318,7 @@ class TestOperandIndexing(unittest.TestCase):
         )
 
     def test_a_statistic_read_is_rank_reducing(self):
-        """``#map_stat``: one value per coordinate of the middle dim, at the head
-        of its stick, from an operand of lower rank than the output."""
+        """``#map_stat``: one value per coordinate of the middle dim, at the head"""
         d0, d1, d2 = sympy.symbols("d0 d1 d2")
         self.assertEqual(
             operand_indexing(
@@ -343,16 +336,14 @@ class TestOperandIndexing(unittest.TestCase):
         )
 
     def test_an_aligned_operand_is_the_identity(self):
-        """The row a matching operand derives to, so the fast path and the
-        derivation cannot mean different things where both apply."""
+        """The row a matching operand derives to, so the fast path and the"""
         coords = list(sympy.symbols("d0:3"))
         self.assertEqual(
             operand_indexing(coords, [32, 48, 64], coords, [32, 48, 64]), (0, 1, 2)
         )
 
     def test_the_within_stick_and_outer_stick_spellings_match_by_kind(self):
-        """Matched by classification, not by expression: the projection writes an
-        outer-stick index as ``floor(c/64)`` and torch writes ``FloorDiv``."""
+        """Matched by classification, not by expression: the projection writes an"""
         c0 = sympy.Symbol("c0")
         self.assertEqual(
             operand_indexing(
@@ -365,17 +356,14 @@ class TestOperandIndexing(unittest.TestCase):
         )
 
     def test_a_stretched_axis_is_refused(self):
-        """One element under a dim that runs 48: the coordinate says the operand
-        walks that dim, so the row is a dim and not a constant, and a map cannot
-        stretch one element over 48."""
+        """One element under a dim that runs 48: the coordinate says the operand"""
         d0, d1 = sympy.symbols("d0 d1")
         with self.assertRaises(NotImplementedError) as ctx:
             operand_indexing([d0, d1], [1, 64], [d0, d1], [48, 64])
         self.assertIn("not a stretch of it", str(ctx.exception))
 
     def test_a_constant_axis_carrying_elements_is_refused(self):
-        """A constant coordinate over 64 elements is the broadcast LANE a
-        reduction's output walks, not something an operand map can read."""
+        """A constant coordinate over 64 elements is the broadcast LANE a"""
         d0, d1 = sympy.symbols("d0 d1")
         with self.assertRaises(NotImplementedError) as ctx:
             operand_indexing([d0, sympy.Integer(0)], [48, 64], [d0, d1], [48, 64])
@@ -388,8 +376,7 @@ class TestOperandIndexing(unittest.TestCase):
         self.assertIn("matches no output device axis", str(ctx.exception))
 
     def test_permuted_axes_are_refused(self):
-        """Expressible as a map and still refused: reading the operand's own
-        memory in that order needs a transpose, which is a restickify."""
+        """Expressible as a map and still refused: reading the operand's own"""
         d0, d1 = sympy.symbols("d0 d1")
         with self.assertRaises(NotImplementedError) as ctx:
             operand_indexing([d1, d0], [48, 32], [d0, d1], [32, 48])

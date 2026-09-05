@@ -40,7 +40,7 @@ import sympy
 from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor import config as spyre_config
 from torch_spyre._inductor.codegen import ktir
-from torch_spyre._inductor.constants import STAGGERED_EAS
+from torch_spyre._inductor.constants import IDENTITY_OP, STAGGERED_EAS
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
 
 # ---------------------------------------------------------------------------
@@ -404,6 +404,37 @@ def make_two_element_type_specs() -> list:
     for position, index in enumerate((3, 4, 5, 6), start=2):
         consume.args[position].arg_index = index
     return [produce, consume]
+
+
+def make_access_only_specs(readers: tuple = ("exp", "sqrt")) -> list:
+    """A placement of ``x`` into an owned buffer, and ``readers`` reading it.
+
+    Three specs by default, and the shape is the whole point: the placement's
+    input and output agree on ``device_size``, ``device_coordinates`` and
+    ``device_dtype`` and differ ONLY in ``allocation``, and the link it writes has
+    TWO readers -- which is the normal case for a placement and the case
+    ``_collapse_producer`` declines.  Not layernorm's ``identity``: the ops here
+    are incidental, and any arity-1 recipe would do.
+    """
+    owned = {"lx": 0}
+    place = make_op_spec(
+        IDENTITY_OP, inputs=1, names=["x", "staged"], allocations=[None, owned]
+    )
+    return [
+        place,
+        *(
+            make_op_spec(
+                op,
+                inputs=1,
+                names=["staged", f"out{index}"],
+                allocations=[owned, None],
+                # ``staged`` is not passed in, so it consumes no position: the
+                # readers' outputs continue the kernel's numbering after ``x``.
+                first_arg_index=1 + index,
+            )
+            for index, op in enumerate(readers)
+        ),
+    ]
 
 
 def make_linked_op_specs(
@@ -2961,6 +2992,125 @@ class TestFusedElementType(unittest.TestCase):
         need a second operand nobody supplies.
         """
         self.assertEqual(ktir.KtirBuilder.RECIPES["layernormscale"].arity, 1)
+
+
+class TestAnAccessOnlySpecIsNoStage(unittest.TestCase):
+    """A spec that carries only a placement becomes a hint, not a stage.
+
+    DECISION pinned: an access-only spec -- one whose input and output agree on
+    ``device_size``, ``device_coordinates`` and ``device_dtype`` and differ only in
+    ``allocation`` -- emits NO step, and every reader of the buffer it placed
+    accesses the SOURCE instead, keeping its own extent and coefficients.
+    Resolved in the plan walk through ``KernelPlan.hints``, consulted at
+    ``_access_of``, which is the single site that attaches a ``Buffer`` to an
+    ``Access``.
+
+    LIMITATION forcing it: there is nothing to lower.  No arithmetic, no
+    reindexing, not even a format change -- the only thing an emitted stage could
+    do is copy a buffer to itself at a different address, and the emitter has no
+    recipe for that on purpose.
+
+    Why not the fusion table's rewrite: ``_collapse_producer`` deletes a producer
+    into ONE surviving consumer and declines when the link has two readers, because
+    a device primitive absorbs the producer's WORK and work can only be absorbed
+    once.  Here there is no work, so all readers are rewired -- and two readers is
+    the normal case, which is why the fixture has two.
+    """
+
+    def test_the_placement_emits_no_step_and_its_readers_read_the_source(self):
+        plan = ktir.build_kernel_plan(make_access_only_specs())
+        # Two readers, two steps: the placement contributed neither a step nor a
+        # stage number.
+        self.assertEqual([step.op for step in plan.steps], ["exp", "sqrt"])
+        self.assertEqual([step.stage for step in plan.steps], [0, 1])
+        for step in plan.steps:
+            [(read_id, access)] = step.ins
+            with self.subTest(op=step.op):
+                # The spec still names the link; the ACCESS is of the source.
+                self.assertEqual(read_id, "staged")
+                self.assertEqual(access.buffer.buf_id, "x")
+                # ...at the reader's own extent and coefficients, not the
+                # placement's: nothing is authored and nothing is translated.
+                self.assertEqual(access.extent, tuple(ADD_SIZE))
+
+    def test_the_link_is_neither_a_parameter_nor_a_threaded_value(self):
+        """One parameter per buffer that reaches memory: the source, and the two
+        results.  The link is gone -- it has no view, no address and no slot."""
+        plan = ktir.build_kernel_plan(make_access_only_specs())
+        self.assertEqual(
+            [(b.buf_id, b.arg_index) for b in plan.parameters],
+            [("x", 0), ("out0", 1), ("out1", 2)],
+        )
+        self.assertEqual(plan.hints["staged"].buf_id, "x")
+        # Not threaded: a hinted buffer has a real view and a real load, which is
+        # what ``Access.buffer`` being set says.
+        self.assertNotIn("staged", plan.buffers)
+
+    def test_a_near_miss_is_refused_rather_than_hinted_away(self):
+        """The one condition whose absence would be silent.
+
+        A spec with the same extent and coordinates but a different FORMAT is a
+        conversion, and one with permuted coordinates is a relayout: in both cases
+        a reader's own description does not describe the source, so the read would
+        be of the wrong bytes -- and it would compile.  Refused, not hinted.
+        """
+        for label, mutate in (
+            ("format", lambda arg: setattr(arg, "device_dtype", DataFormats.IEEE_FP32)),
+            (
+                "coordinates",
+                lambda arg: setattr(
+                    arg, "device_coordinates", list(reversed(arg.device_coordinates))
+                ),
+            ),
+            ("extent", lambda arg: setattr(arg, "device_size", [16, 512, 32])),
+        ):
+            with self.subTest(differs=label):
+                specs = make_access_only_specs()
+                mutate(specs[0].args[1])
+                with self.assertRaises(NotImplementedError) as ctx:
+                    ktir.build_kernel_plan(specs)
+                self.assertIn(
+                    "real data movement rather than a placement", str(ctx.exception)
+                )
+
+    def test_a_link_with_two_writers_is_refused(self):
+        """Dropping the placement would leave the other writer's data being read
+        through a buffer nothing wrote."""
+        specs = make_access_only_specs()
+        second_writer = make_op_spec(
+            "exp",
+            inputs=1,
+            names=["x", "staged"],
+            allocations=[None, {"lx": 0}],
+            first_arg_index=3,
+        )
+        with self.assertRaises(NotImplementedError) as ctx:
+            ktir.build_kernel_plan([specs[0], second_writer, *specs[1:]])
+        self.assertIn("written by 2 ops", str(ctx.exception))
+
+    def test_a_placement_into_a_buffer_the_kernel_does_not_own_is_refused(self):
+        """Only an owned link makes this kernel's reads all the reads there are: a
+        buffer in ``hbm`` may be read by a kernel this vector does not contain."""
+        specs = make_access_only_specs()
+        specs[0] = make_op_spec(IDENTITY_OP, inputs=1, names=["x", "staged"])
+        with self.assertRaises(NotImplementedError) as ctx:
+            ktir.build_kernel_plan(specs)
+        self.assertIn("rather than one this kernel owns", str(ctx.exception))
+
+    def test_a_placement_with_two_inputs_is_refused(self):
+        """A spec with two inputs is computing something, whatever it is called."""
+        specs = make_access_only_specs()
+        specs[0] = make_op_spec(
+            IDENTITY_OP,
+            inputs=2,
+            names=["x", "y", "staged"],
+            allocations=[None, None, {"lx": 0}],
+        )
+        with self.assertRaises(NotImplementedError) as ctx:
+            ktir.build_kernel_plan(specs)
+        self.assertIn(
+            "a hint relates exactly one source to one link", str(ctx.exception)
+        )
 
 
 class TestWithoutTheDialectBuild(unittest.TestCase):

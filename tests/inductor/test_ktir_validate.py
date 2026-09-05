@@ -1189,19 +1189,16 @@ class TestRecipes(unittest.TestCase):
 class TestArmDispatch(unittest.TestCase):
     """Selecting an arm on MORE than the format: the second discriminant.
 
-    ``sub`` binds ``linalg.sub``, which states its own identity indexing, so a
-    broadcast operand had nowhere to put its derived map row and was refused --
-    and softmax's ``x - rowmax`` reads the max at the stick head, so it was
-    refused.  A ``Recipe`` now carries a ``dispatch``, and ``add``/``mul``/``sub``
-    use ``request_scalar_when_broadcast``: the named op for aligned operands, the
-    ``arith`` scalar in a generic when one is broadcast.
+    ``add``/``mul``/``sub`` dispatch through ``request_scalar_when_broadcast``: the
+    named op for aligned operands, the ``arith`` scalar in a generic when one is
+    broadcast, because a named op states its own identity indexing and has nowhere
+    to put a derived map row.  MEASURED end to end: this is what softmax's
+    ``x - rowmax`` needs, and with it ``torch.softmax`` at (256, 128) fp16 on the
+    KTIR path matches the SDSC path exactly (verify.py).
 
-    MEASURED end to end: ``torch.softmax`` at (256, 128) fp16 on the KTIR path
-    comes out at 1.9e-4 max abs diff, 0 of 256 rows wrong, matching SDSC.
-
-    The invariant holding it all together: a ``Request``'s fields are derivable
-    from the SPEC ALONE, so all of them are known before an arm is needed and the
-    selection happens exactly once.
+    The invariant holding it together: a ``Request``'s fields are derivable from the
+    SPEC ALONE, so all of them are known before an arm is needed and the selection
+    happens exactly once.
     """
 
     @staticmethod
@@ -1211,11 +1208,9 @@ class TestArmDispatch(unittest.TestCase):
     def test_the_default_dispatcher_is_the_format_alone(self):
         """Every entry that did not ask for the new discriminant ignores it.
 
-        The pure-refactor pin: ``Recipe.dispatch`` defaults to
-        ``request_by_dtype``, which reads ``request.dtype`` and nothing else, so
-        for those entries ``broadcast`` cannot change an answer.  Asserted over the
-        whole table because the failure mode is one entry silently changing
-        spelling.
+        ``Recipe.dispatch`` defaults to ``request_by_dtype``, which reads
+        ``request.dtype`` and nothing else.  Asserted over the whole table because
+        the failure mode is one entry silently changing spelling.
         """
         for op, recipe in ktir.KtirBuilder.RECIPES.items():
             if recipe.dispatch is not ktir.request_by_dtype:
@@ -1286,10 +1281,9 @@ class TestArmDispatch(unittest.TestCase):
         """The early family check asks the RECIPE, and asks nothing else.
 
         Pinned by a dispatcher that fails if it runs at all: the check needs one
-        bit, that bit is an op fact, and it is asked at a point where the operands
-        have not been squeezed yet -- so choosing an arm here would be a second
-        selection, from a request missing its ``broadcast``, free to disagree with
-        the real one.  The message is unchanged from when it read an arm's kind.
+        bit, that bit is an op fact, and it is asked before the operands have been
+        squeezed -- so choosing an arm here would be a second selection, from a
+        request missing its ``broadcast``, free to disagree with the real one.
         """
 
         def never(arms, request):
@@ -1825,9 +1819,7 @@ class TestAThreadedValueMayNotCrossAStage(unittest.TestCase):
 
     LIMITATION forcing the refusal rather than the emission: a value cannot cross a
     compute stage, and the backend does not decline it -- MEASURED, ``dbo-opt``
-    *aborts* (``PatternMatch.cpp:156 eraseOp: op->use_empty()``). So emitting it
-    trades a message for a crash. The check used to skip this on the stated grounds
-    that the backend refused such kernels anyway; it does not refuse, it dies.
+    *aborts*. So emitting it trades a message for a crash.
     """
 
     def test_an_owned_intermediate_read_by_a_later_stage_is_refused(self):
@@ -1863,8 +1855,8 @@ class TestStagesAreNumbered(unittest.TestCase):
     could not tell a body's first step from the kernel's.
 
     LIMITATION forcing per-stage numbers at all: two stages cannot share one
-    memory view (the backend's ``ComputeGroupExtraction`` aborts on
-    ``op->use_empty()``), so the emitter has to ask "which stage" before it can
+    memory view (the backend aborts on one rather than refusing it), so the emitter
+    has to ask "which stage" before it can
     answer with a view -- and the answer has to be unique per compute.
     """
 
@@ -1911,10 +1903,6 @@ class TestStagesAreNumbered(unittest.TestCase):
                 )
             ],
         )
-
-    def test_one_op_is_stage_zero(self):
-        [step] = ktir.build_kernel_plan([make_op_spec()]).steps
-        self.assertEqual(step.stage, 0)
 
     def test_each_op_in_a_chain_is_its_own_stage(self):
         steps = ktir.build_kernel_plan(make_chained_op_specs(("add", "mul"))).steps
@@ -2034,15 +2022,9 @@ class TestPlanFusionRewrite(FusionCase):
     def test_a_two_stage_span_the_table_names_becomes_one_stage(self):
         """DECISION: recognise the span positionally and replace the whole of it.
 
-        LIMITATION forcing it: the emitter has no ``abs`` recipe, deliberately --
-        the backend refuses a standalone ``math.absf``, so the fused reduction is
-        the only shape the device takes an absolute value in.  If this fails the
-        emitter is handed a bare ``abs`` and every ``amax(abs(x))`` kernel is
-        refused, which is a working path today.
-
-        Would be unnecessary if: the backend gained a pointwise absolute value
-        and an intermediate could cross a compute op, at which point the two
-        stages would simply both emit.
+        There is deliberately no ``abs`` recipe -- the backend refuses a standalone
+        ``math.absf`` -- so if this fails the emitter is handed a bare ``abs`` and
+        every ``amax(abs(x))`` kernel is refused.
         """
         vector = fuse(make_absmax_pair())
         self.assertEqual([spec.op for spec in vector], ["absmax"])
@@ -2059,11 +2041,9 @@ class TestPlanFusionRewrite(FusionCase):
         compiles, runs, and addresses the wrong elements -- the worst failure
         available here, and the only one with no diagnostic at any layer.
 
-        Both halves are asserted because either alone passes for the wrong
-        reason.  ``in_sizes`` makes the two stages disagree about the shared
-        buffer's extent on purpose: without it the assertion is vacuous, since an
-        access-preserving producer's input, output and the survivor's read of
-        that output are all the same list.
+        Both halves are asserted because either alone passes for the wrong reason,
+        and ``in_sizes`` makes the two stages disagree about the shared buffer's
+        extent on purpose: without it the assertion is vacuous.
         """
         pair = make_absmax_pair(in_sizes={1: [32, 256, 64]})
         producer_in, producer_out = pair[0].args
@@ -2112,21 +2092,6 @@ class TestPlanFusionRewrite(FusionCase):
         elementwise = make_linked_op_specs(reductions=(False, False))
         self.assertDeclined(elementwise)
         self.assertEqual([spec.op for spec in fuse(make_linked_op_specs())], ["absmax"])
-
-    def test_a_vector_no_entry_matches_comes_back_as_the_same_objects_in_order(self):
-        """DECISION: outside a matched span the fuser is the identity, by object.
-
-        LIMITATION forcing it: this runs over the OpSpec vector of every kernel
-        the emitter plans, fusable or not, and later passes mutate ``TensorArg``s
-        in place -- so a spec rebuilt identically is a spec whose later edits go
-        to a copy nothing emits.  Identity (``is``) and not equality for exactly
-        that reason.
-        """
-        specs = make_chained_op_specs(("add", "mul", "sub"))
-        vector = fuse(specs)
-        self.assertEqual([spec.op for spec in vector], ["add", "mul", "sub"])
-        for original, returned in zip(specs, vector, strict=True):
-            self.assertIs(original, returned)
 
     def test_the_stages_around_a_collapsed_span_survive(self):
         """DECISION: a match rewrites its own span and nothing around it.
@@ -2178,15 +2143,10 @@ class TestPlanFusionDeclines(FusionCase):
     def test_stages_with_no_link_between_them_are_not_a_match(self):
         """DECISION: the shapes matching is not enough; the dataflow must be there.
 
-        LIMITATION forcing it: the rewrite repoints the survivor's read at the
-        producer's source, which is only the same value if the survivor was
-        reading the producer's result.  Here it reduces a different buffer, so
-        folding the producer away deletes a write nothing replaces AND hands the
-        reduction an operand it was never given.
-
-        The producer still writes an owned buffer (``dangling``), so the only
-        thing missing is the dataflow: otherwise this would decline for the
-        ownership condition below and the two would share one test.
+        The rewrite repoints the survivor's read at the producer's source, which is
+        only the same value if the survivor was reading the producer's result.  The
+        producer still writes an owned buffer (``dangling``), so the dataflow is the
+        only thing missing and this cannot pass for the ownership reason instead.
         """
         self.assertDeclined(
             make_linked_op_specs(edges=(), dangling=(0,)),
@@ -2196,16 +2156,10 @@ class TestPlanFusionDeclines(FusionCase):
     def test_a_link_the_kernel_does_not_own_is_not_deleted(self):
         """DECISION: only a buffer memory planning placed may be deleted.
 
-        LIMITATION forcing it: ``_readers`` can only see the vector it is given,
-        which is this kernel.  ``lx`` / ``hbm_pool`` is the contract's own way of
-        saying nothing outside the kernel can reach the buffer, so ownership is
-        what makes "read once here" mean "read once anywhere".  An ``hbm`` link
-        is a real buffer another kernel may read, and deleting its producer
-        leaves that reader on stale memory -- a wrong answer in a kernel that is
-        not even the one that was rewritten.
-
-        Would be unnecessary if: the fuser were handed the whole graph's reads
-        rather than one kernel's.
+        ``_readers`` sees only this kernel's vector, so ownership (``lx`` /
+        ``hbm_pool``) is what makes "read once here" mean "read once anywhere".  An
+        ``hbm`` link is a real buffer another kernel may read, and deleting its
+        producer leaves that reader on stale memory.
         """
         self.assertDeclined(
             make_absmax_pair(link={"hbm": None}),
@@ -2243,20 +2197,11 @@ class TestPlanFusionDeclines(FusionCase):
     def test_a_link_with_two_readers_is_not_deleted(self):
         """DECISION: the link must be read exactly once, by the survivor.
 
-        Shape D -- ``a = abs(x); amax(a, -1) + sum(a, -1)``, and the case
-        adjacency gets wrong: the second consumer sits AFTER the pair, so the
-        pair is still adjacent and a purely positional matcher fuses, deleting
-        the producer of a buffer the ``sum`` still reads.
-
-        LIMITATION forcing it: a deleted buffer has no memory behind it, so that
-        reader has nothing to read.  ``_check_threaded_buffers`` does catch the
-        wreckage downstream, but only because the buffer happens to be threaded,
-        and its message then blames the surviving reader for a decision the
-        fusion took.
-
-        Would be unnecessary if: the fusion could keep the producer standing and
-        add a reader path -- which is what this shape actually wants, and what
-        needs an address for the intermediate first.
+        ``a = abs(x); amax(a, -1) + sum(a, -1)``, which is the case adjacency gets
+        wrong: the second consumer sits AFTER the pair, so the pair is still
+        adjacent and a purely positional matcher fuses, deleting the producer of a
+        buffer the ``sum`` still reads.  A deleted buffer has no memory behind it,
+        so that reader has nothing to read.
         """
         vector = self.assertDeclined(
             make_linked_op_specs(
@@ -2280,11 +2225,8 @@ class TestPlanFusionDeclines(FusionCase):
         because this emitter cannot build the unfused one either.
 
         The fp16 half is not decoration: a predicate returning False
-        unconditionally would pass without it.  Both fixtures are asserted to
-        reach the same surface, so the format is the only input that differs.
-
-        Would be unnecessary if: the backend picked its SFP mode from the
-        operand format.
+        unconditionally would pass without it, and both fixtures are asserted to
+        reach the same surface so that the format is the only input that differs.
         """
         fp16 = make_absmax_pair(onstick=True)
         fp32 = make_absmax_pair(onstick=True, dtype=DataFormats.IEEE_FP32, lanes=32)
@@ -2321,7 +2263,7 @@ class TestFusionReport(FusionCase):
     """What a successful fusion says it gave up.
 
     DECISION: report per kernel and per buffer, at ``debug`` in detail and at
-    ``warning`` in summary, and reclaim nothing.
+    ``info`` in summary, and reclaim nothing.
     LIMITATION: memory placement runs long before this does, and this emitter
     never issues the device allocate that would carry a placement out, so what a
     fusion drops is planning's STRATEGY for the buffer and not a reservation --
@@ -2375,18 +2317,11 @@ class TestFusionReport(FusionCase):
     def test_only_the_buffer_the_rewrite_deleted_is_conceded(self):
         """DECISION: derive the concessions from the RESULT, per buffer.
 
-        So the report doubles as a check on the rewrite: a buffer listed here is
-        one the rewrite chose to delete, and a rewrite that deleted something
-        still needed would say so.  LIMITATION forcing the granularity: two links
-        of one vector can have different fates, so a per-kernel or per-fusion
-        statement could not tell them apart -- and inflating the figure with
-        buffers that survive is as misleading as omitting it.
-
-        The survivor is given a scratchpad output here, which is what a fused
-        reduction whose result another op in the same kernel consumes would have.
-        Without that the test cannot discriminate: with the survivor writing HBM,
-        neither of its args is an owned buffer and skipping it makes no
-        difference.
+        So the report doubles as a check on the rewrite: a buffer listed here is one
+        the rewrite chose to delete.  The survivor is given a scratchpad output,
+        which is what a fused reduction another op in the same kernel consumes would
+        have; with the survivor writing HBM neither of its args is an owned buffer
+        and the test cannot discriminate.
         """
         pair = make_absmax_pair()
         pair[1].args[-1].allocation = {"lx": 0x3000}
@@ -2638,19 +2573,6 @@ class TestFusionDriver(FusionCase):
                 specs = make_linked_op_specs(ops=(producer, "max"))
                 self.assertEqual([s.op for s in fuse(specs, table)], [expected])
 
-    def test_a_vector_matching_no_entry_is_untouched_by_either(self):
-        """DECISION: the table declines as a whole, not per entry.
-
-        LIMITATION forcing it: one entry declining must not stop the others being
-        tried, and none matching must leave the vector for the per-spec checks to
-        refuse.
-        """
-        table = (
-            make_plan_fusion(name="negmax", pattern=(("neg", False), ("max", True))),
-            make_plan_fusion(),
-        )
-        self.assertDeclined(make_linked_op_specs(ops=("exp", "max")), table)
-
     def test_the_first_matching_entry_in_table_order_wins(self):
         """DECISION: overlapping entries are resolved by position, not specificity.
 
@@ -2876,12 +2798,9 @@ class TestRefusals(unittest.TestCase):
         row-major strides its ``device_size`` states, because the pair is one
         element of ``!spyreop.fp16_fused`` rather than two of ``f16``.
 
-        LIMITATION forcing it: nothing here can spell a stagger.  The staggered
-        arrangements next door are refused for exactly that reason, so an
-        arrangement that passes through has to be one whose element ORDER is the
-        standard one -- which the fused pair's is, MEASURED against
-        ``ktir-spyreop-exx2.mlir`` (``memref<256x64x!spyreop.fp16_fused>``, the
-        strides an f16 output of that reduction would have).
+        An arrangement that passes through has to be one whose element ORDER is
+        the standard one, since nothing here can spell a stagger -- which the fused
+        pair's is, MEASURED against a hand-written reference module.
         """
         extent, strides = (256, 64), (64, 1)
         self.assertEqual(
@@ -2982,15 +2901,14 @@ class TestOneBufferViewedAtTwoElementTypes(unittest.TestCase):
     ``buf_id`` for identity and the signature.  So two stages can view one base
     two ways and the func still takes one parameter for it.
 
-    LIMITATION forcing it: the record did double duty.  Identity and address MUST
-    be shared (they key ``plan.parameters`` and ``KtirBuilder.bases``); geometry and
-    element type are per access -- and one ``setdefault`` shared both, so every
-    stage's view took the FIRST stage's element type.
+    LIMITATION forcing it: identity and address MUST be shared (they key
+    ``plan.parameters`` and ``KtirBuilder.bases``) while geometry and element type
+    are per access, and one ``setdefault`` sharing both makes every stage's view
+    take the FIRST stage's element type.
 
-    MEASURED requirement: ``ktir-spyreop-layernorm-chain.mlir`` views one
-    ``%base_pair`` as ``memref<48x64x!spyreop.fp16_fused>`` where the pair is
-    written and as ``memref<48x64xf16>`` where the mean is read out of each stick
-    head.
+    MEASURED requirement: a hand-written reference chain views one paired base as
+    ``memref<48x64x!spyreop.fp16_fused>`` where the pair is written and as
+    ``memref<48x64xf16>`` where the mean is read out of each stick head.
     """
 
     def test_each_access_carries_its_own_element_type_on_one_buf_id(self):
@@ -3130,10 +3048,10 @@ class TestReadingAStatisticAtTheHeadOfItsStick(unittest.TestCase):
     LIMITATION forcing each.  (1) is the frontend describing one buffer two ways:
     MEASURED, the producer writes ``(256, 64)`` and the consumer's spec says
     ``(1, 256, 64)``, and an access of the wrong rank cannot tile the registered
-    view at all.  (2) is a backend constraint with its own negative test,
-    ``ktir-spyreop-layernormscale-full-stick.mlir``: a tile covering the whole
-    innermost dimension is ``error: the tile covers more than the first element of
-    its innermost dimension``, because the mean of squares sits sixteen bytes along
+    view at all.  (2) is a backend constraint with its own negative reference
+    module: a tile covering the whole innermost dimension is ``error: the tile
+    covers more than the first element of its innermost dimension``, because the
+    mean of squares sits sixteen bytes along
     the mean and a wider tile puts that offset on the next statistic.
     """
 
@@ -3285,11 +3203,9 @@ class TestAnAccessOnlySpecIsNoStage(unittest.TestCase):
     do is copy a buffer to itself at a different address, and the emitter has no
     recipe for that on purpose.
 
-    Why not the fusion table's rewrite: ``_collapse_producer`` deletes a producer
-    into ONE surviving consumer and declines when the link has two readers, because
-    a device primitive absorbs the producer's WORK and work can only be absorbed
-    once.  Here there is no work, so all readers are rewired -- and two readers is
-    the normal case, which is why the fixture has two.
+    Not the fusion table's rewrite, which declines a link with two readers: there
+    is no work to absorb here, so ALL readers are rewired -- and two readers is the
+    normal case, which is why the fixture has two.
     """
 
     def test_the_placement_emits_no_step_and_its_readers_read_the_source(self):

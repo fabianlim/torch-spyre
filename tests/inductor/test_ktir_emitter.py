@@ -154,11 +154,8 @@ class TestAChainRoundTripsItsIntermediate(unittest.TestCase):
     stage that touches it, a store from the add and a load into the mul.
 
     LIMITATION forcing it: a value cannot cross a compute stage -- MEASURED, the
-    backend *aborts* on one (``PatternMatch.cpp:156 op->use_empty()``). An earlier
-    revision of this class pinned the opposite, an intermediate threaded as a value
-    with no trace in memory, on the reasoning that upstream fusion would make it
-    reachable. It never was: two specs are two stages, so a threaded intermediate
-    always crosses one and is now refused (see
+    backend *aborts* on one rather than refusing it. Two specs are two stages, so a
+    threaded intermediate always crosses one and is refused (see
     ``TestAThreadedValueMayNotCrossAStage``).
 
     What makes the round-trip available is a configuration fact, not new
@@ -239,12 +236,11 @@ class TestAStageOwnsItsViews(unittest.TestCase):
     DECISION pinned: a memory view belongs to the stage that tiles it, so a
     buffer two stages read is viewed once in each.
 
-    LIMITATION forcing it: two stages cannot share one view.  MEASURED on the
-    hand-written softmax chain (``ktir-spyreop-softmax-chain.mlir``), which ships
-    seven duplicate views of four bases: as written it compiles (exit 0, six
-    ``local_schedule`` modules for its six computes), and deduping the duplicates
-    aborts ``dbo-opt`` at ``ComputeGroupExtraction.cpp:472``,
-    ``op->use_empty()``.  A stage's compute is extracted into a module of its own
+    LIMITATION forcing it: two stages cannot share one view.  MEASURED on a
+    hand-written reference chain of six computes, which ships seven duplicate views
+    of four bases: as written it compiles (exit 0, six ``local_schedule`` modules
+    for its six computes), and deduping the duplicates ABORTS ``dbo-opt`` rather
+    than refusing.  A stage's compute is extracted into a module of its own
     and its view goes with it, so a second stage's use of that view is a use the
     extraction cannot erase.
 
@@ -826,7 +822,7 @@ class TestFusedElementTypeEmission(unittest.TestCase):
     LIMITATION forcing it: the frontend has no dtype for the pair, so the fused
     element type can only be reached through the arrangement.
 
-    Pinned against ``ktir-spyreop-layernormscale.mlir``, whose compute is
+    Pinned against a hand-written reference module for this op, whose compute is
     ``spyreop.layernormscale_fused %in : !spyreop.fp16_fused -> f16`` inside a
     ``linalg.generic``.  Its extents and its rank-reducing operand map are not
     reachable yet (they are the broadcast and stick-head reads of later tasks);
@@ -896,7 +892,7 @@ class TestAReducingBodyThatIgnoresItsAccumulator(unittest.TestCase):
     pattern does not match, "the last element wins" is what the text means, which
     fails as a non-match rather than as an error.
 
-    Pinned against ``ktir-spyreop-exx2.mlir``, which is written at our extents.
+    Pinned against a hand-written reference module for this op, at our extents.
     MEASURED on the emitted module: ``dbo-opt --from-ktir --kEmitSpyreCode`` exits
     0 and produces one ``module @local_schedule``, that module's own count.
     """
@@ -963,9 +959,8 @@ class TestBroadcastOperandEmission(unittest.TestCase):
     entry, so ``0`` was unspellable, and every broadcast operand was refused
     before it.
 
-    The three maps are the hand-written chain's own -- ``#map_row``, ``#map_stat``
-    and ``#map_splat`` in ``ktir-spyreop-layernorm-chain.mlir``, and ``#map_col``
-    in ``ktir-spyreop-layernormnorm-broadcast.mlir`` -- at our extents.
+    The three maps are a hand-written reference chain's own -- ``#map_row``,
+    ``#map_stat``, ``#map_splat`` and ``#map_col`` -- at our extents.
     """
 
     def test_each_form_prints_the_map_the_chain_writes(self):
@@ -1011,11 +1006,10 @@ class TestStatisticReadEmission(unittest.TestCase):
     reduction writes, one element where the consumer reads.
 
     LIMITATION forcing it: the mean of squares sits sixteen bytes along the mean,
-    so a read covering the whole innermost dimension is a backend error
-    (``ktir-spyreop-layernormscale-full-stick.mlir``), while the write has to
-    cover it because the hardware writes a stick at a time.
+    so a read covering the whole innermost dimension is a backend error, while the
+    write has to cover it because the hardware writes a stick at a time.
 
-    Pinned against ``ktir-spyreop-layernorm-chain.mlir``, whose ``#set_stat_slab``
+    Pinned against a hand-written reference chain, whose ``#set_stat_slab``
     (24x64, the write) and ``#set_stat_one`` (24x1, the read) are the same pair at
     that module's extents.  MEASURED on the emitted module: ``dbo-opt --from-ktir
     --kEmitSpyreCode`` exits 0 with TWO ``module @local_schedule``s, one per
@@ -1061,8 +1055,8 @@ class TestArityBeyondTwoEmission(unittest.TestCase):
     nothing had ever exercised the generic arity of ``validated_roles``,
     ``_parallel_surface`` and ``_emit_generic``'s block.
 
-    Pinned against ``ktir-spyreop-layernormnorm.mlir``, at that module's own
-    extents and format.  MEASURED on the emitted module: ``dbo-opt --from-ktir
+    Pinned against a hand-written reference module for this op, at that module's
+    own extents and format.  MEASURED on the emitted module: ``dbo-opt --from-ktir
     --kEmitSpyreCode`` exits 0 with ONE ``module @local_schedule``, that module's
     own count.
     """
@@ -1125,8 +1119,8 @@ class TestOneBufferViewedAtTwoElementTypesEmission(unittest.TestCase):
     is not the arrangement's to give either, so the two views also differ by what
     the RECIPE says each operand reads.
 
-    Pinned against ``ktir-spyreop-layernorm-chain.mlir``'s ``%view_pair`` /
-    ``%view_sq`` over one ``%base_pair``.  MEASURED on the emitted module:
+    Pinned against a hand-written reference chain's two views, at two element
+    types, over one paired base.  MEASURED on the emitted module:
     ``dbo-opt --from-ktir --kEmitSpyreCode`` exits 0 with TWO ``module
     @local_schedule``s.
     """
@@ -1190,8 +1184,8 @@ class TestAnAccessOnlySpecEmitsNothing(unittest.TestCase):
     itself at a different address, which the hardware does not need.
 
     MEASURED on the emitted module: ``dbo-opt --from-ktir --kEmitSpyreCode`` exits
-    0, and the hand-written ``ktir-spyreop-layernorm-chain.mlir`` likewise views
-    ``%base_x`` directly in two stages with no staging op anywhere in it.
+    0, and a hand-written reference chain likewise views its input directly in two
+    stages with no staging op anywhere in it.
     """
 
     def test_both_readers_view_the_source_and_the_link_is_absent(self):

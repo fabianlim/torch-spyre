@@ -1334,14 +1334,30 @@ class KernelPlan:
         instead.  Refused here rather than emitted: an unread producer would
         silently write nowhere, and an unproduced consumer has no value to read.
 
-        Both ends present is necessary and not sufficient.  A value the backend
-        will accept must also not cross a compute op (see ``is_internal``), which
-        this check does not ask, because materialising is the answer to it and
-        this emitter cannot materialise yet: asking would only refuse more
-        kernels, and the ones it would refuse are refused by the backend anyway.
+        Both ends present is not sufficient: a threaded value must also not cross
+        a COMPUTE STAGE, which is asked here too.  It did not used to be, on the
+        stated grounds that such a kernel "is refused by the backend anyway" --
+        wrong in the way that matters.  MEASURED: ``dbo-opt`` *aborts* on it
+        (``PatternMatch.cpp:156 eraseOp: op->use_empty()``), so what was let
+        through came back as a crash rather than as a diagnosis.
+
+        And there is now something to say instead of only refusing.  A buffer is
+        threaded because memory planning CLAIMED it (``lx`` / ``hbm_pool``), which
+        is what keeps it out of ``spyre_kernel_args`` and leaves ``arg_index ==
+        -1``.  MEASURED with both planners off: the same intermediate arrives as an
+        ordinary ``hbm`` buffer with an ``arg_index``, the wrapper allocates it and
+        passes it, and a two-stage kernel (``amax(exp(x))``) compiles and runs
+        correctly with no emitter change at all.  So the refusal names the flags:
+        the configuration is the fix, and this is where a user meets the problem.
         """
         unread: dict[str, None] = {}  # threaded, produced, not yet read
         produced: set[str] = set()
+        # The stage each threaded buffer was produced in, so that a read from a
+        # different one is recognised.  One ``ComputeStep`` is one stage -- one
+        # compute is one ``local_schedule``, measured -- so "another stage" is
+        # exactly "another step", loop bodies included: the stage counter runs
+        # across the whole tree.
+        produced_in: dict[str, int] = {}
 
         def walk(steps: Sequence[Step]) -> None:
             for step in steps:
@@ -1359,9 +1375,23 @@ class KernelPlan:
                             "op in this kernel produces it; its producer is in "
                             "another kernel, which needs the buffer materialised"
                         )
+                    if produced_in[read_id] != step.stage:
+                        raise NotImplementedError(
+                            f"OpSpec->KTIR: buffer {read_id!r} is an intermediate "
+                            "this kernel owns, so it is threaded as a value -- but "
+                            f"it is written in stage {produced_in[read_id]} and read "
+                            f"in stage {step.stage}, and a value cannot cross a "
+                            "compute stage: the backend aborts on it. Memory "
+                            "planning claimed this buffer, which is what makes it "
+                            "threaded; set LX_PLANNING=0 and HBM_POOL_PLANNING=0 so "
+                            "it stays an ordinary HBM buffer that the wrapper "
+                            "allocates and passes, and this kernel emits a store "
+                            "and a load instead"
+                        )
                     unread.pop(read_id, None)
                 if not step.store:
                     produced.add(step.out_buf_id)
+                    produced_in[step.out_buf_id] = step.stage
                     unread[step.out_buf_id] = None
 
         walk(steps)

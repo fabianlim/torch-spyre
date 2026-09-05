@@ -174,35 +174,51 @@ def make_op_spec(
     )
 
 
-def make_chained_op_specs(ops: tuple = ("add", "mul"), **overrides) -> list:
-    """The ops of one kernel, each threading its result into the next.
+def make_chained_op_specs(
+    ops: tuple = ("add", "mul"), *, owned: bool = False, **overrides
+) -> list:
+    """The ops of one kernel, each handing its result to the next.
 
-    Every op but the last writes an ``lx`` intermediate that the next op reads,
-    which is the contract saying this kernel owns it: not passed in, no address,
-    and nothing outside the kernel can reach it.  The fresh inputs and the final
-    output are HBM args, numbered across the whole kernel rather than per op.
+    ``owned=False`` (the default) is the shape that WORKS: every intermediate is
+    an ordinary HBM buffer with an ``arg_index``, so the producing stage stores it
+    and the consuming stage loads it.  MEASURED as what the frontend produces with
+    ``LX_PLANNING=0 HBM_POOL_PLANNING=0`` -- and a two-stage kernel of this shape
+    compiles and runs correctly, where the owned shape below aborts the backend.
+    One buffer keeps ONE index across the specs that share it, which is why the
+    numbering advances over every arg rather than over the fresh inputs only.
+
+    ``owned=True`` makes each intermediate an ``lx`` buffer instead: not passed
+    in, no address, threaded as a value. That is what memory planning produces by
+    default, and across a stage boundary it is refused -- so it is kept for the
+    test that pins that refusal, and for nothing else.
     """
     lx = {"lx": 0}
     specs, next_arg = [], 0
     for level, op in enumerate(ops):
         # The first op reads two fresh inputs; every later one reads the previous
-        # result and one fresh input.  Only the last op's output is HBM.
+        # result and one fresh input.
         threaded = [] if level == 0 else [f"buf{level - 1}"]
         fresh = [f"arg{next_arg + i}" for i in range(2 - len(threaded))]
+        last = level == len(ops) - 1
         specs.append(
             make_op_spec(
                 op,
                 names=[*threaded, *fresh, f"buf{level}"],
                 allocations=[
-                    *([lx] if threaded else []),
+                    *([lx if owned else None] if threaded else []),
                     *([None] * len(fresh)),
-                    None if level == len(ops) - 1 else lx,
+                    None if last or not owned else lx,
                 ],
                 first_arg_index=next_arg,
                 **overrides,
             )
         )
-        next_arg += len(fresh)
+        # An owned intermediate takes no slot (``arg_index == -1``); a passed one
+        # takes the next, and the following spec starts AT it so the buffer they
+        # share carries one index.
+        next_arg += len(fresh) + (0 if owned and not last else 1)
+        if not owned and not last:
+            next_arg -= 1
     return specs
 
 
@@ -1583,6 +1599,48 @@ class TestLoopDerivations(unittest.TestCase):
         self.assertIn("not a whole number of steps", str(ctx.exception))
 
 
+class TestAThreadedValueMayNotCrossAStage(unittest.TestCase):
+    """An owned intermediate read by a later stage is refused, and says what to set.
+
+    DECISION pinned: refuse here, and name the configuration that fixes it. A
+    buffer is threaded only because memory planning CLAIMED it (``lx`` /
+    ``hbm_pool``), which is what keeps it out of ``spyre_kernel_args`` at
+    ``arg_index == -1``; with both planners off the same intermediate arrives as an
+    ordinary HBM buffer, and MEASURED, a two-stage kernel then compiles and RUNS
+    correctly with no emitter change.
+
+    LIMITATION forcing the refusal rather than the emission: a value cannot cross a
+    compute stage, and the backend does not decline it -- MEASURED, ``dbo-opt``
+    *aborts* (``PatternMatch.cpp:156 eraseOp: op->use_empty()``). So emitting it
+    trades a message for a crash. The check used to skip this on the stated grounds
+    that the backend refused such kernels anyway; it does not refuse, it dies.
+    """
+
+    def test_an_owned_intermediate_read_by_a_later_stage_is_refused(self):
+        with self.assertRaises(NotImplementedError) as caught:
+            ktir.build_kernel_plan(make_chained_op_specs(("add", "mul"), owned=True))
+        message = str(caught.exception)
+        self.assertIn("written in stage 0 and read in stage 1", message)
+        self.assertIn("cannot cross a compute stage", message)
+
+    def test_the_refusal_names_both_planning_flags(self):
+        """The actionable half: a reader must not have to guess the variable."""
+        with self.assertRaises(NotImplementedError) as caught:
+            ktir.build_kernel_plan(make_chained_op_specs(("add", "mul"), owned=True))
+        message = str(caught.exception)
+        self.assertIn("LX_PLANNING=0", message)
+        self.assertIn("HBM_POOL_PLANNING=0", message)
+
+    def test_the_same_chain_is_accepted_when_the_intermediate_is_passed(self):
+        """The control, so the refusal is shown to be about the ALLOCATION only.
+
+        Same ops, same shapes, same stage boundary -- the one difference is that
+        planning did not claim the buffer.
+        """
+        steps = ktir.build_kernel_plan(make_chained_op_specs(("add", "mul"))).steps
+        self.assertEqual([step.stage for step in steps], [0, 1])
+
+
 class TestStagesAreNumbered(unittest.TestCase):
     """``_stages`` hands each ``ComputeStep`` its own stage, over the whole tree.
 
@@ -1622,13 +1680,16 @@ class TestStagesAreNumbered(unittest.TestCase):
                         make_op_spec(
                             "add",
                             names=["arg0", "arg1", "buf0"],
-                            allocations=[None, None, {"lx": 0}],
+                            allocations=[None, None, None],
                             **tiled,
                         ),
+                        # ``buf0`` is passed, not owned: it crosses a stage, and a
+                        # value may not (``TestAThreadedValueMayNotCrossAStage``).
+                        # It keeps stage 0's index, so the second spec starts at it.
                         make_op_spec(
                             "mul",
                             names=["buf0", "arg2", "buf1"],
-                            allocations=[{"lx": 0}, None, None],
+                            allocations=[None, None, None],
                             first_arg_index=2,
                             **tiled,
                         ),

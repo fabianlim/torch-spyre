@@ -146,25 +146,32 @@ class TestKtirBakedAddresses(unittest.TestCase):
     _mlir_ktdp_available(),
     "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
 )
-class TestInternalBufferIsThreaded(unittest.TestCase):
-    """``(a + b) * c`` in one kernel, with the intermediate threaded.
+class TestAChainRoundTripsItsIntermediate(unittest.TestCase):
+    """``(a + b) * c`` in one kernel: the add stores, the mul loads.
 
-    ``buf0`` is allocated in LX, which is the contract saying the kernel owns it,
-    so it gets no func parameter, no memory view, no store and no load: the
-    ``linalg.mul`` consumes the ``linalg.add``'s result directly.
+    DECISION pinned: a stage boundary goes through MEMORY. ``buf0`` is an ordinary
+    HBM buffer with an ``arg_index``, so it gets a func parameter, a view in each
+    stage that touches it, a store from the add and a load into the mul.
 
-    A live kernel does not reach this yet -- the frontend puts the two ops in two
-    kernels, with buf0's LX allocation crossing the boundary between them, and the
-    emitter refuses that (``verify.py``'s ``chain`` case is the standing check).
-    What this pins is the emission, so that fusing the two ops upstream is the
-    only thing that has to change.
+    LIMITATION forcing it: a value cannot cross a compute stage -- MEASURED, the
+    backend *aborts* on one (``PatternMatch.cpp:156 op->use_empty()``). An earlier
+    revision of this class pinned the opposite, an intermediate threaded as a value
+    with no trace in memory, on the reasoning that upstream fusion would make it
+    reachable. It never was: two specs are two stages, so a threaded intermediate
+    always crosses one and is now refused (see
+    ``TestAThreadedValueMayNotCrossAStage``).
+
+    What makes the round-trip available is a configuration fact, not new
+    machinery: with ``LX_PLANNING=0 HBM_POOL_PLANNING=0`` memory planning leaves
+    the intermediate in HBM, the wrapper allocates and passes it, and MEASURED, a
+    two-stage kernel then compiles and RUNS correctly with no emitter change.
     """
 
     EXPECTED_CHAIN_KTIR = """\
 #map = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
 #set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 15 >= 0, d1 >= 0, -d1 + 511 >= 0, d2 >= 0, -d2 + 63 >= 0)>
 module {
-  func.func @ktir_fused_add_mul_0(%arg0: index, %arg1: index, %arg2: index, %arg3: index) attributes {grid = [1]} {
+  func.func @ktir_fused_add_mul_0(%arg0: index, %arg1: index, %arg2: index, %arg3: index, %arg4: index) attributes {grid = [1]} {
     %c0 = arith.constant 0 : index
     %0 = ktdp.construct_memory_view %arg0, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
     %1 = ktdp.construct_access_tile %0[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
@@ -176,12 +183,18 @@ module {
     %7 = linalg.add ins(%2, %5 : tensor<16x512x64xf16>, tensor<16x512x64xf16>) outs(%6 : tensor<16x512x64xf16>) -> tensor<16x512x64xf16>
     %8 = ktdp.construct_memory_view %arg2, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
     %9 = ktdp.construct_access_tile %8[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
-    %10 = ktdp.load %9 : <16x512x64xindex> -> tensor<16x512x64xf16>
-    %11 = tensor.empty() : tensor<16x512x64xf16>
-    %12 = linalg.mul ins(%7, %10 : tensor<16x512x64xf16>, tensor<16x512x64xf16>) outs(%11 : tensor<16x512x64xf16>) -> tensor<16x512x64xf16>
+    ktdp.store %7, %9 : tensor<16x512x64xf16>, <16x512x64xindex>
+    %10 = ktdp.construct_memory_view %arg2, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
+    %11 = ktdp.construct_access_tile %10[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
+    %12 = ktdp.load %11 : <16x512x64xindex> -> tensor<16x512x64xf16>
     %13 = ktdp.construct_memory_view %arg3, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
     %14 = ktdp.construct_access_tile %13[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
-    ktdp.store %12, %14 : tensor<16x512x64xf16>, <16x512x64xindex>
+    %15 = ktdp.load %14 : <16x512x64xindex> -> tensor<16x512x64xf16>
+    %16 = tensor.empty() : tensor<16x512x64xf16>
+    %17 = linalg.mul ins(%12, %15 : tensor<16x512x64xf16>, tensor<16x512x64xf16>) outs(%16 : tensor<16x512x64xf16>) -> tensor<16x512x64xf16>
+    %18 = ktdp.construct_memory_view %arg4, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
+    %19 = ktdp.construct_access_tile %18[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
+    ktdp.store %17, %19 : tensor<16x512x64xf16>, <16x512x64xindex>
     return
   }
 }
@@ -189,7 +202,7 @@ module {
 
     @staticmethod
     def _chain():
-        """``(a + b) * c`` in one kernel: the add's result is the mul's operand."""
+        """``(a + b) * c`` in one kernel, the add's result stored for the mul."""
         return make_chained_op_specs(("add", "mul"))
 
     def test_chain_golden(self):
@@ -198,21 +211,22 @@ module {
         emitted = generate_ktir("ktir_fused_add_mul_0", self._chain())
         self.assertEqual(emitted, self.EXPECTED_CHAIN_KTIR)
 
-    def test_the_intermediate_leaves_no_trace_in_memory(self):
-        """The golden's point, asserted as counts so it cannot be read past.
+    def test_the_intermediate_round_trips_through_memory(self):
+        """The golden's point, as counts so it cannot be read past.
 
-        Three loads and one store for four buffers: buf0 is a value, and the
-        second op's first operand is the first op's result.
+        Five buffers, five parameters: four loads (a, b, c and buf0 read back)
+        and two stores (buf0 and buf1). The mul's first operand is a LOAD, not
+        the add's result -- that is the whole difference from threading.
         """
         from torch_spyre._inductor.codegen.ktir import generate_ktir
 
         emitted = generate_ktir("ktir_fused_add_mul_0", self._chain())
-        self.assertEqual(emitted.count("ktdp.load"), 3)  # a, b, c -- not buf0
-        self.assertEqual(emitted.count("ktdp.store"), 1)  # buf1 only
-        self.assertEqual(emitted.count("ktdp.construct_memory_view"), 4)
+        self.assertEqual(emitted.count("ktdp.load"), 4)  # a, b, c, and buf0
+        self.assertEqual(emitted.count("ktdp.store"), 2)  # buf0 and buf1
+        self.assertEqual(emitted.count("ktdp.construct_memory_view"), 6)
         [add] = [ln for ln in emitted.splitlines() if "linalg.add ins(" in ln]
         [mul] = [ln for ln in emitted.splitlines() if "linalg.mul ins(" in ln]
-        self.assertIn(f"ins({add.split('=')[0].strip()},", mul)
+        self.assertNotIn(f"ins({add.split('=')[0].strip()},", mul)
 
 
 @unittest.skipUnless(
@@ -241,20 +255,21 @@ class TestAStageOwnsItsViews(unittest.TestCase):
 
     @staticmethod
     def _two_stages_over_one_buffer() -> list:
-        """``(a + b) * a``, with the sum threaded and ``a`` read by both stages."""
-        lx = {"lx": 0}
+        """``(a + b) * a``: the sum round-trips, and ``a`` is read by both stages."""
         add = make_op_spec(
-            "add", names=["arg0", "arg1", "buf0"], allocations=[None, None, lx]
+            "add", names=["arg0", "arg1", "buf0"], allocations=[None, None, None]
         )
         mul = make_op_spec(
-            "mul", names=["buf0", "arg0", "buf1"], allocations=[lx, None, None]
+            "mul", names=["buf0", "arg0", "buf1"], allocations=[None, None, None]
         )
         # ``make_op_spec`` numbers each spec's args from ``first_arg_index``, and
-        # this kernel's second stage re-reads a buffer the first one already
+        # this kernel's second stage re-reads two buffers the first one already
         # numbered.  Said here rather than by a ``first_arg_index``, because the
-        # point of the fixture is that ``arg0`` is ONE buffer at ONE index.
-        mul.args[1].arg_index = 0  # arg0, as stage 0 numbered it
-        mul.args[2].arg_index = 2  # buf1, after arg0 and arg1
+        # point of the fixture is that ``arg0`` is ONE buffer at ONE index -- and
+        # so is ``buf0``, which stage 0 stores and stage 1 loads back.
+        mul.args[0].arg_index = 2  # buf0, as stage 0 numbered it
+        mul.args[1].arg_index = 0  # arg0, likewise
+        mul.args[2].arg_index = 3  # buf1, after arg0, arg1 and buf0
         return [add, mul]
 
     def test_a_buffer_two_stages_read_is_viewed_once_in_each(self):
@@ -268,10 +283,13 @@ class TestAStageOwnsItsViews(unittest.TestCase):
         first, second = emitted.split("linalg.add ins(")
         self.assertEqual(first.count("construct_memory_view %arg0"), 1)
         self.assertEqual(second.count("construct_memory_view %arg0"), 1)
-        # Four views for three buffers: arg0 twice, arg1 and buf1 once each, and
-        # nothing at all for the threaded buf0.
-        self.assertEqual(emitted.count("construct_memory_view"), 4)
-        self.assertNotIn("buf0", emitted)
+        # Six views for four buffers: arg0 twice (once per stage), arg1 once, and
+        # buf0 twice -- stage 0 stores it and stage 1 loads it back, each through
+        # its own view -- plus buf1 once.
+        self.assertEqual(emitted.count("construct_memory_view"), 6)
+        # A round-tripped intermediate leaves a store and a load behind it.
+        self.assertEqual(emitted.count("ktdp.store"), 2)
+        self.assertEqual(emitted.count("ktdp.load"), 4)
 
 
 @unittest.skipUnless(

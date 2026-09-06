@@ -2496,10 +2496,10 @@ class KtirBuilder:
         "gelufwd": Recipe(
             arity=1, arms=Arm(kind=BindingKind.PAYLOAD, binding=lambda: spyreop.gelu)
         ),
-        "layernormscale": Recipe(
-            arity=1,
-            arms=Arm(kind=BindingKind.PAYLOAD, binding=lambda: spyreop.layernormscale),
-        ),
+        # No ``layernormscale``: the frontend's op takes one tensor and an eps
+        # scalar, ``spyreop.layernormscale`` takes two tensors, and no entry can
+        # be both.  It emitted for neither -- a real spec was refused on arity, a
+        # unary one crashed in the binding -- so a clear refusal is what is left.
         "softplus": Recipe(
             arity=1,
             arms=Arm(kind=BindingKind.PAYLOAD, binding=lambda: spyreop.softplus),

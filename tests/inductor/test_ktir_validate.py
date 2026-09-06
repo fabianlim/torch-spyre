@@ -1042,7 +1042,6 @@ class TestAPayloadWithNoNamedOpGetsAGeneric(unittest.TestCase):
             "sigmoid",
             "reciprocal",
             "gelufwd",
-            "layernormscale",
             "softplus",
         ):
             with self.subTest(op=op):

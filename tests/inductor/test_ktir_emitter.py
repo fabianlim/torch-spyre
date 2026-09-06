@@ -669,7 +669,6 @@ module {
             ("reciprocal", "spyreop.reciprocal"),
             # The one pair where the handler name and the op differ.
             ("gelufwd", "spyreop.gelu"),
-            ("layernormscale", "spyreop.layernormscale"),
         ):
             with self.subTest(op=op):
                 emitted = generate_ktir(

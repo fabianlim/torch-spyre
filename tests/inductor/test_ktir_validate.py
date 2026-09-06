@@ -1564,6 +1564,9 @@ class TestPlanFusionDroppedBuffer(FusionCase):
         for step in plan.steps:
             self.assertNotEqual(step.out_buf_id, link_id)
             self.assertNotIn(link_id, [read_id for read_id, _ in step.ins])
+        # And it carries no shape, so anything that tried to view it would fail
+        # rather than emit a view over the wrong extent.
+        self.assertEqual(plan.buffers[link_id].layout.extent, ())
 
 
 class TestGenuineAbsmaxRecipe(unittest.TestCase):

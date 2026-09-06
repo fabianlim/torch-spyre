@@ -1103,13 +1103,16 @@ class KernelPlan:
             self.dropped.add(link)
             if link in self.buffers:
                 continue
-            # Same derivations ``_access_of`` runs for a normal parameter: the
-            # producer this arg belonged to already ran them once, so they
-            # cannot fail here either.
-            layout, _ = _solve_layout(arg, [])
-            elems = ElemTypes.of(arg.device_dtype)
+            # NO SHAPE, deliberately: this entry exists to hold a parameter
+            # position, and nothing describes this buffer's memory.  A derived
+            # layout here would be a number nobody reads and, for a producer
+            # inside a loop, a wrong one; empty makes that plain and
+            # ``memory_view`` refuses it outright.
             self.buffers[link] = _buffer(
-                arg, layout, elems, bake_addresses=self.options.bake_addresses
+                arg,
+                Layout(extent=(), strides=()),
+                ElemTypes.of(arg.device_dtype),
+                bake_addresses=self.options.bake_addresses,
             )
         self._symbols, self.divisions = _divisions(specs)
         self._divisors = {
@@ -2255,6 +2258,13 @@ class KtirBuilder:
         Extent and strides come from ``buffer.layout``, the record ``_layout``
         derived, so the view says what the plan says, in whole element counts.
         """
+        # An empty extent is a buffer registered to hold a parameter position and
+        # nothing else (``KernelPlan.dropped``).  It has no shape to view, so a
+        # caller reaching here has lost track of which buffers it may describe.
+        assert buffer.layout.extent, (
+            f"{buffer.buf_id} is declared but not described; no view may be built "
+            "for it"
+        )
         sizes = [int(e) for e in buffer.layout.extent]
         strides = [int(s) for s in buffer.layout.strides]
         memref_t = ir.MemRefType.get(sizes, self.named_type(buffer.elems.storage))

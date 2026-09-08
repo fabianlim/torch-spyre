@@ -75,7 +75,7 @@ from torch_spyre._inductor.codegen.opspec_utils import (
     reduction_indexing,
     row_major_strides,
 )
-from torch_spyre._inductor.constants import STAGGERED_EAS
+from torch_spyre._inductor.constants import MAX_POOL_SIZE_BYTES, STAGGERED_EAS
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
 from torch_spyre._inductor.pass_utils import coeff_through_floor
@@ -313,6 +313,11 @@ class Buffer:
     ``KernelPlan.buffers`` holds one of these per ``buf_id`` -- the first seen --
     and what it is held for is the identity half: the signature has one parameter
     per buffer however many ways the stages view it.
+
+    A base comes from one of three places, read off these fields rather than off
+    the allocation dict a second time: a func parameter of its own
+    (``arg_index >= 0``), a baked constant (``base_elements``), or the kernel's one
+    HBM pool (``pool_offset``, added to the leading ``SlotKind.POOL`` parameter).
     """
 
     buf_id: str  # opspec_utils.buf_id(arg)
@@ -321,6 +326,11 @@ class Buffer:
     layout: Layout
     base_elements: int | None  # ELEMENTS for the baked form; None => func arg
     space: str = "HBM"
+    # BYTES from the start of the kernel's HBM pool, exactly as memory planning
+    # wrote it (``allocation["hbm_pool"]``); None for a buffer that is not in the
+    # pool.  Bytes and not elements: the value it is added to is the pool
+    # tensor's device address, which the runtime patches in as a byte address.
+    pool_offset: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1081,36 +1091,79 @@ def _access(
 # reads no spec, so it cannot discover a reason to refuse half-way through.
 
 
-# The ``allocation`` keys memory planning uses for a buffer the kernel owns.
-INTERNAL_SPACES: tuple[str, ...] = ("lx", "hbm_pool")
+# The memory-planning spaces this emitter recognises, each named once.  LX is
+# on-chip scratchpad with no base the kernel is given, so an LX buffer is carried
+# as an SSA value; ``hbm_pool`` is an offset into a base the kernel IS given.
+THREADED_SPACES: tuple[str, ...] = ("lx",)
+POOL_SPACE = "hbm_pool"
 
 
-def is_internal(arg: TensorArg) -> bool:
-    """Whether this buffer is one the kernel owns rather than one it is passed.
+def is_threaded(arg: TensorArg) -> bool:
+    """Whether this buffer is carried as an SSA value: no base, no view, no store.
 
-    Read from ``allocation``, which is where the contract already says it:
-    ``"hbm"`` is a graph input or output, addressed directly, while ``"lx"`` and
-    ``"hbm_pool"`` are intermediates that memory planning placed on the kernel's
-    behalf.  ``create_tensor_arg`` uses that same distinction to decide what
-    becomes a kernel argument at all (``spyre_kernel.py``: an ``lx`` /
-    ``hbm_pool`` tensor is left out of ``spyre_kernel_args``, which is why those
-    args carry ``arg_index == -1``) -- so this is that rule read back, not a
-    second convention, and not the sentinel index, which says only "not passed".
-
-    The two emitters answer differently because their granularity differs: one
-    ``sdsc_execute`` per OpSpec forces SDSC to materialise the intermediate into
-    the allocation it was given, while one KTIR func for the whole kernel CAN
-    keep it as an SSA value -- no store, no view, no parameter, and no address
-    for the scheduler to honour.
-
-    Can, not must, and the difference is why this predicate is not the same
-    question as "how is this buffer handled": threading only carries a value that
-    never crosses a compute stage, and ``_check_threaded_buffers`` states what
-    happens to the rest.
+    True for LX only, because nothing hands the kernel an LX base to store to.  A
+    threaded value cannot cross a compute stage, which is what
+    ``_check_owned_buffers`` refuses.
     """
-    # Named positively: an allocation this emitter does not recognise at all is
-    # not silently threaded, it reaches ``_buffer`` and is refused there.
-    return any(space in (arg.allocation or {}) for space in INTERNAL_SPACES)
+    return any(space in (arg.allocation or {}) for space in THREADED_SPACES)
+
+
+def pool_offset_of(arg: TensorArg) -> int | None:
+    """``arg``'s byte offset into the kernel's HBM pool, or None if not pooled.
+
+    UNMODIFIED, and in BYTES.  The base this is added to is the pool tensor's
+    device address, which the runtime patches into the kernel's leading
+    parameter as a byte address, so scaling the offset by the element size would
+    move every pool buffer to a fraction of its planned distance and overlap the
+    one below it.  MEASURED: halving these values at fp16 puts softmax's ``buf1``
+    on top of ``buf0`` and still passes tolerance, so a tolerance test cannot be
+    trusted to catch the unit going wrong.
+
+    Key presence, not truthiness: offset 0 is the first buffer in the pool, and
+    two buffers legitimately share it when planning saw the first one die.
+    """
+    allocation = arg.allocation or {}
+    if POOL_SPACE not in allocation:
+        return None
+    offset = allocation[POOL_SPACE]
+    if offset is None:
+        raise NotImplementedError(
+            f"OpSpec->KTIR: buffer {arg.name!r} has an unassigned "
+            f"{POOL_SPACE!r} offset (None); memory planning must run before "
+            "KTIR emission"
+        )
+    return int(offset)
+
+
+def _uses_hbm_pool(specs: Sequence[Any]) -> bool:
+    """Whether these specs reference a pooled tensor, as the WRAPPER asks it.
+
+    ``spyre_kernel.uses_hbm_pool`` and not a second walk of the same args: it is
+    what ``call_kernel`` decides to pass a pool tensor by, and the signature must
+    be built from the same answer.  Imported inside the call to keep this module
+    importable without the frontend half of the pipeline.
+    """
+    from torch_spyre._inductor.spyre_kernel import uses_hbm_pool
+
+    return uses_hbm_pool(specs)
+
+
+def pool_needs_frontend_allocation(what: str) -> str:
+    """The refusal when no pool base can reach the kernel.
+
+    A KTIR kernel is a bare ``module { func.func }``, so there is nowhere for the
+    backend's own ``sdscbundle.device_mem_allocate`` to live: front-end
+    allocation is the only mode that can supply a pool base at all.
+    """
+    return (
+        f"OpSpec->KTIR: {what} lives in the kernel's HBM pool, whose base can "
+        "only reach a KTIR kernel as a parameter the wrapper fills with a "
+        "front-end-allocated pool tensor: the KTIR path emits no sdscbundle "
+        "wrapper, so the backend's own device_mem_allocate has nowhere to go. "
+        "Set FRONTEND_POOL_ALLOCATION=1 (config.frontend_pool_allocation), or "
+        "HBM_POOL_PLANNING=0 to keep the intermediate an ordinary HBM buffer "
+        "the wrapper allocates and passes"
+    )
 
 
 def _buffer(
@@ -1119,6 +1172,7 @@ def _buffer(
     elems: ElemTypes,
     *,
     bake_addresses: bool = False,
+    frontend_pool_allocation: bool = False,
 ) -> Buffer:
     """``arg``'s buffer record, rejecting what the emitter cannot address.
 
@@ -1127,6 +1181,44 @@ def _buffer(
     emitted from.  ``layout`` and ``elems`` are the other derivations' answers,
     passed in rather than re-derived.
     """
+    pool_offset = pool_offset_of(arg)
+    if pool_offset is not None:
+        # An offset is emittable only where a base to add it to exists, which is
+        # what the two refusals below are about.
+        if not frontend_pool_allocation:
+            raise NotImplementedError(
+                pool_needs_frontend_allocation(f"buffer {arg.name!r}")
+            )
+        if bake_addresses:
+            raise NotImplementedError(
+                f"OpSpec->KTIR: buffer {arg.name!r} lives in the kernel's HBM "
+                "pool, and a pool offset cannot be baked into a constant: the "
+                "baked form's address unit is unexplained, so the offset would "
+                "be emitted in an unknown unit. Use symbolic addresses "
+                "(BUNDLE_SYMBOLIC_ARGS=1), or HBM_POOL_PLANNING=0"
+            )
+        if not 0 <= pool_offset <= MAX_POOL_SIZE_BYTES:
+            raise NotImplementedError(
+                f"OpSpec->KTIR: buffer {arg.name!r} has pool offset "
+                f"{pool_offset}, which is outside any pool this path can be "
+                f"handed ([0, {MAX_POOL_SIZE_BYTES}])"
+            )
+        # A pooled buffer is not passed, so holding a call position too would mean
+        # the frontend and this disagree about the argument list.
+        assert arg.arg_index < 0, (
+            f"{arg.name!r} is pooled but also kernel argument {arg.arg_index}"
+        )
+        return Buffer(
+            buf_id=buf_id(arg),
+            arg_index=-1,
+            elems=elems,
+            layout=layout,
+            # No parameter of its own and no baked constant: ``open_kernel``
+            # builds its base as the pool's plus this offset.
+            base_elements=None,
+            space="HBM",
+            pool_offset=pool_offset,
+        )
     # ``arg_index`` stays -1 for buffers the frontend does not pass to the
     # kernel, which today means an LX or HBM-pool allocation.  This emitter
     # constructs HBM memory views only.
@@ -1152,10 +1244,10 @@ def _buffer(
 class PlanOptions:
     """Everything the caller chooses about one emission, in one value.
 
-    One choice, and it is not a capability switch: what the kernel *does* comes
-    from the OpSpec contract (its ``LoopSpec``s are its loops), so it is not the
-    caller's to pick.  What is left is how to spell the one thing the contract
-    does not decide.
+    Neither field is a capability switch: what the kernel *does* comes from the
+    OpSpec contract (its ``LoopSpec``s are its loops), so it is not the caller's
+    to pick.  What is left is how to spell what the contract does not decide, and
+    what the surrounding wrapper is going to do.
 
     ``bake_addresses`` emits each base as an ``arith.constant`` in elements
     instead of a func argument, because ``ktdp.load`` requires a static memref
@@ -1163,9 +1255,16 @@ class PlanOptions:
     op.  Canonical KTIR is symbolic; baking is the dataflow-scheduler#65
     workaround that the backend compiler requires.  The SDSC path makes the same choice from
     ``config.bundle_symbolic_args``.
+
+    ``frontend_pool_allocation`` is a FACT the emitter must be told rather than a
+    spelling: whether ``call_kernel`` passes this kernel's pool tensor ahead of the
+    tensor arguments.  It decides whether the signature opens with a pool slot, and
+    so whether a pooled intermediate is emittable at all.  The caller reads it from
+    config; nothing here reads config or the environment.
     """
 
     bake_addresses: bool = False
+    frontend_pool_allocation: bool = False
 
 
 def _divisions(specs: Sequence[Any]) -> tuple[list[Any], tuple[Division, ...]]:
@@ -1211,6 +1310,46 @@ def _op_specs(specs: Sequence[Any]) -> Iterator[OpSpec]:
             yield entry
 
 
+# How a kernel comes to own a buffer, keyed by the kind
+# ``KernelPlan._check_owned_buffers`` works in, so one refusal covers both.
+_OWNERSHIP: dict[str, str] = {
+    "threaded": (
+        "its allocation is lx, so it is threaded as a value rather than stored "
+        "and loaded"
+    ),
+    "pooled": (
+        "its allocation is hbm_pool, so it lives in a pool tensor the wrapper "
+        "allocates for this one call and frees after it"
+    ),
+}
+
+
+class SlotKind(enum.Enum):
+    """What kind of value a func parameter carries.
+
+    ``POOL`` is the base of the one HBM pool this kernel's intermediates sit in,
+    ``BUFFER`` the base of one passed-in buffer.  A kind rather than two lists,
+    because the ordinal contract needs ONE order; a further kind (the SDSC
+    bundle's dynamic-shape symbols) would join this list rather than start a
+    second convention.
+    """
+
+    POOL = enum.auto()
+    BUFFER = enum.auto()
+
+
+@dataclasses.dataclass(frozen=True)
+class ParamSlot:
+    """One func parameter: its kind, and the buffer it addresses if it has one.
+
+    ``buffer`` is None for ``SlotKind.POOL``: a pool base belongs to no single
+    buffer, every pooled intermediate adding its own offset to it.
+    """
+
+    kind: SlotKind
+    buffer: Buffer | None = None
+
+
 class KernelPlan:
     """One kernel, resolved: its grid, its buffers, and the steps for its body.
 
@@ -1236,6 +1375,11 @@ class KernelPlan:
         # declared as parameters -- see ``add_specs``.  No access is ever built
         # for one, which is why this lives on the plan and not on ``Buffer``.
         self.dropped: set[str] = set()
+        # Whether the signature opens with a pool slot.  From the SPECS and the
+        # option -- the two facts ``call_kernel`` builds ``call_args`` from -- and
+        # NOT from the surviving buffers: a plan fusion can delete every pooled
+        # intermediate while the wrapper still passes the pool tensor.
+        self.pool_slot: bool = False
         self.steps: tuple[Step, ...] = ()
         # Handed out by ``_stages``, one per ``ComputeStep``, across the whole
         # tree: a step in a loop body is as much a stage as a top-level one, and
@@ -1243,26 +1387,58 @@ class KernelPlan:
         self._next_stage = 0
 
     @property
-    def parameters(self) -> list[Buffer]:
-        """External buffers in ascending ``arg_index``.
+    def parameters(self) -> list[ParamSlot]:
+        """The func's parameters, in the order ``call_kernel`` passes them.
 
-        Ascending ``arg_index`` matches the positional order ``call_kernel``
-        passes to ``.run(...)``, so the emitted func signature lines up with
-        that binding.
+        THE ordinal contract, stated once: the signature and the wrapper's
+        ``.run(...)`` arguments agree by position alone.  The pool tensor first if
+        this kernel is passed one, then the tensor arguments by ``arg_index``.
 
-        A plan-time fusion can delete a buffer the caller still allocates and
-        passes.  That buffer stays in this list (``add_specs`` re-registers it as
-        a parameter-only entry, see ``KernelPlan.dropped``), so the call site's
-        positional argument list and this list's length always agree; the
-        buffer's ``buf_id`` is in ``self.dropped`` and nothing ever writes it.
+        A buffer a plan-time fusion deleted keeps its slot (``add_specs``
+        re-registers it, see ``KernelPlan.dropped``) and so does a pool slot whose
+        every buffer was deleted, because a position that moved would misbind
+        every argument after it.
         """
-        return sorted(
-            (e for e in self.buffers.values() if e.arg_index >= 0),
-            key=lambda e: e.arg_index,
-        )
+        slots = [ParamSlot(kind=SlotKind.POOL)] if self.pool_slot else []
+        slots += [
+            ParamSlot(kind=SlotKind.BUFFER, buffer=buffer)
+            for buffer in sorted(
+                (e for e in self.buffers.values() if e.arg_index >= 0),
+                key=lambda e: e.arg_index,
+            )
+        ]
+        return slots
+
+    @property
+    def parameter_buffers(self) -> list[Buffer]:
+        """The buffers ``parameters`` gives a slot of their own, in slot order.
+
+        Read off ``parameters`` rather than re-derived, so there is no second
+        ordering to keep in step with the first.
+        """
+        return [
+            slot.buffer
+            for slot in self.parameters
+            if slot.kind is SlotKind.BUFFER and slot.buffer is not None
+        ]
+
+    @property
+    def pool_buffers(self) -> list[Buffer]:
+        """The buffers that live in the pool, in registration order.
+
+        These have no slot of their own: each one's base is the pool slot's block
+        argument plus its own ``pool_offset``.
+        """
+        return [e for e in self.buffers.values() if e.pool_offset is not None]
 
     def add_specs(self, specs: Sequence[OpSpec | LoopSpec | UnimplementedOp]) -> None:
         """Plan ``specs`` into this plan's grid, buffers and steps."""
+        # BEFORE the fusion, from the predicate the wrapper uses: it reads these
+        # specs and has never heard of a plan fusion, so the slot must be decided
+        # from what it read.
+        self.pool_slot = self.pool_slot or (
+            _uses_hbm_pool(specs) and self.options.frontend_pool_allocation
+        )
         # FIRST, and before ``_divisions``: fusing first is what makes the grid a
         # fact about the ops the kernel actually runs.  ``_divisions`` insists every
         # op ask for the same division, and the two specs of an absmax pair name
@@ -1285,6 +1461,7 @@ class KernelPlan:
                 Layout(extent=(), strides=()),
                 ElemTypes.of(arg.device_dtype),
                 bake_addresses=self.options.bake_addresses,
+                frontend_pool_allocation=self.options.frontend_pool_allocation,
             )
         self._symbols, self.divisions = _divisions(specs)
         self._divisors = {
@@ -1297,36 +1474,40 @@ class KernelPlan:
         self.grid = (cores,)
         self._next_stage = 0
         self.steps = self._stages(specs, ())
-        self._check_threaded_buffers(self.steps)
+        self._check_owned_buffers(self.steps)
 
-    def _check_threaded_buffers(self, steps: Sequence[Step]) -> None:
-        """A threaded buffer must be produced before it is read, and then read.
+    def _check_owned_buffers(self, steps: Sequence[Step]) -> None:
+        """A buffer this kernel owns must be produced before it is read, and read.
 
-        A threaded value has no memory behind it, so the kernel has to contain
-        both ends of it.  Either end missing means the intermediate reached this
-        kernel without the op on the other side of it -- the fusion decision and
-        the kernel boundary disagree -- and the buffer needs materialising
-        instead.  Refused here rather than emitted: an unread producer would
-        silently write nowhere, and an unproduced consumer has no value to read.
+        BOTH ENDS, and for both kinds of owned buffer -- threaded (``lx``) and
+        pooled (``hbm_pool``) -- because neither kind's memory outlives the call:
+        a threaded value has none, and a pooled one sits in a tensor the wrapper
+        allocates before ``.run()`` and frees after it.  Either end missing means
+        the fusion decision and the kernel boundary disagree, and the buffer needs
+        materialising instead.
 
-        Both ends present is not sufficient: a threaded value must also not cross
-        a COMPUTE STAGE, which is asked here too.  MEASURED: the backend compiler *aborts*
-        on such a kernel rather than refusing it, so letting one through returns a
-        crash rather than a diagnosis.
-
-        The refusal names the two planning flags because they are the fix.  A
-        buffer is threaded only because memory planning CLAIMED it (``lx`` /
-        ``hbm_pool``), which is what keeps it out of ``spyre_kernel_args`` at
-        ``arg_index == -1``; MEASURED with both planners off, the same intermediate
-        arrives as an ordinary ``hbm`` buffer the wrapper allocates and passes, and
-        a two-stage kernel then compiles and runs correctly with no emitter change.
+        THE STAGE CROSSING IS LX-ONLY.  A threaded value must not cross a compute
+        stage -- each stage's schedule is extracted into a module of its own, and
+        MEASURED, the backend compiler *aborts* rather than refusing.  A pooled
+        buffer has a base, so it crosses stages as a passed-in buffer does, and
+        the LX refusal names ``LX_PLANNING=0`` alone.
         """
-        unread: dict[str, None] = {}  # threaded, produced, not yet read
+        # ``buf_id -> "threaded" | "pooled"``, produced and not yet read.  The
+        # kind is kept because it decides which refusal the unread end raises.
+        unread: dict[str, str] = {}
         produced: set[str] = set()
-        # The stage each threaded buffer was produced in, so that a read from a
+        # The stage each owned buffer was produced in, so that a read from a
         # different one is recognised.  The stage counter runs across the whole
         # tree, so "another stage" is exactly "another step", loop bodies included.
         produced_in: dict[str, int] = {}
+
+        def kind_of(access: Access) -> str | None:
+            """ "threaded" / "pooled" for a buffer the kernel owns, else None."""
+            if access.buffer is None:
+                return "threaded"
+            if access.buffer.pool_offset is not None:
+                return "pooled"
+            return None  # passed in: its memory outlives the call
 
         def walk(steps: Sequence[Step]) -> None:
             for step in steps:
@@ -1334,41 +1515,41 @@ class KernelPlan:
                     walk(step.body)
                     continue
                 for read_id, access in step.ins:
-                    if access.buffer is not None:  # loaded from its own view
+                    kind = kind_of(access)
+                    if kind is None:
                         continue
                     if read_id not in produced:
                         raise NotImplementedError(
                             f"OpSpec->KTIR: buffer {read_id!r} is an intermediate "
-                            "this kernel owns (its allocation is lx / hbm_pool, so "
-                            "it is threaded as a value rather than loaded) but no "
-                            "op in this kernel produces it; its producer is in "
-                            "another kernel, which needs the buffer materialised"
+                            f"this kernel owns ({_OWNERSHIP[kind]}) but no op in "
+                            "this kernel produces it; its producer is in another "
+                            "kernel, which needs the buffer materialised"
                         )
-                    if produced_in[read_id] != step.stage:
+                    if kind == "threaded" and produced_in[read_id] != step.stage:
                         raise NotImplementedError(
                             f"OpSpec->KTIR: buffer {read_id!r} is an intermediate "
                             "this kernel owns, so it is threaded as a value -- but "
                             f"it is written in stage {produced_in[read_id]} and read "
                             f"in stage {step.stage}, and a value cannot cross a "
-                            "compute stage: the backend aborts on it. Memory "
-                            "planning claimed this buffer, which is what makes it "
-                            "threaded; set LX_PLANNING=0 and HBM_POOL_PLANNING=0 so "
-                            "it stays an ordinary HBM buffer that the wrapper "
-                            "allocates and passes, and this kernel emits a store "
-                            "and a load instead"
+                            "compute stage: the backend aborts on it. LX planning "
+                            "claimed this buffer, and LX is scratchpad with no base "
+                            "to address it by, which is what makes it threaded; set "
+                            "LX_PLANNING=0 so it stays an ordinary HBM buffer that "
+                            "the wrapper allocates and passes, and this kernel emits "
+                            "a store and a load instead"
                         )
                     unread.pop(read_id, None)
-                if not step.store:
+                kind = "threaded" if not step.store else kind_of(step.out)
+                if kind is not None:
                     produced.add(step.out_buf_id)
                     produced_in[step.out_buf_id] = step.stage
-                    unread[step.out_buf_id] = None
+                    unread[step.out_buf_id] = kind
 
         walk(steps)
-        for unread_id in unread:
+        for unread_id, kind in unread.items():
             raise NotImplementedError(
                 f"OpSpec->KTIR: buffer {unread_id!r} is an intermediate this kernel "
-                "owns (its allocation is lx / hbm_pool, so it is threaded as a "
-                "value rather than stored) but nothing in this kernel reads it; "
+                f"owns ({_OWNERSHIP[kind]}) but nothing in this kernel reads it; "
                 "its consumer is in another kernel, which needs the buffer "
                 "materialised"
             )
@@ -1600,9 +1781,11 @@ class KernelPlan:
             attrs=attrs,
             dtype=dtype,
             broadcast=broadcast,
-            # An internal buffer never reaches memory: it is threaded as a value,
-            # so it gets no store, no func parameter, no view and no address.
-            store=not is_internal(out),
+            # A threaded buffer never reaches memory: it is carried as a value,
+            # so it gets no store, no func parameter, no view and no address.  A
+            # pooled one does reach memory -- at the pool base plus its offset --
+            # so it is stored like any passed-in buffer.
+            store=not is_threaded(out),
         )
 
     def _access_of(
@@ -1637,7 +1820,7 @@ class KernelPlan:
         layout, q = _solve_layout(arg, levels)
         elems = ElemTypes.of(arg.device_dtype, None if unfused else _arrangement(arg))
         buffer = None
-        if not is_internal(arg):
+        if not is_threaded(arg):
             # A ``Buffer`` PER ACCESS, built from this arg's own layout and element
             # types, and the registry keeps the first one.  The record does double
             # duty -- identity and address, which must be shared because
@@ -1649,7 +1832,11 @@ class KernelPlan:
             # is written and as ``memref<48x64xf16>`` where the mean is read out of
             # the stick head.
             buffer = _buffer(
-                arg, layout, elems, bake_addresses=self.options.bake_addresses
+                arg,
+                layout,
+                elems,
+                bake_addresses=self.options.bake_addresses,
+                frontend_pool_allocation=self.options.frontend_pool_allocation,
             )
             self.buffers.setdefault(buf_id(arg), buffer)
         # The divisions are the outermost levels, so their steps come first.
@@ -1708,7 +1895,30 @@ def build_kernel_plan(
     plan.add_specs(specs)
     if not plan.buffers:
         raise NotImplementedError("OpSpec->KTIR: no OpSpec to emit")
+    _assert_one_pool(plan)
     return plan
+
+
+def _assert_one_pool(plan: KernelPlan) -> None:
+    """One pool per kernel, and every pooled buffer inside it.
+
+    An invariant to state, not a generality to build for: the wrapper allocates
+    exactly one ``_pool_{name}`` per kernel and every ``hbm_pool`` allocation is an
+    offset into that extent, so a second pool base is a plan bug.  Asserted here so
+    that emission may add offsets to one block argument without asking again.
+    """
+    slots = plan.parameters
+    pool_slots = [slot for slot in slots if slot.kind is SlotKind.POOL]
+    assert len(pool_slots) <= 1, f"{len(pool_slots)} pool slots in one kernel"
+    if pool_slots:
+        assert slots[0].kind is SlotKind.POOL, (
+            "the pool slot is the leading parameter, matching call_kernel"
+        )
+    # A pooled buffer with no slot to add its offset to cannot be addressed at
+    # all, so ``_buffer`` must already have refused it.
+    assert not (plan.pool_buffers and not pool_slots), (
+        f"pooled buffers {[b.buf_id for b in plan.pool_buffers]} with no pool slot"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2587,9 +2797,14 @@ class KtirBuilder:
         ``self.plan``, the plan this builder was created for.
 
         Baked bases need no func arguments and appear as ``arith.constant``s;
-        symbolic bases are one ``index`` parameter each, in ``plan.parameters``
-        order.  Deleting the baked arm reverts the dataflow-scheduler#65
-        workaround.
+        symbolic bases are one ``index`` parameter per SLOT of ``plan.parameters``,
+        bound by plain enumeration -- the slot list is already in the wrapper's
+        order, pool included, so no position needs arithmetic.  Deleting the baked
+        arm reverts the dataflow-scheduler#65 workaround.
+
+        A pooled buffer has no slot of its own: its base is the pool slot's block
+        argument plus its byte offset, emitted here so the ``addi`` dominates every
+        stage that views the buffer.
 
         The bases, and not the views: a view belongs to the stage that tiles it
         (``view()``), because two stages sharing one view abort the backend
@@ -2598,9 +2813,9 @@ class KtirBuilder:
         buffer either way, whatever the stages then do with it.
         """
         baked = self.plan.options.bake_addresses
-        buffers = self.plan.parameters
-        # One base address per buffer, in the plan's order, or none at all.
-        params = [] if baked else [self.index_t] * len(buffers)
+        slots = self.plan.parameters
+        # One ``index`` per slot, in the plan's order, or none at all.
+        params = [] if baked else [self.index_t] * len(slots)
         try:
             module = ir.Module.create()
             with ir.InsertionPoint(module.body):
@@ -2617,7 +2832,16 @@ class KtirBuilder:
                 with ir.InsertionPoint(block):
                     self.c0 = self.icst_index(0)
                     self.env.bind_ivs(self.core_portions())
-                    for position, buffer in enumerate(buffers):
+                    pool_base = None
+                    for position, slot in enumerate(slots):
+                        if slot.kind is SlotKind.POOL:
+                            # One pool per kernel (``_assert_one_pool``), and the
+                            # slot is held even when no pooled buffer survived a
+                            # fusion, to keep the positions after it in place.
+                            pool_base = None if baked else self.block_args[position]
+                            continue
+                        buffer = slot.buffer
+                        assert buffer is not None, "a buffer slot without a buffer"
                         if buffer.buf_id in self.plan.dropped:
                             # Declared above as one of ``params`` (its block arg
                             # position must still be consumed); nothing else
@@ -2633,6 +2857,13 @@ class KtirBuilder:
                             )
                             base = self.icst_index(buffer.base_elements)
                         self.bases[buffer.buf_id] = base
+                    for buffer in self.plan.pool_buffers:
+                        # ``_buffer`` refuses a pooled buffer that has no pool base
+                        # to add to, so by here there is one.
+                        assert pool_base is not None and buffer.pool_offset is not None
+                        self.bases[buffer.buf_id] = self.val(
+                            arith.AddIOp(pool_base, self.icst_index(buffer.pool_offset))
+                        )
                     yield
                     func.ReturnOp([])  # no operands, matching the signature
             # Printed while the context is still alive.
@@ -3283,8 +3514,9 @@ def generate_ktir(
 
     ``specs`` is the finished OpSpec kernel contract (the same value
     ``call_kernel`` passes positionally to ``.run(...)``).  Func parameters are
-    the unique operand buffers in ascending ``arg_index`` order so the emitted
-    signature matches that positional binding (or, in the baked form, no
+    ``KernelPlan.parameters``: this kernel's pool base if the wrapper allocates
+    one, then the unique operand buffers in ascending ``arg_index`` order, so the
+    emitted signature matches that positional binding (or, in the baked form, no
     parameters at all and one ``arith.constant`` base address per buffer).
 
     Three steps: plan the kernel (which raises every rejection), open it, emit

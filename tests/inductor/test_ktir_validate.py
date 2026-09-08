@@ -39,7 +39,7 @@ import sympy
 
 from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor.codegen import ktir
-from torch_spyre._inductor.constants import STAGGERED_EAS
+from torch_spyre._inductor.constants import MAX_POOL_SIZE_BYTES, STAGGERED_EAS
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
 
 # ---------------------------------------------------------------------------
@@ -221,6 +221,52 @@ def make_chained_op_specs(
         next_arg += len(fresh) + (0 if owned and not last else 1)
         if not owned and not last:
             next_arg -= 1
+    return specs
+
+
+def make_pooled_chain(offsets: tuple = (0, 0x8000), ops: tuple | None = None) -> list:
+    """A chain whose intermediates HBM-pool planning placed, one per crossing.
+
+    ``offsets`` is one BYTE offset into the kernel's pool per intermediate, in
+    stage order, and there is one more op than there are intermediates: every
+    intermediate is written by its stage and read by the next, which is the
+    crossing that makes a kernel multi-stage.  What the pool changes is only where
+    the intermediate lives -- it keeps a base, a view, a store and a load, so this
+    is the ``owned=True`` chain of ``make_chained_op_specs`` with the one space
+    that has a base to offset from.
+
+    Two intermediates may share an offset: planning reuses a slot whose previous
+    occupant it saw die, and softmax's ``buf3`` genuinely reuses ``buf0``'s.  Each
+    allocation is a fresh dict, so a test may retune one without moving the rest.
+    """
+    ops = ops or ("add", "mul", "sub")[: len(offsets) + 1]
+    if len(ops) != len(offsets) + 1:
+        raise ValueError("make_pooled_chain: one more op than offsets")
+    specs, next_arg = [], 0
+    for level, op in enumerate(ops):
+        last = level == len(ops) - 1
+        read = [] if level == 0 else [f"t{level - 1}"]
+        fresh = [f"x{next_arg + index}" for index in range(2 - len(read))]
+        specs.append(
+            make_op_spec(
+                op,
+                names=[*read, *fresh, "out" if last else f"t{level}"],
+                allocations=[
+                    *([{"hbm_pool": offsets[level - 1]}] if read else []),
+                    *([None] * len(fresh)),
+                    None if last else {"hbm_pool": offsets[level]},
+                ],
+                kernel_locals=[
+                    *([True] * len(read)),
+                    *([False] * len(fresh)),
+                    not last,
+                ],
+                first_arg_index=next_arg,
+            )
+        )
+        # A pooled buffer takes no call position, so only the fresh inputs -- and
+        # the final output -- advance the numbering.
+        next_arg += len(fresh) + (1 if last else 0)
     return specs
 
 
@@ -670,21 +716,24 @@ class TestRejectionsThroughGenerateKtir(unittest.TestCase):
 
 
 class TestPlanOptions(unittest.TestCase):
-    """The caller's one choice, and it is about spelling, not capability.
+    """The caller's choices: how to spell an address, and what the wrapper does.
 
     What the kernel does comes from the contract, so there is nothing here to
     turn a feature on with: no core count and no loop mode (a ``LoopSpec`` is a
-    loop).
+    loop).  Neither option is a capability switch -- ``bake_addresses`` picks a
+    spelling for a base, and ``frontend_pool_allocation`` states whether the
+    wrapper passes a pool tensor, which the emitter cannot observe for itself.
     """
 
     def test_defaults_are_the_canonical_form(self):
         options = ktir.PlanOptions()
         self.assertFalse(options.bake_addresses)  # symbolic addresses
+        self.assertFalse(options.frontend_pool_allocation)  # config's default
 
-    def test_options_are_only_about_spelling(self):
+    def test_options_are_the_spelling_and_the_wrapper_s_own_behaviour(self):
         self.assertEqual(
             sorted(f.name for f in dataclasses.fields(ktir.PlanOptions)),
-            ["bake_addresses"],
+            ["bake_addresses", "frontend_pool_allocation"],
         )
 
 
@@ -722,7 +771,7 @@ class TestWorkDivision(unittest.TestCase):
     def test_the_tile_shrinks_and_the_view_does_not(self):
         """One core's tile is its share; every core addresses the whole buffer."""
         plan = ktir.build_kernel_plan([make_op_spec(divisions={"d1": 32})])
-        for buffer in plan.parameters:
+        for buffer in plan.parameter_buffers:
             with self.subTest(buf_id=buffer.buf_id):
                 self.assertEqual(buffer.layout.extent, (16, 512, 64))
         step = plan.steps[0]
@@ -748,18 +797,20 @@ class TestKernelPlan(unittest.TestCase):
         # doing the work rather than agreeing with insertion order by luck.
         specs[0].args = [specs[0].args[2], specs[0].args[0], specs[0].args[1]]
         plan = ktir.build_kernel_plan(specs)
-        self.assertEqual([e.arg_index for e in plan.parameters], [0, 1, 2])
-        self.assertEqual([e.buf_id for e in plan.parameters], ["arg0", "arg1", "buf0"])
+        self.assertEqual([e.arg_index for e in plan.parameter_buffers], [0, 1, 2])
+        self.assertEqual(
+            [e.buf_id for e in plan.parameter_buffers], ["arg0", "arg1", "buf0"]
+        )
         # The plan holds the derived records, so the buffer's extent and its
         # row-major strides are readable here rather than only in the MLIR.
-        self.assertEqual(plan.parameters[0].layout.extent, (16, 512, 64))
-        self.assertEqual(plan.parameters[0].layout.strides, (32768, 64, 1))
+        self.assertEqual(plan.parameter_buffers[0].layout.extent, (16, 512, 64))
+        self.assertEqual(plan.parameter_buffers[0].layout.strides, (32768, 64, 1))
 
     def test_symbolic_form_resolves_no_base_addresses(self):
         plan = ktir.build_kernel_plan([make_op_spec()])
         # Every 'hbm' address in the fixture is None and never read: the bases
         # are func arguments.
-        self.assertEqual([e.base_elements for e in plan.parameters], [None] * 3)
+        self.assertEqual([e.base_elements for e in plan.parameter_buffers], [None] * 3)
 
     def test_baked_form_resolves_bases_in_elements(self):
         plan = ktir.build_kernel_plan(
@@ -768,7 +819,7 @@ class TestKernelPlan(unittest.TestCase):
         )
         # fp16: 2 bytes per element, so the byte slot halves.
         self.assertEqual(
-            [e.base_elements for e in plan.parameters],
+            [e.base_elements for e in plan.parameter_buffers],
             [0, (1 << 34) // 2, (2 << 34) // 2],
         )
 
@@ -802,29 +853,43 @@ class TestBaseAddressElements(unittest.TestCase):
                 ktir._base_address_elements(self._arg(allocation))
 
 
-class TestInternalBufferSignal(unittest.TestCase):
-    """``is_internal`` decides materialise-vs-thread, from ``allocation``.
+class TestThreadedAndPooledAreTwoQuestions(unittest.TestCase):
+    """The emitter's two questions about a planner-placed buffer, from ``allocation``.
 
-    The same field ``create_tensor_arg`` uses to decide what becomes a kernel
-    argument at all, so the two cannot disagree about which buffers the kernel
-    owns.
+    ``is_threaded`` is how the kernel carries the value, ``pool_offset_of`` where
+    it lives, and the two spaces answer differently: LX has no base to store to, an
+    HBM-pool offset has one.  "Not passed in" is neither of these -- it is
+    ``arg_index < 0``, the frontend's own statement.
     """
 
-    def test_an_hbm_buffer_is_passed_in_not_owned(self):
+    def test_a_passed_in_hbm_buffer_is_neither(self):
         for arg in make_op_spec().args:
-            self.assertFalse(ktir.is_internal(arg))
+            self.assertFalse(ktir.is_threaded(arg))
+            self.assertIsNone(ktir.pool_offset_of(arg))
 
-    def test_planning_placed_it_means_the_kernel_owns_it(self):
-        for allocation in ({"lx": 0x1000}, {"hbm_pool": 0x2000}):
-            with self.subTest(allocation=allocation):
-                spec = make_op_spec(allocations=[None, None, allocation])
-                self.assertTrue(ktir.is_internal(spec.args[-1]))
+    def test_only_lx_is_threaded(self):
+        """The split: an LX intermediate is a value, a pooled one is an address."""
+        onstick, pooled = (
+            make_op_spec(allocations=[None, None, allocation]).args[-1]
+            for allocation in ({"lx": 0x1000}, {"hbm_pool": 0x2000})
+        )
+        self.assertTrue(ktir.is_threaded(onstick))
+        self.assertFalse(ktir.is_threaded(pooled))
+        self.assertIsNone(ktir.pool_offset_of(onstick))
+        self.assertEqual(ktir.pool_offset_of(pooled), 0x2000)
 
-    def test_an_unrecognised_allocation_is_not_threaded(self):
-        """Threading is chosen on a positive signal, so an allocation this
-        emitter does not know reaches the buffer rejection instead."""
+    def test_an_unrecognised_allocation_is_neither_and_is_refused(self):
+        """Both are chosen on a positive signal, so an allocation this emitter does
+        not know is not silently threaded or pooled: it reaches the buffer
+        rejection, which is what ``arg_index < 0`` means there."""
         spec = make_op_spec(allocations=[None, None, {"somewhere_new": 0}])
-        self.assertFalse(ktir.is_internal(spec.args[-1]))
+        arg = spec.args[-1]
+        self.assertFalse(ktir.is_threaded(arg))
+        self.assertIsNone(ktir.pool_offset_of(arg))
+        self.assertEqual(arg.arg_index, -1)  # not passed in, per the fixture's rule
+        with self.assertRaises(NotImplementedError) as ctx:
+            ktir.build_kernel_plan([spec])
+        self.assertIn("is not a kernel argument", str(ctx.exception))
 
     def test_a_threaded_buffer_nothing_reads_is_rejected(self):
         """An intermediate whose consumer is in another kernel: not stored, and
@@ -833,6 +898,179 @@ class TestInternalBufferSignal(unittest.TestCase):
         with self.assertRaises(NotImplementedError) as ctx:
             ktir.build_kernel_plan(specs)
         self.assertIn("nothing in this kernel", str(ctx.exception))
+
+
+class TestHbmPoolSlotsAndOffsets(unittest.TestCase):
+    """A pooled intermediate: one leading pool slot, and offsets carried as given.
+
+    An ``hbm_pool`` allocation is a BYTE offset into the one pool the wrapper
+    allocates for this kernel and passes as call argument 0, so the plan opens the
+    signature with a pool slot and every pooled buffer's base is that slot plus its
+    own offset.  Everything here is about the plan; the emitted ``arith.addi`` and
+    the per-stage views are in ``test_ktir_emitter.py``.
+    """
+
+    def _plan(self, specs, **options):
+        return ktir.build_kernel_plan(
+            specs, ktir.PlanOptions(frontend_pool_allocation=True, **options)
+        )
+
+    def test_the_pool_is_the_leading_slot_and_pooled_buffers_have_none(self):
+        plan = self._plan(make_pooled_chain())
+        self.assertEqual(
+            [slot.kind for slot in plan.parameters],
+            [ktir.SlotKind.POOL] + [ktir.SlotKind.BUFFER] * 5,
+        )
+        self.assertIsNone(plan.parameters[0].buffer)
+        # The pooled intermediates take no slot: they are not passed, so they
+        # cannot be, and their base is the pool slot's plus an offset.
+        self.assertEqual([b.buf_id for b in plan.pool_buffers], ["t0", "t1"])
+        self.assertNotIn("t0", [buffer.buf_id for buffer in plan.parameter_buffers])
+
+    def test_a_kernel_with_no_pooled_buffer_has_no_pool_slot(self):
+        """Per kernel, never a global shift: a pool-free kernel is unchanged."""
+        plan = self._plan([make_op_spec()])
+        self.assertEqual(
+            [slot.kind for slot in plan.parameters], [ktir.SlotKind.BUFFER] * 3
+        )
+
+    def test_no_buffer_position_moves_except_by_the_one_leading_slot(self):
+        """The ordinal contract, with a dropped buffer in the tail.
+
+        ``abs`` is fused into ``max``, so its output ``t0`` is a buffer the caller
+        still allocates and passes and nothing writes; ``t1`` is the pooled link the
+        surviving stages cross.  The buffer slots must stay in ascending
+        ``arg_index`` -- ``t0`` included -- and occupy the positions after the pool,
+        in that order and no other.
+        """
+        specs = make_linked_op_specs(
+            ops=("abs", "max", "exp"),
+            reductions=(False, True, False),
+            edges=((0, 1), (1, 2)),
+            links={0: {"hbm": None}, 1: {"hbm_pool": 0x2000}},
+        )
+        plan = self._plan(specs)
+        buffers = plan.parameter_buffers
+        self.assertIn("t0", plan.dropped)
+        # ``arg_index`` ascending, the dropped buffer keeping its own.  The
+        # fixture numbers ``t0``'s second occurrence 2 and the registry keeps the
+        # first, which is why 2 is absent rather than misplaced.
+        self.assertEqual([b.buf_id for b in buffers], ["x0", "t0", "out2"])
+        self.assertEqual([b.arg_index for b in buffers], [0, 1, 3])
+        # And each one sits at its own index in that order, one after the pool:
+        # the whole of the shift is the single leading slot.
+        for position, buffer in enumerate(buffers, start=1):
+            with self.subTest(buf_id=buffer.buf_id):
+                self.assertIs(plan.parameters[position].buffer, buffer)
+
+    def test_the_offset_is_carried_through_in_bytes_unmodified(self):
+        """No unit conversion: the base it is added to is a byte address."""
+        plan = self._plan(make_pooled_chain(offsets=(0, 0x8000)))
+        self.assertEqual([b.pool_offset for b in plan.pool_buffers], [0, 0x8000])
+        # Not scaled by the fp16 element size, which is the plausible wrong answer.
+        self.assertNotEqual(plan.pool_buffers[1].pool_offset, 0x8000 // 2)
+        # And a pooled buffer has neither a call position nor a baked constant.
+        for buffer in plan.pool_buffers:
+            self.assertEqual(buffer.arg_index, -1)
+            self.assertIsNone(buffer.base_elements)
+
+    def test_two_buffers_may_share_one_offset(self):
+        """Planning reuses a slot whose previous occupant it saw die (softmax's
+        ``buf3`` reuses ``buf0``'s), so equal offsets are sound, not a collision."""
+        plan = self._plan(make_pooled_chain(offsets=(0, 0)))
+        self.assertEqual([b.pool_offset for b in plan.pool_buffers], [0, 0])
+        self.assertEqual(len({b.buf_id for b in plan.pool_buffers}), 2)
+
+    def test_a_pooled_buffer_crossing_a_stage_is_accepted(self):
+        """The point of the whole change: the crossing an LX value cannot make."""
+        steps = self._plan(make_pooled_chain()).steps
+        self.assertEqual([step.stage for step in steps], [0, 1, 2])
+        # Written in its own stage, loaded from its view in the next.
+        self.assertTrue(all(step.store for step in steps))
+        self.assertEqual(steps[1].ins[0][0], "t0")
+        self.assertEqual(steps[1].ins[0][1].buffer.pool_offset, 0)
+
+
+class TestHbmPoolRefusals(unittest.TestCase):
+    """What the emitter refuses about a pool, each because no base is obtainable."""
+
+    def _rejects(self, specs, fragment, **options):
+        with self.assertRaises(NotImplementedError) as ctx:
+            ktir.build_kernel_plan(specs, ktir.PlanOptions(**options))
+        self.assertIn(fragment, str(ctx.exception))
+
+    def test_a_pooled_buffer_without_frontend_allocation_is_refused(self):
+        """A KTIR kernel has no sdscbundle wrapper for device_mem_allocate to
+        live in, so the only pool base it can be given is one Python passes."""
+        self._rejects(make_pooled_chain(), "FRONTEND_POOL_ALLOCATION=1")
+
+    def test_the_refusal_is_per_kernel_not_per_graph(self):
+        """A kernel with no pooled buffer still emits with the flag off."""
+        plan = ktir.build_kernel_plan([make_op_spec()])
+        self.assertEqual(len(plan.parameters), 3)
+
+    def test_a_pooled_buffer_with_baked_addresses_is_refused(self):
+        """The baked form's address unit is unexplained (it emits halved segment
+        constants that something downstream re-derives), so a baked pool offset
+        would be a constant in an unknown unit."""
+        specs = make_pooled_chain()
+        # The baked form reads a real byte address for every passed-in buffer, so
+        # the fixture's unassigned ones are filled in here: the refusal under test
+        # is the pool's, not a missing address.
+        for spec in specs:
+            for arg in spec.args:
+                if "hbm" in arg.allocation:
+                    arg.allocation["hbm"] = arg.arg_index << 34
+        self._rejects(
+            specs,
+            "cannot be baked into a constant",
+            bake_addresses=True,
+            frontend_pool_allocation=True,
+        )
+
+    def test_an_offset_beyond_any_pool_is_refused(self):
+        """Nothing else bounds a pool write, and this path never calls
+        ``generate_bundle``, which is where the bound used to be enforced."""
+        for offset in (MAX_POOL_SIZE_BYTES + 1, -1):
+            with self.subTest(offset=offset):
+                self._rejects(
+                    make_pooled_chain(offsets=(offset, 0)),
+                    "outside any pool this path can be handed",
+                    frontend_pool_allocation=True,
+                )
+        # The edge itself is inside the bound, so it is planned rather than refused.
+        plan = ktir.build_kernel_plan(
+            make_pooled_chain(offsets=(MAX_POOL_SIZE_BYTES, 0)),
+            ktir.PlanOptions(frontend_pool_allocation=True),
+        )
+        self.assertEqual(plan.pool_buffers[0].pool_offset, MAX_POOL_SIZE_BYTES)
+
+    def test_a_pooled_buffer_read_with_no_producer_here_is_refused(self):
+        """The pool tensor is allocated per call and freed after it, so a pooled
+        buffer written in another kernel reads memory that never held its value --
+        a refusal, exactly as for a threaded one."""
+        specs = [make_op_spec(allocations=[{"hbm_pool": 0x1000}])]
+        self._rejects(
+            specs, "no op in this kernel produces it", frontend_pool_allocation=True
+        )
+
+    def test_a_pooled_buffer_nothing_here_reads_is_refused(self):
+        """The other end, and for the same reason: the pool is freed after the
+        call, so the value would not reach the consumer's kernel."""
+        specs = [make_op_spec(allocations=[None, None, {"hbm_pool": 0x1000}])]
+        self._rejects(
+            specs, "nothing in this kernel reads it", frontend_pool_allocation=True
+        )
+
+    def test_the_pooled_refusals_name_the_pool_and_not_lx(self):
+        """Each refusal describes the mechanism of the buffer it is about."""
+        specs = [make_op_spec(allocations=[{"hbm_pool": 0x1000}])]
+        with self.assertRaises(NotImplementedError) as ctx:
+            ktir.build_kernel_plan(
+                specs, ktir.PlanOptions(frontend_pool_allocation=True)
+            )
+        self.assertIn("hbm_pool", str(ctx.exception))
+        self.assertNotIn("lx", str(ctx.exception))
 
 
 class TestRecipes(unittest.TestCase):
@@ -1613,13 +1851,16 @@ class TestAThreadedValueMayNotCrossAStage(unittest.TestCase):
         self.assertIn("written in stage 0 and read in stage 1", message)
         self.assertIn("cannot cross a compute stage", message)
 
-    def test_the_refusal_names_both_planning_flags(self):
-        """The actionable half: a reader must not have to guess the variable."""
+    def test_the_refusal_names_the_lx_flag_and_only_it(self):
+        """The actionable half: a reader must not have to guess the variable --
+        and must not be offered HBM_POOL_PLANNING=0, which fixes nothing here and
+        is not needed for a pooled intermediate either, since this path addresses
+        one."""
         with self.assertRaises(NotImplementedError) as caught:
             ktir.build_kernel_plan(make_chained_op_specs(("add", "mul"), owned=True))
         message = str(caught.exception)
         self.assertIn("LX_PLANNING=0", message)
-        self.assertIn("HBM_POOL_PLANNING=0", message)
+        self.assertNotIn("HBM_POOL_PLANNING", message)
 
     def test_the_same_chain_is_accepted_when_the_intermediate_is_passed(self):
         """The control, so the refusal is shown to be about the ALLOCATION only."""
@@ -1751,7 +1992,10 @@ class TestPlanFusionRewrite(FusionCase):
         """
         pair = make_absmax_pair(link={"hbm": None})
         link = pair[0].args[-1]
-        self.assertFalse(ktir.is_internal(link))
+        # Passed in, and neither threaded nor pooled: no planner placed it.
+        self.assertGreaterEqual(link.arg_index, 0)
+        self.assertFalse(ktir.is_threaded(link))
+        self.assertIsNone(ktir.pool_offset_of(link))
         self.assertTrue(link.kernel_local)
         self.assertEqual([spec.op for spec in fuse(pair)], ["absmax"])
 
@@ -1911,7 +2155,9 @@ class TestPlanFusionDroppedBuffer(FusionCase):
 
         plan = ktir.build_kernel_plan(pair)
         self.assertEqual(len(plan.parameters), len(pre_fusion))
-        self.assertIn(link.arg_index, [buffer.arg_index for buffer in plan.parameters])
+        self.assertIn(
+            link.arg_index, [buffer.arg_index for buffer in plan.parameter_buffers]
+        )
 
     def test_the_dropped_buffer_is_recorded_but_never_accessed(self):
         pair = make_absmax_pair(link={"hbm": None})
@@ -2090,9 +2336,9 @@ class TestOneBufferViewedAtTwoElementTypes(unittest.TestCase):
     def test_the_signature_still_lists_the_buffer_once(self):
         """The dedup by ``buf_id`` is what keeps the signature right while the"""
         plan = ktir.build_kernel_plan(make_two_element_type_specs())
-        self.assertEqual([b.buf_id for b in plan.parameters].count("pair"), 1)
+        self.assertEqual([b.buf_id for b in plan.parameter_buffers].count("pair"), 1)
         self.assertEqual(
-            [b.buf_id for b in plan.parameters],
+            [b.buf_id for b in plan.parameter_buffers],
             ["x0", "pair", "x1", "s2", "s3", "s4", "out0"],
         )
 

@@ -31,6 +31,7 @@ from test_ktir_validate import (
     make_nested_op_spec,
     make_onstick_sum_specs,
     make_op_spec,
+    make_pooled_chain,
     make_statistic_reader_specs,
     make_two_element_type_specs,
 )
@@ -607,8 +608,10 @@ module {
         from torch_spyre._inductor.codegen import ktir
 
         plan = ktir.build_kernel_plan([self._tiled_nest()])
-        self.assertEqual([b.buf_id for b in plan.parameters], ["arg0", "arg1", "buf0"])
-        for buffer in plan.parameters:
+        self.assertEqual(
+            [b.buf_id for b in plan.parameter_buffers], ["arg0", "arg1", "buf0"]
+        )
+        for buffer in plan.parameter_buffers:
             with self.subTest(buf_id=buffer.buf_id):
                 self.assertEqual(buffer.layout.extent, (2, 256, 64))
                 self.assertEqual(buffer.layout.strides, (16384, 64, 1))
@@ -1032,6 +1035,79 @@ class TestOneBufferViewedAtTwoElementTypesEmission(unittest.TestCase):
             emitted,
         )
         self.assertIn("ktdp.load %11 : <256x1xindex> -> tensor<256x1xf16>", emitted)
+
+
+@unittest.skipUnless(
+    _mlir_ktdp_available(),
+    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
+)
+class TestHbmPoolIntermediates(unittest.TestCase):
+    """A pooled intermediate, as it comes out: pool base + offset, per stage.
+
+    The wrapper allocates one pool tensor per kernel and passes it ahead of the
+    tensor arguments, so the signature opens with one extra ``index`` and every
+    pooled buffer's view is offset from it by ``arith.addi``.  The offsets are the
+    planner's own bytes, added unmodified.
+    """
+
+    @staticmethod
+    def _emit(specs, name="ktir_pooled_0"):
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        return generate_ktir(name, specs, frontend_pool_allocation=True)
+
+    def test_the_signature_opens_with_the_pool_base(self):
+        """Six parameters for five passed buffers: the pool is the first."""
+        emitted = self._emit(make_pooled_chain())
+        self.assertIn(
+            "func.func @ktir_pooled_0(%arg0: index, %arg1: index, %arg2: index, "
+            "%arg3: index, %arg4: index, %arg5: index)",
+            emitted,
+        )
+        # And the pooled intermediates are addressed off %arg0, while the passed
+        # buffers use their own parameters -- %arg1 onwards, in order.
+        self.assertIn("%0 = arith.addi %arg0, %c0", emitted)
+        self.assertIn("%1 = arith.addi %arg0, %c32768", emitted)
+
+    def test_the_emitted_offsets_are_the_planners_own_bytes(self):
+        """Unmodified: not scaled to fp16 elements, which would halve them and
+        drop the second buffer on top of the first."""
+        emitted = self._emit(make_pooled_chain(offsets=(0, 0x8000)))
+        self.assertIn("%c32768 = arith.constant 32768 : index", emitted)
+        self.assertNotIn("arith.constant 16384 : index", emitted)
+
+    def test_the_pooled_buffer_is_stored_and_loaded_across_the_stages(self):
+        """What a threaded value cannot do: the store is in one stage, the load in
+        the next, both through views of the same pool address."""
+        emitted = self._emit(make_pooled_chain())
+        views = [
+            line.strip() for line in emitted.splitlines() if "memory_view %0" in line
+        ]
+        # One view per stage that touches it -- the producer's and the consumer's --
+        # because two stages sharing one view aborts the backend.
+        self.assertEqual(len(views), 2)
+        # Two results, one right-hand side: same base, same geometry.
+        self.assertEqual(len({view.split("=", 1)[1] for view in views}), 1)
+        self.assertIn("ktdp.store", emitted)
+        self.assertIn("ktdp.load", emitted)
+
+    def test_two_buffers_at_one_offset_each_get_their_own_views(self):
+        """The ``buf0``/``buf3`` reuse: equal offsets are two buffers, and nothing
+        may collapse their views into one."""
+        emitted = self._emit(make_pooled_chain(offsets=(0, 0)))
+        addis = [line.strip() for line in emitted.splitlines() if "arith.addi" in line]
+        self.assertEqual(len(addis), 2)
+        # Two bases at the same offset, and four views: two stages each, for two
+        # buffers.
+        self.assertEqual(sum("arith.addi %arg0, %c0" in line for line in addis), 2)
+        for base in ("%0", "%1"):
+            with self.subTest(base=base):
+                self.assertEqual(
+                    sum(
+                        f"memory_view {base}," in line for line in emitted.splitlines()
+                    ),
+                    2,
+                )
 
 
 if __name__ == "__main__":

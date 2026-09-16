@@ -207,9 +207,9 @@ class ElemTypes:
     TOGETHER, which the dialect spells as one element of ``!spyreop.fp16_fused``
     rather than as two of ``f16``.  So the lookup is
     ``(device_dtype, element_arrangement) -> spelling``: the arrangement selects
-    the table and the dtype the row.  MEASURED: ``ir.Type.parse`` resolves both
-    fused spellings once ``ktdp.register_dialects`` has run, so ``named_type``
-    needs nothing added for them.
+    the table and the dtype the row.  ``ir.Type.parse`` resolves both fused
+    spellings once ``ktdp.register_dialects`` has run, so ``named_type`` needs
+    nothing added for them.
     """
 
     NAMES: ClassVar[dict[DataFormats, str]] = {
@@ -464,8 +464,8 @@ class ComputeStep:
 
     ``stage`` is this step's position in the kernel's stage order, counted over
     the whole step tree (loop bodies included) by ``KernelPlan._stages``.  One
-    compute is one stage, which is the backend's own granularity: MEASURED, one
-    compute becomes one ``local_schedule`` module.  It is on the step because the
+    compute is one stage, which is the backend's own granularity: one compute
+    becomes one ``local_schedule`` module.  It is on the step because the
     memory views a step tiles are per stage (see ``KtirBuilder.view``), so the
     emitter needs to know which stage is asking before it can answer with a view.
     """
@@ -709,10 +709,9 @@ def _arrangement_layout(
     rule: a mean and a mean of squares held together are ONE element of
     ``!spyreop.fp16_fused``, so the buffer has the rank, extent and row-major
     strides its ``device_size`` states and the pair is a fact about the element
-    TYPE (``ElemTypes.of``) rather than about the addressing.  MEASURED against a
-    hand-written reference module for this op, whose fused output view is
-    ``memref<256x64x!spyreop.fp16_fused>`` -- the same 256x64 an f16 output of
-    that reduction would have, at the same strides.
+    TYPE (``ElemTypes.of``) rather than about the addressing.  Its fused output
+    view is ``memref<256x64x!spyreop.fp16_fused>`` -- the same 256x64 an f16
+    output of that reduction would have, at the same strides.
     """
     if arrangement in (
         None,
@@ -855,10 +854,10 @@ def _reads_stick_head(arg: TensorArg) -> bool:
 
     The signature of one: the innermost device axis carries a CONSTANT coordinate
     -- so no iteration dim walks it -- over a whole stick of elements.  That is
-    what a reduction writes (MEASURED: our on-stick reductions produce
-    ``[.., 64]`` at coordinate ``0``, because the hardware writes a whole stick at
-    a time and the opaque reduction needs the rest of the stick to get the result
-    to element 0), and a consumer of it wants the one element at the head.
+    what a reduction writes (our on-stick reductions produce ``[.., 64]`` at
+    coordinate ``0``, because the hardware writes a whole stick at a time and
+    the opaque reduction needs the rest of the stick to get the result to
+    element 0), and a consumer of it wants the one element at the head.
 
     Asked of INPUTS only, and the producer is why: its output has exactly this
     shape and must keep writing all 64 lanes.
@@ -1673,8 +1672,8 @@ class KernelPlan:
         if not spec.is_reduction:
             # A read of a statistic is squeezed the way its PRODUCER's output was,
             # so the reader's access has the rank of the buffer the producer
-            # registered -- MEASURED, a reduction writes ``(256, 64)`` and its
-            # consumer's spec describes the same buffer as ``(1, 256, 64)``.
+            # registered -- a reduction writes ``(256, 64)`` and its consumer's
+            # spec describes the same buffer as ``(1, 256, 64)``.
             #
             # Pointwise only, and ``_reduction_nest`` is the reason: it reads the
             # INPUT's coordinates straight off the spec to derive ``in_map``, so
@@ -1809,11 +1808,11 @@ class KernelPlan:
         ``head`` narrows the TILE to one element on the innermost axis and leaves
         the VIEW alone -- the buffer is a whole stick per statistic either way, and
         which part of it this access reads is not a property of the buffer.  It is a
-        hard constraint and not an optimisation: MEASURED against a hand-written
-        negative reference module, a tile covering the whole innermost dimension is
-        ``error: the tile covers more than the first element of its innermost
-        dimension``, because the mean of squares sits sixteen bytes along the mean
-        and a wider tile puts that offset on the next statistic.
+        hard constraint and not an optimisation: a tile covering the whole
+        innermost dimension is ``error: the tile covers more than the first
+        element of its innermost dimension``, because the mean of squares sits
+        sixteen bytes along the mean and a wider tile puts that offset on the
+        next statistic.
 
         ``unfused`` is the recipe's word that THIS operand reads the buffer at its
         plain element type although the buffer holds fused statistics -- the mean
@@ -1829,8 +1828,8 @@ class KernelPlan:
             # ``plan.parameters`` and ``KtirBuilder.bases`` are keyed by ``buf_id``;
             # geometry and element type, which are per access.  Sharing both through
             # one ``setdefault`` makes every stage's view of a buffer take the FIRST
-            # stage's element type, and MEASURED, a layernorm chain needs two: one
-            # base is viewed as ``memref<48x64x!spyreop.fp16_fused>`` where the pair
+            # stage's element type, and a layernorm chain needs two: one base is
+            # viewed as ``memref<48x64x!spyreop.fp16_fused>`` where the pair
             # is written and as ``memref<48x64xf16>`` where the mean is read out of
             # the stick head.
             buffer = _buffer(
@@ -2538,8 +2537,8 @@ class Recipe:
     # result's position.
     #
     # It is on the RECIPE because it is a fact about the op and not about the
-    # buffer.  MEASURED on the real layernorm vector, ``element_arrangement`` says
-    # only "this buffer holds two values to a stick" -- it is propagated to every
+    # buffer.  ``element_arrangement`` says only "this buffer holds two values
+    # to a stick" -- it is propagated to every
     # arg naming a statistic buffer and does not say how an operand READS it, and
     # two ops read one such buffer two ways.  So the arrangement is the default and
     # the recipe has the last word.
@@ -3018,10 +3017,9 @@ class KtirBuilder:
         """``stage``'s memory view of ``buffer``, emitted at first use in it.
 
         One view per (stage, buffer) and not one per buffer: sharing a view
-        between two stages ABORTS the backend rather than refusing -- MEASURED on
-        a hand-written reference chain of six computes, where deduping its seven
-        duplicate views onto four aborts while the duplicates it ships with
-        compile clean.  A stage's schedule is extracted
+        between two stages ABORTS the backend rather than refusing -- deduping a
+        reference chain's seven duplicate views onto four aborts, while the
+        duplicates it ships with compile clean.  A stage's schedule is extracted
         into its own module, and the view has to go with it, so a second stage's
         use of the same view is a use the extraction cannot erase.
 
@@ -3133,8 +3131,8 @@ class KtirBuilder:
         #     nowhere to go (``_broadcast_surface``).  The ``arith`` scalar goes in
         #     a generic's region, which states every row, so
         #     ``request_scalar_when_broadcast`` reaches for it exactly then.
-        #     MEASURED: this is what softmax's ``x - rowmax`` needs, and with it
-        #     the KTIR path's softmax matches the SDSC path's exactly (verify.py).
+        #     This is what softmax's ``x - rowmax`` needs, and with it the KTIR
+        #     path's softmax matches the SDSC path's exactly (verify.py).
         #
         # The named arm is FIRST in each entry because two dtype-less arms of
         # different kinds resolve in declaration order (``request_by_dtype``), and
@@ -3229,8 +3227,8 @@ class KtirBuilder:
         # ``_stages`` is what ties those two statements together -- but the
         # binding IGNORES ``accumulated``, which no other combiner does.  That is
         # the same category as ``absmax`` above and carries the same warning: the
-        # body is a MARKER FOR A DEVICE PATTERN, not a fold.  MEASURED, the
-        # device's own unfusing pass replaces this op with the two
+        # body is a MARKER FOR A DEVICE PATTERN, not a fold: the device's own
+        # unfusing pass replaces this op with the two
         # reductions it stands for -- the value accumulated and its square, each
         # scaled by one over the count on the way in -- so nothing below lowers
         # the generic as written.  If that pattern does not match, the generic
@@ -3298,9 +3296,8 @@ class KtirBuilder:
         # ``!spyreop.fp16_fused``, which is what ``exx2_fused`` wrote.  The
         # two-operand ``spyreop.layernormscale``, which takes the mean and the mean
         # of squares apart, is what the backend's own unfusing pass
-        # produces BELOW us -- MEASURED against a hand-written reference module for
-        # this op -- so binding it here would be doing the backend's job with an
-        # operand nobody supplies.
+        # produces BELOW us, so binding it here would be doing the backend's job
+        # with an operand nobody supplies.
         "layernormscale": Recipe(
             arity=1,
             arms=Arm(
@@ -3308,23 +3305,22 @@ class KtirBuilder:
                 binding=lambda: spyreop.layernormscale_fused,
             ),
             # The RESULT (position 1, arity being 1) is a plain float, whatever the
-            # output buffer's arrangement says.  MEASURED: the frontend flags that
-            # buffer ``EXX2`` too -- it propagates the flag to every arg naming a
+            # output buffer's arrangement says: the frontend flags that buffer
+            # ``EXX2`` too -- it propagates the flag to every arg naming a
             # statistic buffer -- and the op is
             # ``... : !spyreop.fp16_fused -> f16``.
             unfused=(1,),
         ),
         # The normalisation itself: five operands, positional, no attributes.
-        # MEASURED against a hand-written reference module -- the printed form
-        # is ``spyreop.layernormnorm %x squares %sq scale %sc weight %w bias %b``,
+        # The printed form is
+        # ``spyreop.layernormnorm %x squares %sq scale %sc weight %w bias %b``,
         # and the builder takes them in that order.
         #
-        # ``squares`` (1) and ``scale`` (2) are read UNFUSED, and MEASURED on the
-        # real ``F.layer_norm`` vector both of their args carry ``EXX2``: the flag
-        # follows the BUFFER and is propagated to every arg naming one.  This op
-        # reads a plain ``f16`` out of the head of each stick in both cases --
-        # MEASURED on a hand-written reference chain, where both views are
-        # ``memref<48x64xf16>`` over bases the fused view also covers.
+        # ``squares`` (1) and ``scale`` (2) are read UNFUSED: both of their args
+        # carry ``EXX2`` -- the flag follows the BUFFER and is propagated to
+        # every arg naming one.  This op reads a plain ``f16`` out of the head
+        # of each stick in both cases -- both views are ``memref<48x64xf16>``
+        # over bases the fused view also covers.
         "layernormnorm": Recipe(
             arity=5,
             arms=Arm(kind=BindingKind.PAYLOAD, binding=lambda: spyreop.layernormnorm),

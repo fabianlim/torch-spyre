@@ -2163,23 +2163,6 @@ PLAN_FUSIONS: tuple[PlanFusion, ...] = (
         name="absmax",
         pattern=(("abs", False), ("max", True)),
         result_op=_ABSMAX_OP,
-        # False for fp32 on-stick absmax, which compiles and returns garbage.
-        # MEASURED on device: for this one combination the backend emits its
-        # ``SFP_SPLAT``/``SFP_REDUCE`` at ``mode=fp16`` on 4-byte lanes, so the
-        # answer is NaN / ~1e38 with no diagnostic anywhere.  Declining costs a
-        # working two-op kernel that this emitter cannot build either -- there is
-        # no ``abs`` recipe -- so it buys a refusal in place of a wrong answer,
-        # and nothing else.
-        #
-        # "On-stick" is exactly ``Surface.GENERIC`` for a reduction: the
-        # within-stick axis is among the reduced dims, so the nest is not what
-        # ``linalg.reduce`` means.  Asked of ``_reduction_surface``, which is the
-        # derivation ``_compute_step`` itself will run, so the question cannot
-        # drift from the emission.
-        viable=lambda fused: not (
-            dtype_of(fused) is DataFormats.IEEE_FP32
-            and _reduction_surface(fused) is Surface.GENERIC
-        ),
         why=(
             "the min/max unit takes the absolute value as a mode bit, so max(|x|) "
             "is one reduction and not a pointwise pass plus a reduction; and a "

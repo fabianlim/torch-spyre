@@ -2087,17 +2087,22 @@ class TestPlanFusionDeclines(FusionCase):
         self.assertEqual([spec.op for spec in vector], ["abs", "max", "sum", "add"])
 
     def test_the_viability_predicate_declines(self):
-        """DECISION: decline a form the device computes INCORRECTLY.
+        """DECISION: an undecidable question declines, rather than raising.
 
-        An undecidable question declines too, rather than raising.
+        fp32 on-stick absmax used to be the real example (the device computed
+        it incorrectly, so ``absmax``'s own predicate declined that one
+        combination). That got fixed on the device side, so ``absmax`` is now
+        unconditionally viable (``PLAN_FUSIONS`` carries no ``viable`` for it)
+        and both dtypes fuse. The undecidable case below is a synthetic
+        ``PlanFusion`` built for this test, since nothing in ``PLAN_FUSIONS``
+        currently declines.
         """
         fp16 = make_absmax_pair(onstick=True)
         fp32 = make_absmax_pair(onstick=True, dtype=DataFormats.IEEE_FP32, lanes=32)
         for pair in (fp16, fp32):
             self.assertIs(ktir._reduction_surface(pair[1]), ktir.Surface.GENERIC)
-        # fp32 on-stick absmax compiles and returns garbage; fp16 is fine.
-        self.assertDeclined(fp32, reason="is not viable on this operand")
         self.assertEqual([spec.op for spec in fuse(fp16)], ["absmax"])
+        self.assertEqual([spec.op for spec in fuse(fp32)], ["absmax"])
 
         def undecidable(fused):
             raise NotImplementedError("no surface for this shape")

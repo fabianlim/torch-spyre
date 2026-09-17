@@ -3159,6 +3159,93 @@ class KtirBuilder:
                 Arm(kind=BindingKind.PAYLOAD, binding=lambda: arith.subf),
             ),
         ),
+        # No NAMED arm for any comparison: there is no ``linalg``-level compare
+        # op, and Spyre has no native bool -- the result is the same float
+        # format as the operands, carrying 1.0/0.0 (``dtype_ops.py``'s
+        # ``_BOOL_EQUIVALENT_DTYPES``, already resolved by layout propagation
+        # before this recipe ever runs).  One dtype-generic arm serves fp16
+        # and fp32 alike, the same way ``add``'s ``arith.addf`` arm does.
+        "equal": Recipe(
+            arity=2,
+            arms=Arm(
+                kind=BindingKind.PAYLOAD,
+                binding=_written_here(
+                    lambda a, b: arith.select(
+                        arith.cmpf(arith.CmpFPredicate.OEQ, a, b),
+                        arith.constant(a.type, 1.0),
+                        arith.constant(a.type, 0.0),
+                    )
+                ),
+            ),
+        ),
+        # UNE, not ONE: Python/PyTorch's ``!=`` is True when either operand is
+        # NaN (unordered), where ONE (ordered not-equal) is False on NaN.  The
+        # other three comparisons want ordered predicates -- a NaN compares
+        # False against anything under IEEE-754 -- so this is the one
+        # predicate that does not match its sibling's pattern.
+        "notequal": Recipe(
+            arity=2,
+            arms=Arm(
+                kind=BindingKind.PAYLOAD,
+                binding=_written_here(
+                    lambda a, b: arith.select(
+                        arith.cmpf(arith.CmpFPredicate.UNE, a, b),
+                        arith.constant(a.type, 1.0),
+                        arith.constant(a.type, 0.0),
+                    )
+                ),
+            ),
+        ),
+        "greaterequal": Recipe(
+            arity=2,
+            arms=Arm(
+                kind=BindingKind.PAYLOAD,
+                binding=_written_here(
+                    lambda a, b: arith.select(
+                        arith.cmpf(arith.CmpFPredicate.OGE, a, b),
+                        arith.constant(a.type, 1.0),
+                        arith.constant(a.type, 0.0),
+                    )
+                ),
+            ),
+        ),
+        "lesserequal": Recipe(
+            arity=2,
+            arms=Arm(
+                kind=BindingKind.PAYLOAD,
+                binding=_written_here(
+                    lambda a, b: arith.select(
+                        arith.cmpf(arith.CmpFPredicate.OLE, a, b),
+                        arith.constant(a.type, 1.0),
+                        arith.constant(a.type, 0.0),
+                    )
+                ),
+            ),
+        ),
+        # torch.where(mask, a, b): mask first, matching aten's own order
+        # (SpyreOpFuncs.where(x, y, z) -> PointwiseOp("where3", [x, y, z])).
+        # ``mask`` arrives float-encoded (1.0/0.0), same as any comparison's
+        # output above, so recovering a real ``i1`` for ``arith.select``'s
+        # condition needs its own ``cmpf`` first -- ordered (ONE) is correct
+        # here specifically because we are recovering OUR OWN 0.0/1.0
+        # encoding, never a NaN, unlike a user-facing ``!=``.
+        "where3": Recipe(
+            arity=3,
+            arms=Arm(
+                kind=BindingKind.PAYLOAD,
+                binding=_written_here(
+                    lambda mask, a, b: arith.select(
+                        arith.cmpf(
+                            arith.CmpFPredicate.ONE,
+                            mask,
+                            arith.constant(mask.type, 0.0),
+                        ),
+                        a,
+                        b,
+                    )
+                ),
+            ),
+        ),
         "sum": Recipe(
             arity=1, arms=Arm(kind=BindingKind.COMBINER, binding=lambda: arith.addf)
         ),

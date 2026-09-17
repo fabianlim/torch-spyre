@@ -3159,6 +3159,54 @@ class KtirBuilder:
                 Arm(kind=BindingKind.PAYLOAD, binding=lambda: arith.subf),
             ),
         ),
+        # spyreop.compare is one op, not cmpf+select: it already returns the
+        # width compared (1.0/0.0), not a boolean.  Every predicate is
+        # ordered in the IEEE-754 sense (SpyreOp.td) -- a NaN operand gives
+        # 0.0, notequal included.  That is the device's own definition of
+        # notequal, not Python's (where NaN != anything is True); using the
+        # hardware-native op means this recipe takes the device's semantics,
+        # a divergence worth knowing about rather than one to paper over with
+        # a slower, software-emulated arith.cmpf.
+        # One recipe per predicate, all identical but for the predicate name --
+        # which is also the op name, so the comprehension needs no mapping
+        # table.  ``pred=name`` binds each lambda's predicate at comprehension
+        # time, not call time (the usual loop-closure trap).
+        **{
+            name: Recipe(
+                arity=2,
+                arms=Arm(
+                    kind=BindingKind.PAYLOAD,
+                    binding=_written_here(
+                        lambda a, b, pred=name: spyreop.compare(
+                            a,
+                            b,
+                            ir.Attribute.parse(f"#spyreop.compare_predicate<{pred}>"),
+                        )
+                    ),
+                ),
+            )
+            for name in (
+                "equal",
+                "notequal",
+                "greaterthan",
+                "greaterequal",
+                "lesserthan",
+                "lesserequal",
+            )
+        },
+        # torch.where(mask, a, b): mask first, matching aten's own order
+        # (SpyreOpFuncs.where(x, y, z) -> PointwiseOp("where3", [x, y, z])).
+        # spyreop.select's condition is "an ordinary value of the width being
+        # selected, not a boolean" (SpyreOp.td) -- exactly the float-encoded
+        # mask a comparison recipe above already produces, so it is passed
+        # straight through with no recovery step.
+        "where3": Recipe(
+            arity=3,
+            arms=Arm(
+                kind=BindingKind.PAYLOAD,
+                binding=_written_here(lambda mask, a, b: spyreop.select(mask, a, b)),
+            ),
+        ),
         "sum": Recipe(
             arity=1, arms=Arm(kind=BindingKind.COMBINER, binding=lambda: arith.addf)
         ),

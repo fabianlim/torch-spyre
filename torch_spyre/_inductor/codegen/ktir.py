@@ -3261,41 +3261,83 @@ class KtirBuilder:
                 Arm(kind=BindingKind.PAYLOAD, binding=lambda: arith.subf),
             ),
         ),
-        # spyreop.compare is one op, not cmpf+select: it already returns the
-        # width compared (1.0/0.0), not a boolean.  Every predicate is
-        # ordered in the IEEE-754 sense (SpyreOp.td) -- a NaN operand gives
-        # 0.0, notequal included.  That is the device's own definition of
-        # notequal, not Python's (where NaN != anything is True); using the
-        # hardware-native op means this recipe takes the device's semantics,
-        # a divergence worth knowing about rather than one to paper over with
-        # a slower, software-emulated arith.cmpf.
-        # One recipe per predicate, all identical but for the predicate name --
-        # which is also the op name, so the comprehension needs no mapping
-        # table.  ``pred=name`` binds each lambda's predicate at comprehension
-        # time, not call time (the usual loop-closure trap).
-        **{
-            name: Recipe(
-                arity=2,
-                arms=Arm(
-                    kind=BindingKind.PAYLOAD,
-                    binding=_written_here(
-                        lambda a, b, pred=name: spyreop.compare(
-                            a,
-                            b,
-                            ir.Attribute.parse(f"#spyreop.compare_predicate<{pred}>"),
-                        )
-                    ),
+        # spyreop.compare is one op, not cmpf+select: it already returns the width
+        # compared (1.0/0.0), not a boolean.  Every predicate is ordered in the
+        # IEEE-754 sense (SpyreOp.td), so a NaN operand gives 0.0, notequal
+        # included -- the device's definition, not Python's, and a divergence worth
+        # knowing rather than papering over with a software-emulated arith.cmpf.
+        # Written out rather than comprehended over the six names, so each recipe
+        # names its predicate as a ``ComparePredicate`` member.  A comprehension
+        # would key both the dict and the predicate on one string, but those are
+        # two facts: the key is this repo's op name (``SpyreOpFuncs.ge`` emits
+        # ``PointwiseOp("greaterequal", ...)``) and the member is the dialect's
+        # spelling.  Equal today, so keying on one hides a future rename.  The
+        # member is reached inside the lambda because ``spyreop`` is ``None`` until
+        # ``_load_dialects`` runs -- the deferral every binding here uses.
+        "equal": Recipe(
+            arity=2,
+            arms=Arm(
+                kind=BindingKind.PAYLOAD,
+                binding=_written_here(
+                    lambda a, b: spyreop.compare(a, b, spyreop.ComparePredicate.Equal)
                 ),
-            )
-            for name in (
-                "equal",
-                "notequal",
-                "greaterthan",
-                "greaterequal",
-                "lesserthan",
-                "lesserequal",
-            )
-        },
+            ),
+        ),
+        "notequal": Recipe(
+            arity=2,
+            arms=Arm(
+                kind=BindingKind.PAYLOAD,
+                binding=_written_here(
+                    lambda a, b: spyreop.compare(
+                        a, b, spyreop.ComparePredicate.NotEqual
+                    )
+                ),
+            ),
+        ),
+        "greaterthan": Recipe(
+            arity=2,
+            arms=Arm(
+                kind=BindingKind.PAYLOAD,
+                binding=_written_here(
+                    lambda a, b: spyreop.compare(
+                        a, b, spyreop.ComparePredicate.GreaterThan
+                    )
+                ),
+            ),
+        ),
+        "greaterequal": Recipe(
+            arity=2,
+            arms=Arm(
+                kind=BindingKind.PAYLOAD,
+                binding=_written_here(
+                    lambda a, b: spyreop.compare(
+                        a, b, spyreop.ComparePredicate.GreaterEqual
+                    )
+                ),
+            ),
+        ),
+        "lesserthan": Recipe(
+            arity=2,
+            arms=Arm(
+                kind=BindingKind.PAYLOAD,
+                binding=_written_here(
+                    lambda a, b: spyreop.compare(
+                        a, b, spyreop.ComparePredicate.LesserThan
+                    )
+                ),
+            ),
+        ),
+        "lesserequal": Recipe(
+            arity=2,
+            arms=Arm(
+                kind=BindingKind.PAYLOAD,
+                binding=_written_here(
+                    lambda a, b: spyreop.compare(
+                        a, b, spyreop.ComparePredicate.LesserEqual
+                    )
+                ),
+            ),
+        ),
         # torch.where(mask, a, b): mask first, matching aten's own order
         # (SpyreOpFuncs.where(x, y, z) -> PointwiseOp("where3", [x, y, z])).
         # spyreop.select's condition is "an ordinary value of the width being

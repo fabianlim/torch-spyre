@@ -974,6 +974,69 @@ class TestReplicatedScalarOperandEmission(unittest.TestCase):
     _mlir_ktdp_available(),
     "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
 )
+class TestFourByteHeadReadRefusal(unittest.TestCase):
+    """One element per row spread across the lanes is refused at four bytes.
+
+    The lane spread moves two bytes, so on the device a four-byte operand reaches
+    every fourth lane and the rest read zero -- a silent wrong result, which is why
+    it is refused here and not left to the backend compiler, which accepts it.
+    """
+
+    @staticmethod
+    def _per_row_operand_spec(dtype):
+        """``realdiv`` of a tile by a ``(512, stick)`` statistic read at its head."""
+        import sympy
+
+        d0, d1, d2 = sympy.symbols("d0 d1 d2")
+        stick = 64 if dtype == DataFormats.SEN169_FP16 else 32
+        return make_op_spec(
+            "realdiv",
+            dtype=dtype,
+            sizes=[[16, 512, stick], [512, stick], [16, 512, stick]],
+            coords_per_arg=[[d0, d1, d2], [d1, sympy.Integer(0)], [d0, d1, d2]],
+        )
+
+    def test_a_per_row_operand_at_fp32_is_refused(self):
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        with self.assertRaisesRegex(
+            NotImplementedError,
+            "one element per row spread across the lanes of a 4-byte",
+        ):
+            generate_ktir(
+                "k_per_row_fp32",
+                [self._per_row_operand_spec(DataFormats.IEEE_FP32)],
+            )
+
+    def test_the_same_shape_at_fp16_is_still_emitted(self):
+        """The control: only the width differs, so the width is what decides."""
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir(
+            "k_per_row_fp16",
+            [self._per_row_operand_spec(DataFormats.SEN169_FP16)],
+        )
+        self.assertIn("affine_map<(d0, d1, d2) -> (d1, 0)>", emitted)
+
+    def test_a_single_value_at_fp32_is_still_read(self):
+        """A scalar is one value, not one per row, and is measured exact at fp32.
+
+        ``x / x.sum()`` hands ``realdiv`` an operand of exactly this description
+        and passes on the device, so it keeps the head read it always had.
+        """
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir(
+            "k_scalar_fp32",
+            [make_scalar_operand_op_spec(DataFormats.IEEE_FP32, replicated=False)],
+        )
+        self.assertIn("tensor<1xf32>", emitted)
+
+
+@unittest.skipUnless(
+    _mlir_ktdp_available(),
+    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
+)
 class TestStatisticReadEmission(unittest.TestCase):
     """Two stages over one statistic buffer: a stick written, a head read."""
 

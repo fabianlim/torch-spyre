@@ -880,6 +880,29 @@ def _reads_stick_head(arg: TensorArg) -> bool:
     return not getattr(coord, "free_symbols", None) and int(arg.device_size[-1]) > 1
 
 
+def _spreads_head_per_row(arg: TensorArg) -> bool:
+    """Whether this INPUT's head read must spread a DIFFERENT element per row, wide.
+
+    A head read (``_reads_stick_head``) narrows the operand to one element per
+    stick and leaves the load unit to spread that element across the lanes.  The
+    spread moves two bytes, so it is sound for a two-byte format.  For a four-byte
+    one it is not: measured on the device with a ``(256, 1)`` fp32 operand against
+    a ``(256, 64)`` one, every fourth lane carries the operand and the other three
+    carry zeros, for ``add``, ``sub``, ``mul``, ``gt`` and ``eq`` alike, while the
+    same ops at fp16 and the same shape at fp32 with a whole stick per row (the
+    ``(1, 64)`` operand) are exact.  The wrong result is silent -- the kernel
+    compiles and runs -- so this is refused where the head read is decided.
+
+    Only an operand that carries MORE THAN ONE value is asked: one element per row
+    needs a spread per row.  A single value (every non-stick axis extent one, as a
+    full reduction's scalar is) is measured exact at fp32 (``x / x.sum()``), so it
+    keeps reading as before.
+    """
+    if not _reads_stick_head(arg) or num_bytes(arg.device_dtype) <= 2:
+        return False
+    return any(int(size) > 1 for size in arg.device_size[:-1])
+
+
 def _reads_every_lane(arg: TensorArg, out: TensorArg) -> bool:
     """Whether this INPUT is a scalar the op should read a whole STICK of.
 
@@ -1779,6 +1802,14 @@ class KernelPlan:
             for arg in inputs:
                 if _reads_every_lane(arg, out):
                     read.append(_lane_walking(arg, out))
+                elif _spreads_head_per_row(arg):
+                    raise NotImplementedError(
+                        f"OpSpec->KTIR: operand {arg.name!r} of op {spec.op!r} is "
+                        "one element per row spread across the lanes of a "
+                        f"{num_bytes(arg.device_dtype)}-byte format; the lane "
+                        "spread moves two bytes, so it returns the operand in "
+                        "every fourth lane and zeros in the rest"
+                    )
                 elif _reads_stick_head(arg):
                     read.append(
                         _squeezed(

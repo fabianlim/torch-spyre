@@ -974,12 +974,13 @@ class TestReplicatedScalarOperandEmission(unittest.TestCase):
     _mlir_ktdp_available(),
     "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
 )
-class TestFourByteHeadReadRefusal(unittest.TestCase):
-    """One element per row spread across the lanes is refused at four bytes.
+class TestOneElementPerRowOperandEmission(unittest.TestCase):
+    """A ``(512, 1)`` operand against a ``(16, 512, lanes)`` tile, at either width.
 
-    The lane spread moves two bytes, so on the device a four-byte operand reaches
-    every fourth lane and the rest read zero -- a silent wrong result, which is why
-    it is refused here and not left to the backend compiler, which accepts it.
+    The operand is read at the head of each row and spread across the lanes by the
+    backend.  At four bytes that spread used to return the operand in every fourth
+    lane only, so the emitter refused it; the backend has since been fixed, and
+    this pins that the same KTIR is now emitted at both widths.
     """
 
     @staticmethod
@@ -996,71 +997,19 @@ class TestFourByteHeadReadRefusal(unittest.TestCase):
             coords_per_arg=[[d0, d1, d2], [d1, sympy.Integer(0)], [d0, d1, d2]],
         )
 
-    def test_a_per_row_operand_at_fp32_is_refused(self):
+    def test_the_head_read_is_emitted_at_both_widths(self):
         from torch_spyre._inductor.codegen.ktir import generate_ktir
 
-        with self.assertRaisesRegex(
-            NotImplementedError,
-            "one element per row spread across the lanes of a 4-byte",
+        for dtype, elem in (
+            (DataFormats.SEN169_FP16, "f16"),
+            (DataFormats.IEEE_FP32, "f32"),
         ):
-            generate_ktir(
-                "k_per_row_fp32",
-                [self._per_row_operand_spec(DataFormats.IEEE_FP32)],
-            )
-
-    def test_the_same_shape_at_fp16_is_still_emitted(self):
-        """The control: only the width differs, so the width is what decides."""
-        from torch_spyre._inductor.codegen.ktir import generate_ktir
-
-        emitted = generate_ktir(
-            "k_per_row_fp16",
-            [self._per_row_operand_spec(DataFormats.SEN169_FP16)],
-        )
-        self.assertIn("affine_map<(d0, d1, d2) -> (d1, 0)>", emitted)
-
-    def test_lifting_the_refusal_emits_the_head_read_the_device_gets_wrong(self):
-        """What the emitter hands the backend if the refusal is removed.
-
-        The refusal is a stopgap for a gap in the backend compiler's lane spread,
-        and is meant to go when that is fixed.  This pins the KTIR it stands in
-        front of, so lifting it is a visible, deliberate step: the head read is the
-        ``(d1, 0)`` map over a one-element-per-row tile, spelled at four bytes.  It
-        is the form the backend accepts and the device runs wrong -- the operand
-        in every fourth lane and zeros in the rest -- so this test passing says
-        what is emitted, not that it is correct.
-
-        When the backend's four-byte lane spread is fixed:
-
-        * delete ``_spreads_head_per_row`` and its check in the pointwise plan;
-        * delete the refusal test above and this one;
-        * keep the fp16 and single-value tests, which are about forms that never
-          went through it, and re-measure ``(256, 1)`` at fp32 on the device.
-        """
-        from unittest import mock
-
-        from torch_spyre._inductor.codegen import ktir
-
-        with mock.patch.object(ktir, "_spreads_head_per_row", return_value=False):
-            emitted = ktir.generate_ktir(
-                "k_per_row_fp32_lifted",
-                [self._per_row_operand_spec(DataFormats.IEEE_FP32)],
-            )
-        self.assertIn("affine_map<(d0, d1, d2) -> (d1, 0)>", emitted)
-        self.assertIn("tensor<512x1xf32>", emitted)
-
-    def test_a_single_value_at_fp32_is_still_read(self):
-        """A scalar is one value, not one per row, and is measured exact at fp32.
-
-        ``x / x.sum()`` hands ``realdiv`` an operand of exactly this description
-        and passes on the device, so it keeps the head read it always had.
-        """
-        from torch_spyre._inductor.codegen.ktir import generate_ktir
-
-        emitted = generate_ktir(
-            "k_scalar_fp32",
-            [make_scalar_operand_op_spec(DataFormats.IEEE_FP32, replicated=False)],
-        )
-        self.assertIn("tensor<1xf32>", emitted)
+            with self.subTest(dtype=dtype):
+                emitted = generate_ktir(
+                    "k_per_row", [self._per_row_operand_spec(dtype)]
+                )
+                self.assertIn("affine_map<(d0, d1, d2) -> (d1, 0)>", emitted)
+                self.assertIn(f"tensor<512x1x{elem}>", emitted)
 
 
 @unittest.skipUnless(

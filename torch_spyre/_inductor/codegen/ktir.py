@@ -493,6 +493,12 @@ class ComputeStep:
     # step.  It is not derivable from ``surface`` alone: a GENERIC step is what a
     # broadcast operand forces, but also what any scalar PAYLOAD needs.
     broadcast: bool = False
+    # Operands written as a literal in the body instead of read: ``(position,
+    # bits)`` pairs, ascending, where ``position`` is the operand's place in the op
+    # (so the payload is called with the same argument order whether or not a
+    # constant was inlined) and ``bits`` is the hex text of the literal.  Such an
+    # operand is not in ``ins``.  Empty for every step that reads all its inputs.
+    constants: tuple[tuple[int, str], ...] = ()
 
 
 def dtype_of(spec: OpSpec) -> DataFormats:
@@ -941,7 +947,7 @@ def _reads_every_lane(arg: TensorArg, out: TensorArg) -> bool:
     * every other operand axis is one element at a constant coordinate, i.e. the
       operand really does walk nothing before the rewrite.
     """
-    if not arg.replicated_scalar:
+    if arg.replicated_scalar is None:
         return False
     coords = list(arg.device_coordinates)
     out_coords = list(out.device_coordinates)
@@ -959,6 +965,68 @@ def _reads_every_lane(arg: TensorArg, out: TensorArg) -> bool:
         not getattr(coord, "free_symbols", None) and int(arg.device_size[axis]) == 1
         for axis, coord in enumerate(coords[:-1])
     )
+
+
+def _inline_constant(arg: TensorArg) -> str | None:
+    """The literal to write in place of reading this INPUT, or ``None`` to read it.
+
+    A constant operand reaches the emitter as a one-stick buffer the wrapper
+    filled (``replicated_scalar`` says so, and holds the value's device encoding).
+    Streaming it is not needed when the value can be a literal in the op's body,
+    and the backend accepts one in two cases only:
+
+    * fp32, any FINITE value.  The encoding is the IEEE bit pattern, which is what
+      an ``f32`` literal means.  ``inf`` and ``nan`` are left streamed: MLIR spells
+      them as a hex bit pattern and nobody has checked the backend takes one.
+    * the device's 16-bit format, value ZERO.  That format is not binary16 (``1.0``
+      is ``0x3E00`` there and ``0x3C00`` in IEEE), and an ``f16`` literal means the
+      IEEE one, so any other value would reach the device as a different number.
+      Zero is the one value whose two encodings agree.
+
+    Anything else, including a marker the frontend could not encode, answers
+    ``None`` and keeps the read it has always had.  So does a ``True``: that is
+    what the field held before it carried a value, and a kernel cached from then
+    still says it -- the wrapper cache is not keyed on this code, so it outlives
+    the change -- and the claim without a value is exactly "read the stick".
+    """
+    if not isinstance(arg.replicated_scalar, str) or not arg.is_input:
+        return None
+    try:
+        bits = int(arg.replicated_scalar, 16)
+    except ValueError:
+        return None
+    if arg.device_dtype == DataFormats.IEEE_FP32:
+        return None if (bits >> 23) & 0xFF == 0xFF else f"0x{bits:08X}"
+    if arg.device_dtype == DataFormats.SEN169_FP16 and bits == 0:
+        return "0x0000"
+    return None
+
+
+def _inlined_constants(
+    recipe: Recipe, dtype: DataFormats | None, inputs: Sequence[TensorArg]
+) -> list[tuple[int, str]]:
+    """``(position, bits)`` for each operand of an op that is written as a literal.
+
+    Empty when nothing can be, which is any of:
+
+    * no operand is a constant the backend takes as a literal (``_inline_constant``);
+    * every operand is one: a tensor has to stay, or there is nothing to iterate;
+    * the op has no scalar PAYLOAD spelling at this format.  That is the only place
+      a literal can live -- a named linalg op has no slot for one -- so this, and
+      nothing about which op it is, decides whether the op can take a constant;
+    * the recipe names operands by their place (``unfused``), which dropping one
+      would shift.
+    """
+    constants = [
+        (position, bits)
+        for position, arg in enumerate(inputs)
+        if (bits := _inline_constant(arg)) is not None
+    ]
+    if not constants or len(constants) == len(inputs):
+        return []
+    if recipe.unfused or not _has_payload_arm(recipe, dtype):
+        return []
+    return constants
 
 
 def _lane_walking(arg: TensorArg, out: TensorArg) -> TensorArg:
@@ -1483,6 +1551,10 @@ class KernelPlan:
         # declared as parameters -- see ``add_specs``.  No access is ever built
         # for one, which is why this lives on the plan and not on ``Buffer``.
         self.dropped: set[str] = set()
+        # The constant operands a step wrote as a literal instead of reading.  The
+        # wrapper still allocates and passes each one, so the signature keeps its
+        # slot (``_declare_inlined``) and nothing reads it.
+        self._inlined: list[TensorArg] = []
         # Whether the signature opens with a pool slot.  From the SPECS and the
         # option -- the two facts ``call_kernel`` builds ``call_args`` from -- and
         # NOT from the surviving buffers: a plan fusion can delete every pooled
@@ -1585,7 +1657,33 @@ class KernelPlan:
         self.grid = (cores,)
         self._next_stage = 0
         self.steps = self._stages(specs, ())
+        self._declare_inlined()
         self._check_owned_buffers(self.steps)
+
+    def _declare_inlined(self) -> None:
+        """Keep the parameter position of every constant a step wrote as a literal.
+
+        The same arrangement as a buffer a plan fusion deleted the producer of
+        (``dropped``): the caller still passes the argument, so the signature
+        must still declare it or every position after it would misbind, and
+        nothing accesses it, so it gets a slot and no view.  Only when no OTHER
+        step reads it -- a constant shared with an op that keeps streaming it was
+        registered with a real layout by that step and stays an ordinary buffer
+        -- and only when it is a kernel argument at all (``arg_index >= 0``): an
+        LX-resident constant is never passed, so there is no position to hold.
+        """
+        for arg in self._inlined:
+            link = buf_id(arg)
+            if link in self.buffers or arg.arg_index < 0:
+                continue
+            self.dropped.add(link)
+            self.buffers[link] = _buffer(
+                arg,
+                Layout(extent=(), strides=()),
+                ElemTypes.of(arg.device_dtype),
+                bake_addresses=self.options.bake_addresses,
+                frontend_pool_allocation=self.options.frontend_pool_allocation,
+            )
 
     def _check_owned_buffers(self, steps: Sequence[Step]) -> None:
         """A buffer this kernel owns must be produced before it is read, and read.
@@ -1779,6 +1877,7 @@ class KernelPlan:
                 indexing = Indexing(iters=iters, maps=(in_map, out_map))
         levels = _levels(spec, loops)
         broadcast = False
+        constants: list[tuple[int, str]] = []
         if not spec.is_reduction:
             # A read of a statistic is squeezed the way its PRODUCER's output was,
             # so the reader's access has the rank of the buffer the producer
@@ -1798,6 +1897,19 @@ class KernelPlan:
             # rewrite the operand rather than the map -- ``operand_indexing``
             # renders whatever arrives, faithfully, so what has to be right is
             # what arrives.
+            #
+            # BEFORE either: a constant that can be a literal is not read at all,
+            # so neither the widening nor the head read applies to it.  It leaves
+            # the inputs and is recorded by its place in the op; the step is then
+            # planned as a scalar PAYLOAD (below), the only spelling that can hold
+            # a literal.
+            constants = _inlined_constants(recipe, dtype, inputs)
+            if constants:
+                places = {position for position, _ in constants}
+                self._inlined.extend(inputs[position] for position in sorted(places))
+                inputs = [
+                    arg for position, arg in enumerate(inputs) if position not in places
+                ]
             read: list[TensorArg] = []
             for arg in inputs:
                 if _reads_every_lane(arg, out):
@@ -1841,6 +1953,9 @@ class KernelPlan:
                 is not None
                 for arg in inputs
             )
+            # An inlined constant needs the scalar spelling for the same reason a
+            # broadcast operand does: only a generic's region can hold a literal.
+            broadcast = broadcast or bool(constants)
         # The op's spelling, chosen ONCE, from the whole request: the format, plus
         # whether an operand is broadcast (never, for a reduction, whose shape comes
         # from ``_reduce_surface`` -- the arm is asked for there only so that an op
@@ -1915,6 +2030,7 @@ class KernelPlan:
             attrs=attrs,
             dtype=dtype,
             broadcast=broadcast,
+            constants=tuple(constants),
             # A threaded buffer never reaches memory: it is carried as a value,
             # so it gets no store, no func parameter, no view and no address.  A
             # pooled one does reach memory -- at the pool base plus its offset --
@@ -2743,6 +2859,20 @@ class Recipe:
         return chosen
 
 
+def _has_payload_arm(recipe: Recipe, dtype: DataFormats | None) -> bool:
+    """Whether \\p recipe has a scalar PAYLOAD spelling at \\p dtype.
+
+    Asked with ``broadcast=True``, the request that selects it: a literal can only
+    live in a generic's region, and a named op has no place for one.  A format the
+    op does not exist at is "no", not an error here, so the caller falls back to
+    reading the constant and the usual refusal comes from where it always did.
+    """
+    try:
+        return recipe.arm(dtype, broadcast=True).kind is BindingKind.PAYLOAD
+    except NotImplementedError:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # What the builder carries in scope
 # ---------------------------------------------------------------------------
@@ -2874,6 +3004,24 @@ class KtirBuilder:
     def icst_index(self, value: int):
         """A fresh ``arith.constant <value> : index``."""
         return self.val(arith.ConstantOp(self.index_t, int(value)))
+
+    def scalar_literal(self, bits: str, dtype: DataFormats | None):
+        """A fresh ``arith.constant`` of \\p dtype's element type, from its bit pattern.
+
+        Parsed from the hex text (``0x41200000 : f32``) rather than built from a
+        Python float, so the value is exactly the bits the frontend encoded and
+        no float conversion sits between the two.  \\p dtype is the step's, which
+        is the format the op was planned at and so the format of every operand.
+        """
+        # A step with a constant was planned from an op whose format ``dtype_of``
+        # resolved, so a missing one is a plan bug and not an unsupported request.
+        assert dtype is not None, "a step with an inlined constant has no format"
+        storage = ElemTypes.of(dtype).storage
+        return self.val(
+            arith.ConstantOp(
+                self.named_type(storage), ir.Attribute.parse(f"{bits} : {storage}")
+            )
+        )
 
     @staticmethod
     def _affine_map(rank: int, row: Sequence[int | None]):
@@ -3667,7 +3815,14 @@ class KtirBuilder:
         def body(*args):
             if reducing:
                 return payload(args[-1], *args[:-1], **attrs)
-            return payload(*args[:-1], **attrs)
+            operands = list(args[:-1])
+            # An inlined constant is not an input, so it has no block argument:
+            # it is built here, in the region, and put back at the place the op
+            # names it.  Ascending positions, so each insert lands where the
+            # operand sat and ``sub`` and ``realdiv`` keep their order.
+            for position, bits in step.constants:
+                operands.insert(position, self.scalar_literal(bits, step.dtype))
+            return payload(*operands, **attrs)
 
         return linalg.generic(
             inputs=list(ins),

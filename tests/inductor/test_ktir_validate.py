@@ -63,6 +63,18 @@ FP16 = DataFormats.SEN169_FP16
 ADD_SIZE = [16, 512, 64]
 
 
+def _replicated_scalar(value) -> "str | None":
+    """A ``replicated_scalars`` entry as the field holds it: a hex string, or None.
+
+    ``True`` stands for the claim with no encoding, and gets the marker the
+    frontend uses for a value its converter refused, which the emitter reads as
+    "not a literal".
+    """
+    if value is True:
+        return "unencoded"
+    return value or None
+
+
 def make_op_spec(
     op: str = "add",
     *,
@@ -111,9 +123,11 @@ def make_op_spec(
     * ``kernel_locals`` per arg: the bit the scheduler fills, saying nothing
       outside this kernel reads the buffer.  Defaults to False, as it does in
       the contract.
-    * ``replicated_scalars`` per arg: the bit the frontend fills for a
+    * ``replicated_scalars`` per arg: what the frontend fills for a
       ``spyre.constant`` buffer, saying every element of it holds the same value.
-      Defaults to False, as it does in the contract.
+      A hex string is the value's device encoding (``"0x41200000"``); ``True`` is
+      the claim without an encoding, which the emitter streams, as it did when the
+      field was a bool.  Defaults to ``None``, as it does in the contract.
     * ``divisions`` maps a coordinate symbol's name to its work division;
       ``space`` replaces the iteration space outright (``{}`` for a tiled op).
     * ``tiled`` / ``trips`` are the loop-level symbols and trip counts, and
@@ -162,7 +176,7 @@ def make_op_spec(
                 element_arrangement=at(arrangements, position)
                 or ElementArrangement.STANDARD,
                 kernel_local=bool(at(kernel_locals, position)),
-                replicated_scalar=bool(at(replicated_scalars, position)),
+                replicated_scalar=_replicated_scalar(at(replicated_scalars, position)),
             )
         )
 
@@ -366,7 +380,10 @@ def make_broadcast_op_spec(form: str = "row") -> OpSpec:
 
 
 def make_scalar_operand_op_spec(
-    dtype: DataFormats = FP16, *, replicated: bool = True
+    dtype: DataFormats = FP16,
+    *,
+    replicated: "bool | str" = True,
+    op: str = "equal",
 ) -> OpSpec:
     """``a == 0.0``: a degenerate ``spyre.constant`` operand, as projected.
 
@@ -387,7 +404,7 @@ def make_scalar_operand_op_spec(
     full = [sympy.floor(lanes / stick), rows, sympy.Mod(lanes, stick)]
     zero = sympy.Integer(0)
     return make_op_spec(
-        "equal",
+        op,
         dtype=dtype,
         names=["arg0_1", "buf1", "buf0"],
         sizes=[[chunks, 256, stick], [1, 1, stick], [chunks, 256, stick]],

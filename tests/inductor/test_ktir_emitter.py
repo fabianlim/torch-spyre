@@ -1067,6 +1067,72 @@ class TestFourByteHeadReadRefusal(unittest.TestCase):
     _mlir_ktdp_available(),
     "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
 )
+class TestInlinedConstantEmission(unittest.TestCase):
+    """A constant operand written as a literal in the body, not read as a stick.
+
+    The frontend still allocates and passes the constant's buffer, so the kernel
+    keeps declaring its parameter; it just has no view and no load.
+    """
+
+    FP32 = DataFormats.IEEE_FP32
+    FP16 = DataFormats.SEN169_FP16
+
+    @staticmethod
+    def _emit(dtype, bits, op="add"):
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        return generate_ktir(
+            "k_const",
+            [make_scalar_operand_op_spec(dtype, replicated=bits, op=op)],
+        )
+
+    def _assert_streamed(self, emitted):
+        self.assertIn("construct_memory_view %arg1", emitted)
+        self.assertNotIn("arith.constant 1.0", emitted)
+
+    def _assert_inlined(self, emitted):
+        # Still a parameter, with no view built for it.
+        self.assertIn("%arg1: index", emitted)
+        self.assertNotIn("construct_memory_view %arg1", emitted)
+        self.assertNotIn("%arg1,", emitted.split("{", 1)[1])
+
+    def test_an_fp32_constant_is_a_literal_in_the_body(self):
+        emitted = self._emit(self.FP32, "0x41200000")  # 10.0
+        self._assert_inlined(emitted)
+        self.assertIn("arith.constant 1.000000e+01 : f32", emitted)
+        self.assertRegex(emitted, r"arith\.addf %\w+, %cst")
+        self.assertNotIn("linalg.add ", emitted)
+
+    def test_the_operand_order_is_the_ops(self):
+        """``x - 10.0`` and ``10.0 - x`` differ, so the constant keeps its place."""
+        emitted = self._emit(self.FP32, "0x41200000", op="sub")
+        self.assertRegex(emitted, r"arith\.subf %\w+, %cst")
+
+    def test_fp16_zero_is_a_literal_and_any_other_value_is_not(self):
+        """The device's 16-bit format is not binary16; only zero reads the same."""
+        self._assert_inlined(self._emit(self.FP16, "0x0000"))
+        # 10.0 in the device format; as an f16 literal it would mean something else.
+        self._assert_streamed(self._emit(self.FP16, "0x4480"))
+
+    def test_a_non_finite_fp32_constant_is_still_streamed(self):
+        for bits in ("0x7F800000", "0xFF800000", "0x7FC00000"):
+            with self.subTest(bits=bits):
+                self._assert_streamed(self._emit(self.FP32, bits))
+
+    def test_a_value_the_frontend_could_not_encode_is_still_streamed(self):
+        self._assert_streamed(self._emit(self.FP32, "unencoded"))
+
+    def test_a_comparison_takes_a_literal_like_any_other_op(self):
+        """Which op it is does not decide this: a scalar payload spelling does."""
+        emitted = self._emit(self.FP32, "0x41200000", op="equal")
+        self._assert_inlined(emitted)
+        self.assertIn("spyreop.compare <equal> %in, %cst", emitted)
+
+
+@unittest.skipUnless(
+    _mlir_ktdp_available(),
+    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
+)
 class TestStatisticReadEmission(unittest.TestCase):
     """Two stages over one statistic buffer: a stick written, a head read."""
 

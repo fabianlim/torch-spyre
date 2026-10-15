@@ -21,7 +21,7 @@ from abc import ABC
 import torch
 import sympy
 
-from torch_spyre._C import DataFormats, ElementArrangement
+from torch_spyre._C import DataFormats, ElementArrangement, encode_constant
 
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.codegen.common import (
@@ -470,6 +470,28 @@ class SpyreKernelOpsHandler(DefaultHandler):
         raise NotImplementedError
 
 
+def _encode_replicated_scalar(value, dtype: DataFormats) -> str:
+    """\\p value as the device holds it at \\p dtype, as the hex text of its bits.
+
+    The host converter is the one that knows the format (``encode_constant``,
+    also what the SDSC constant info uses): at fp32 it is the IEEE bit pattern,
+    ``inf`` and the canonical ``nan`` included, and at the device's 16-bit format
+    it is NOT binary16 -- ``1.0`` is ``0x3E00`` there, not ``0x3C00`` -- so the
+    encoding is taken from it and never computed here.
+
+    Text so that the value survives being written into generated source: a float
+    ``inf`` is not a literal, and an int zero is falsy where a string is not.  A
+    value the converter refuses still has to claim the buffer (the claim is what
+    lets the emitter read the whole stick), so it gets a marker the emitter will
+    not parse as bits, and the constant keeps being streamed.
+    """
+    width = 8 if dtype == DataFormats.IEEE_FP32 else 4
+    try:
+        return f"0x{encode_constant(value, dtype):0{width}X}"
+    except (ValueError, TypeError, RuntimeError):
+        return "unencoded"
+
+
 def _tile_advance_expr_from_dep(
     dep: MemoryDep,
     tiled_dim_extents: dict[int, sympy.Expr],
@@ -814,10 +836,22 @@ class SpyreKernel(Kernel[CSEVariable]):
         # one stick, and ``spyre_fill_tensor`` covers it with a single
         # MEMORY_FILL over the composite address), so it is the one producer
         # that may claim this.
-        replicated_scalar = bool(
-            _spyre_config.ktir_emitter
-            and isinstance(V.graph.try_get_buffer(name), SpyreConstantFallback)
+        #
+        # The claim carries the VALUE, as the device encoding of the constant at
+        # this arg's format, so the emitter can write it into the kernel as a
+        # literal instead of reading the stick back.  A string, because a
+        # non-finite constant has no usable ``repr`` as a float in generated
+        # source, and an encoding rather than the float because the device's
+        # 16-bit format is not IEEE: only the host converter knows it.
+        constant_buffer = (
+            V.graph.try_get_buffer(name) if _spyre_config.ktir_emitter else None
         )
+        replicated_scalar: str | None = None
+        if isinstance(constant_buffer, SpyreConstantFallback):
+            replicated_scalar = _encode_replicated_scalar(
+                constant_buffer.constant_args[0],
+                tensor.layout.device_layout.device_dtype,
+            )
         it_space = iteration_space(current_node)
         # With dynamic=True the host index may contain symbolic strides
         # (e.g. x0*s1+x1).  Concretize size symbols so normalize_coordinates
@@ -1695,8 +1729,10 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                                 buf.writeline(f"name={arg.name!r},")
                             if arg.kernel_local:
                                 buf.writeline("kernel_local=True,")
-                            if arg.replicated_scalar:
-                                buf.writeline("replicated_scalar=True,")
+                            if arg.replicated_scalar is not None:
+                                buf.writeline(
+                                    f"replicated_scalar={arg.replicated_scalar!r},"
+                                )
                             if arg.device_tile_advance_expr is not None:
                                 buf.writeline(
                                     "device_tile_advance_expr="

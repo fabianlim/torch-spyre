@@ -85,7 +85,7 @@ _EXPECTED_TENSOR_ARG_SCHEMA = {
     "element_arrangement": "ElementArrangement",
     "work_division": "TensorWorkDivision | None",
     "kernel_local": "bool",
-    "replicated_scalar": "bool",
+    "replicated_scalar": "str | None",
 }
 _EXPECTED_TENSOR_WORK_DIVISION_SCHEMA = {
     "work_slices": "dict[Symbol, int]",
@@ -337,9 +337,12 @@ def _canonical_tensor_arg(arg: TensorArg) -> object:
         result["kernel_local"] = True
     # Same rule, same reason: only set on the KTIR path, so an SDSC identity is
     # unchanged.  It belongs in the identity at all because it changes what the
-    # emitter reads out of the buffer -- one lane or the whole stick.
-    if arg.replicated_scalar:
-        result["replicated_scalar"] = True
+    # emitter reads out of the buffer -- one lane, the whole stick, or nothing,
+    # with the value written into the kernel as a literal -- and so the VALUE is
+    # part of the identity: two kernels that differ only in the constant must not
+    # share a compiled program.
+    if arg.replicated_scalar is not None:
+        result["replicated_scalar"] = arg.replicated_scalar
     return result
 
 

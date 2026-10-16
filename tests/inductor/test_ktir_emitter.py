@@ -974,12 +974,13 @@ class TestReplicatedScalarOperandEmission(unittest.TestCase):
     _mlir_ktdp_available(),
     "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
 )
-class TestFourByteHeadReadRefusal(unittest.TestCase):
-    """One element per row spread across the lanes is refused at four bytes.
+class TestOneElementPerRowOperandEmission(unittest.TestCase):
+    """A ``(512, 1)`` operand against a ``(16, 512, lanes)`` tile, at either width.
 
-    The lane spread moves two bytes, so on the device a four-byte operand reaches
-    every fourth lane and the rest read zero -- a silent wrong result, which is why
-    it is refused here and not left to the backend compiler, which accepts it.
+    The operand is read at the head of each row and spread across the lanes by the
+    backend.  At four bytes that spread used to return the operand in every fourth
+    lane only, so the emitter refused it; the backend has since been fixed, and
+    this pins that the same KTIR is now emitted at both widths.
     """
 
     @staticmethod
@@ -996,71 +997,85 @@ class TestFourByteHeadReadRefusal(unittest.TestCase):
             coords_per_arg=[[d0, d1, d2], [d1, sympy.Integer(0)], [d0, d1, d2]],
         )
 
-    def test_a_per_row_operand_at_fp32_is_refused(self):
+    def test_the_head_read_is_emitted_at_both_widths(self):
         from torch_spyre._inductor.codegen.ktir import generate_ktir
 
-        with self.assertRaisesRegex(
-            NotImplementedError,
-            "one element per row spread across the lanes of a 4-byte",
+        for dtype, elem in (
+            (DataFormats.SEN169_FP16, "f16"),
+            (DataFormats.IEEE_FP32, "f32"),
         ):
-            generate_ktir(
-                "k_per_row_fp32",
-                [self._per_row_operand_spec(DataFormats.IEEE_FP32)],
-            )
+            with self.subTest(dtype=dtype):
+                emitted = generate_ktir(
+                    "k_per_row", [self._per_row_operand_spec(dtype)]
+                )
+                self.assertIn("affine_map<(d0, d1, d2) -> (d1, 0)>", emitted)
+                self.assertIn(f"tensor<512x1x{elem}>", emitted)
 
-    def test_the_same_shape_at_fp16_is_still_emitted(self):
-        """The control: only the width differs, so the width is what decides."""
+
+@unittest.skipUnless(
+    _mlir_ktdp_available(),
+    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
+)
+class TestInlinedConstantEmission(unittest.TestCase):
+    """A constant operand written as a literal in the body, not read as a stick.
+
+    The frontend still allocates and passes the constant's buffer, so the kernel
+    keeps declaring its parameter; it just has no view and no load.
+    """
+
+    FP32 = DataFormats.IEEE_FP32
+    FP16 = DataFormats.SEN169_FP16
+
+    @staticmethod
+    def _emit(dtype, bits, op="add"):
         from torch_spyre._inductor.codegen.ktir import generate_ktir
 
-        emitted = generate_ktir(
-            "k_per_row_fp16",
-            [self._per_row_operand_spec(DataFormats.SEN169_FP16)],
+        return generate_ktir(
+            "k_const",
+            [make_scalar_operand_op_spec(dtype, replicated=bits, op=op)],
         )
-        self.assertIn("affine_map<(d0, d1, d2) -> (d1, 0)>", emitted)
 
-    def test_lifting_the_refusal_emits_the_head_read_the_device_gets_wrong(self):
-        """What the emitter hands the backend if the refusal is removed.
+    def _assert_streamed(self, emitted):
+        self.assertIn("construct_memory_view %arg1", emitted)
+        self.assertNotIn("arith.constant 1.0", emitted)
 
-        The refusal is a stopgap for a gap in the backend compiler's lane spread,
-        and is meant to go when that is fixed.  This pins the KTIR it stands in
-        front of, so lifting it is a visible, deliberate step: the head read is the
-        ``(d1, 0)`` map over a one-element-per-row tile, spelled at four bytes.  It
-        is the form the backend accepts and the device runs wrong -- the operand
-        in every fourth lane and zeros in the rest -- so this test passing says
-        what is emitted, not that it is correct.
+    def _assert_inlined(self, emitted):
+        # Still a parameter, with no view built for it.
+        self.assertIn("%arg1: index", emitted)
+        self.assertNotIn("construct_memory_view %arg1", emitted)
+        self.assertNotIn("%arg1,", emitted.split("{", 1)[1])
 
-        When the backend's four-byte lane spread is fixed:
+    def test_an_fp32_constant_is_a_literal_in_the_body(self):
+        emitted = self._emit(self.FP32, "0x41200000")  # 10.0
+        self._assert_inlined(emitted)
+        self.assertIn("arith.constant 1.000000e+01 : f32", emitted)
+        self.assertRegex(emitted, r"arith\.addf %\w+, %cst")
+        self.assertNotIn("linalg.add ", emitted)
 
-        * delete ``_spreads_head_per_row`` and its check in the pointwise plan;
-        * delete the refusal test above and this one;
-        * keep the fp16 and single-value tests, which are about forms that never
-          went through it, and re-measure ``(256, 1)`` at fp32 on the device.
-        """
-        from unittest import mock
+    def test_the_operand_order_is_the_ops(self):
+        """``x - 10.0`` and ``10.0 - x`` differ, so the constant keeps its place."""
+        emitted = self._emit(self.FP32, "0x41200000", op="sub")
+        self.assertRegex(emitted, r"arith\.subf %\w+, %cst")
 
-        from torch_spyre._inductor.codegen import ktir
+    def test_fp16_zero_is_a_literal_and_any_other_value_is_not(self):
+        """The device's 16-bit format is not binary16; only zero reads the same."""
+        self._assert_inlined(self._emit(self.FP16, "0x0000"))
+        # 10.0 in the device format; as an f16 literal it would mean something else.
+        self._assert_streamed(self._emit(self.FP16, "0x4480"))
 
-        with mock.patch.object(ktir, "_spreads_head_per_row", return_value=False):
-            emitted = ktir.generate_ktir(
-                "k_per_row_fp32_lifted",
-                [self._per_row_operand_spec(DataFormats.IEEE_FP32)],
-            )
-        self.assertIn("affine_map<(d0, d1, d2) -> (d1, 0)>", emitted)
-        self.assertIn("tensor<512x1xf32>", emitted)
+    def test_a_non_finite_fp32_constant_is_still_streamed(self):
+        for bits in ("0x7F800000", "0xFF800000", "0x7FC00000"):
+            with self.subTest(bits=bits):
+                self._assert_streamed(self._emit(self.FP32, bits))
 
-    def test_a_single_value_at_fp32_is_still_read(self):
-        """A scalar is one value, not one per row, and is measured exact at fp32.
+    def test_a_value_the_frontend_could_not_encode_is_still_streamed(self):
+        self._assert_streamed(self._emit(self.FP32, "unencoded"))
 
-        ``x / x.sum()`` hands ``realdiv`` an operand of exactly this description
-        and passes on the device, so it keeps the head read it always had.
-        """
-        from torch_spyre._inductor.codegen.ktir import generate_ktir
-
-        emitted = generate_ktir(
-            "k_scalar_fp32",
-            [make_scalar_operand_op_spec(DataFormats.IEEE_FP32, replicated=False)],
-        )
-        self.assertIn("tensor<1xf32>", emitted)
+    def test_a_comparison_takes_a_literal_like_any_other_op(self):
+        """Which op it is does not decide this: a scalar payload spelling does."""
+        emitted = self._emit(self.FP32, "0x41200000", op="equal")
+        self._assert_inlined(emitted)
+        self.assertIn("spyreop.compare <equal> %in, %cst", emitted)
 
 
 @unittest.skipUnless(

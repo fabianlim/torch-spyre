@@ -32,6 +32,7 @@ import importlib
 import inspect
 import sys
 import unittest
+from collections.abc import Collection, Sequence
 from unittest import mock
 
 import regex as re
@@ -590,6 +591,52 @@ def make_linked_op_specs(
     return specs
 
 
+def make_dataflow_specs(
+    steps: Sequence[tuple],
+    *,
+    dtype: DataFormats = FP16,
+    scalars: dict | None = None,
+    local: Collection[str] = (),
+) -> list:
+    """Specs for a kernel described as dataflow: ``(op, [reads], write)`` per step.
+
+    Every buffer is full size and every step reads and writes it at that step's
+    own identity coordinates, except the ``scalars``: a name mapped to the hex
+    encoding of the one value a one-stick constant holds (``replicated_scalar``),
+    read at a constant coordinate the way the frontend describes it.  A buffer
+    gets its argument index the first time any step names it, which the per-spec
+    numbering of ``make_op_spec`` cannot know.  ``local`` names the buffers the
+    scheduler found nothing outside the kernel reading; the rest are not.
+    """
+    scalars = scalars or {}
+    stick = 64 if dtype == FP16 else 32
+    chunks = 1 if dtype == FP16 else 2
+    full_size, scalar_size = [chunks, 256, stick], [1, 1, stick]
+    zero = sympy.Integer(0)
+    index: dict[str, int] = {}
+    specs = []
+    for step, (op, reads, write) in enumerate(steps):
+        names = [*reads, write]
+        symbols = sympy.symbols(f"{chr(ord('d') + step)}0:3")
+        spec = make_op_spec(
+            op,
+            inputs=len(reads),
+            names=names,
+            sizes=[scalar_size if n in scalars else full_size for n in names],
+            coords_per_arg=[
+                [zero] * 3 if n in scalars else list(symbols) for n in names
+            ],
+            dtype=dtype,
+            kernel_locals=[n in local for n in names],
+            replicated_scalars=[scalars.get(n) for n in names],
+            space={sym: (extent, 1) for sym, extent in zip(symbols, full_size)},
+        )
+        for arg in spec.args:
+            arg.arg_index = index.setdefault(arg.name, len(index))
+        specs.append(spec)
+    return specs
+
+
 def make_absmax_pair(**overrides) -> list:
     """``amax(abs(x), ...)``: shape A, and the only fixture that names the entry."""
     return make_linked_op_specs(ops=("abs", "max"), **overrides)
@@ -602,6 +649,7 @@ def make_plan_fusion(**overrides) -> ktir.PlanFusion:
         "pattern": (("abs", False), ("max", True)),
         "result_op": "fused",
         "why": "a probe entry, defined by the test that uses it",
+        "rewrite": ktir._read_source,
     }
     entry.update(overrides)
     return ktir.PlanFusion(**entry)  # type: ignore[arg-type]
@@ -630,7 +678,10 @@ class TestValidateRejections(unittest.TestCase):
 
     def test_mixed_work_division_rejected(self):
         """Two ops in one kernel, two grids: there is only one grid to emit."""
-        specs = [make_op_spec(), make_op_spec(divisions={"d1": 2})]
+        specs = [
+            make_op_spec(),
+            make_op_spec(divisions={"d1": 2}, names=["arg0", "arg1", "buf1"]),
+        ]
         self._rejects(specs, "different work divisions")
 
     def test_ragged_work_division_rejected(self):
@@ -878,9 +929,11 @@ class TestKernelPlan(unittest.TestCase):
         )
 
     def test_repeated_buffer_is_registered_once(self):
-        specs = [make_op_spec()] + [make_op_spec()]
+        # Two ops reading the same two inputs: those are registered once, so four
+        # buffers and not six.  The outputs differ because a buffer has one writer.
+        specs = [make_op_spec(), make_op_spec(names=["arg0", "arg1", "buf1"])]
         plan = ktir.build_kernel_plan(specs)
-        self.assertEqual(len(plan.buffers), 3)
+        self.assertEqual(len(plan.buffers), 4)
 
 
 class TestBaseAddressElements(unittest.TestCase):
@@ -2017,7 +2070,8 @@ class TestPlanFusionRewrite(FusionCase):
         With stages either side, because a match rewrites its own span and
         nothing around it.
         """
-        before, after = make_op_spec("add"), make_op_spec("mul")
+        before = make_op_spec("add", names=["a0", "a1", "before"])
+        after = make_op_spec("mul", names=["m0", "m1", "after"])
         vector = fuse([before, *make_absmax_pair(), after])
         self.assertEqual([spec.op for spec in vector], ["add", "absmax", "mul"])
         self.assertIs(vector[0], before)
@@ -2026,16 +2080,22 @@ class TestPlanFusionRewrite(FusionCase):
         self.assertIn("absmax", ktir.KtirBuilder.RECIPES)
 
     def test_a_span_the_pattern_does_not_name_is_left_alone(self):
-        """DECISION: a slot is ``(op name, is_reduction)``, matched adjacently."""
-        producer, consumer = make_absmax_pair()
+        """DECISION: a slot is ``(op name, is_reduction)``."""
         cases = {
             "another op": make_linked_op_specs(ops=("exp", "max")),
             "not a reduction": make_linked_op_specs(reductions=(False, False)),
-            "a stage in between": [producer, make_op_spec("add"), consumer],
         }
         for label, specs in cases.items():
             with self.subTest(case=label):
                 self.assertDeclined(specs)
+
+    def test_a_stage_in_between_does_not_stop_a_span(self):
+        """DECISION: a pair is found by what reads what, not by what is next."""
+        producer, consumer = make_absmax_pair()
+        between = make_op_spec("add", names=["a0", "a1", "between"])
+        vector = fuse([producer, between, consumer])
+        self.assertEqual([spec.op for spec in vector], ["add", "absmax"])
+        self.assertIs(vector[0], between)
 
     def test_a_kernel_local_link_in_plain_hbm_is_fused(self):
         """DECISION: locality, not a planner's placement, licenses the deletion.
@@ -2166,6 +2226,227 @@ class TestPlanFusionDeclines(FusionCase):
             (make_plan_fusion(viable=undecidable),),
             reason="no surface for this shape",
         )
+
+
+class TestIdentityFusion(FusionCase):
+    """An ``identity`` a scalar expansion or a bool cast creates is deleted.
+
+    The kernels are described as dataflow (``make_dataflow_specs``) so the order
+    of the specs, and what sits between a producer and its reader, is the test's
+    to choose.
+    """
+
+    ZERO = "0x0000"  # fp16 zero: the one fp16 value that can be a literal
+    ALL_LOCAL = ("c0", "c1", "c2", "c3", "t0", "t1", "t2")
+
+    def fused(self, steps, **options):
+        options.setdefault("local", self.ALL_LOCAL)
+        return fuse(make_dataflow_specs(steps, **options))
+
+    def test_a_scalar_arm_becomes_a_literal_and_keeps_its_argument_slot(self):
+        """``where(m, p, 0.0)``: no identity, no read for the arm."""
+        specs = make_dataflow_specs(
+            [("identity", ["K"], "c0"), ("where3", ["m", "p", "c0"], "out")],
+            scalars={"K": self.ZERO},
+            local=["c0"],
+        )
+        slot = specs[0].args[-1].arg_index
+        vector, dropped = ktir.apply_plan_fusions(specs)
+        self.assertEqual([spec.op for spec in vector], ["where3"])
+        [arm] = [arg for arg in vector[0].args if arg.name == "K"]
+        self.assertEqual(arm.replicated_scalar, self.ZERO)
+        self.assertEqual([arg.arg_index for arg in dropped], [slot])
+        plan = ktir.build_kernel_plan(specs)
+        [step] = plan.steps
+        self.assertEqual(len(step.ins), 2)  # the arm is a literal, not a read
+
+    def test_the_operand_is_found_by_buffer_not_by_position(self):
+        """The scalar can be any arm; the select still loses exactly that read."""
+        for arms in (["c0", "p", "q"], ["m", "c0", "q"], ["m", "p", "c0"]):
+            with self.subTest(arms=arms):
+                specs = make_dataflow_specs(
+                    [("identity", ["K"], "c0"), ("where3", arms, "out")],
+                    scalars={"K": self.ZERO},
+                    local=["c0"],
+                )
+                [fused] = fuse(specs)
+                self.assertEqual(
+                    [arg.name for arg in fused.args if arg.is_input],
+                    [n if n != "c0" else "K" for n in arms],
+                )
+
+    def test_a_comparison_feeding_a_select_loses_both_identities(self):
+        """``where(x >= C, a, K)``: the bool cast and the scalar arm both go.
+
+        The select's operand order differs from the order of the specs, which is
+        the case matching by position cannot see.
+        """
+        vector = self.fused(
+            [
+                ("greaterequal", ["x", "C"], "t0"),
+                ("identity", ["K"], "c0"),
+                ("identity", ["t0"], "c1"),
+                ("where3", ["c1", "a", "c0"], "out"),
+            ],
+            scalars={"K": self.ZERO, "C": self.ZERO},
+        )
+        self.assertEqual([spec.op for spec in vector], ["greaterequal", "where3"])
+        self.assertEqual(
+            [arg.name for arg in vector[1].args if arg.is_input], ["t0", "a", "K"]
+        )
+
+    def test_a_stage_between_the_identity_and_its_reader_still_fuses(self):
+        """The match follows the dependence, so a ``mul`` in between is no bar."""
+        vector = self.fused(
+            [
+                ("identity", ["K"], "c0"),
+                ("mul", ["u", "v"], "t0"),
+                ("where3", ["t0", "p", "c0"], "out"),
+            ],
+            scalars={"K": self.ZERO},
+        )
+        self.assertEqual([spec.op for spec in vector], ["mul", "where3"])
+
+    def test_a_comparison_against_zeros_like_loses_its_identity(self):
+        """``x == zeros_like(x)``: the identity feeds an ``equal``."""
+        vector = self.fused(
+            [("identity", ["K"], "c0"), ("equal", ["x", "c0"], "out")],
+            scalars={"K": self.ZERO},
+        )
+        self.assertEqual([spec.op for spec in vector], ["equal"])
+
+    def test_every_literal_consumer_in_the_table_fires(self):
+        for entry in ktir.PLAN_FUSIONS:
+            if entry.rewrite is not ktir._use_value:
+                continue
+            [_, (op, _)] = entry.pattern
+            with self.subTest(op=op):
+                vector = (
+                    self.fused(
+                        [("identity", ["K"], "c0"), (op, ["x", "c0"], "out")],
+                        scalars={"K": self.ZERO},
+                    )
+                    if op != "where3"
+                    else self.fused(
+                        [("identity", ["K"], "c0"), (op, ["m", "x", "c0"], "out")],
+                        scalars={"K": self.ZERO},
+                    )
+                )
+                self.assertEqual([spec.op for spec in vector], [op])
+
+    def test_a_chain_of_two_identities_fuses_in_two_rounds(self):
+        """A copy of a copy of the source: the second only matches after the first."""
+        vector = self.fused(
+            [
+                ("identity", ["x"], "c0"),
+                ("identity", ["c0"], "c1"),
+                ("where3", ["m", "c1", "q"], "out"),
+            ],
+        )
+        self.assertEqual([spec.op for spec in vector], ["where3"])
+        self.assertEqual(
+            [arg.name for arg in vector[0].args if arg.is_input], ["m", "x", "q"]
+        )
+
+    def test_an_identity_with_two_readers_is_left_alone(self):
+        self.assertDeclined(
+            make_dataflow_specs(
+                [
+                    ("identity", ["K"], "c0"),
+                    ("where3", ["m", "p", "c0"], "t0"),
+                    ("where3", ["m", "q", "c0"], "t1"),
+                ],
+                scalars={"K": self.ZERO},
+                local=self.ALL_LOCAL,
+            ),
+            reason="read 2 time(s)",
+        )
+
+    def test_an_identity_whose_output_leaves_the_kernel_is_left_alone(self):
+        self.assertDeclined(
+            make_dataflow_specs(
+                [("identity", ["K"], "c0"), ("where3", ["m", "p", "c0"], "out")],
+                scalars={"K": self.ZERO},
+                local=[],
+            ),
+            reason="is not kernel-local",
+        )
+
+    def test_the_two_guards_are_exclusive(self):
+        """A scalar broadcast is not a drop-in; a same-layout copy is not a scalar."""
+        scalar = make_dataflow_specs(
+            [("identity", ["K"], "c0"), ("where3", ["m", "p", "c0"], "out")],
+            scalars={"K": self.ZERO},
+            local=["c0"],
+        )
+        copy = make_dataflow_specs(
+            [("identity", ["x"], "c0"), ("where3", ["m", "c0", "q"], "out")],
+            local=["c0"],
+        )
+        for specs, rewrite, fires in (
+            (scalar, ktir._read_source, False),
+            (scalar, ktir._use_value, True),
+            (copy, ktir._read_source, True),
+            (copy, ktir._use_value, False),
+        ):
+            producer, consumer = specs
+            [read] = [a for a in consumer.args if a.name == "c0"]
+            with self.subTest(rewrite=rewrite.__name__, scalar=specs is scalar):
+                self.assertEqual(rewrite(producer, consumer, read) is not None, fires)
+
+    def test_a_nonzero_fp16_constant_is_declined(self):
+        """It cannot be a literal, and reading its stick as a tensor is wrong."""
+        specs = make_dataflow_specs(
+            [("identity", ["K"], "c0"), ("where3", ["m", "p", "c0"], "out")],
+            scalars={"K": "0x4480"},
+            local=["c0"],
+        )
+        self.assertDeclined(specs, reason="not a constant the backend takes")
+
+    def test_a_consumer_with_no_literal_spelling_is_declined_before_deletion(self):
+        """``exp`` has no second operand to hold a literal: the identity stays."""
+        specs = make_dataflow_specs(
+            [("identity", ["K"], "c0"), ("exp", ["c0"], "out")],
+            scalars={"K": self.ZERO},
+            local=["c0"],
+        )
+        self.assertDeclined(specs)
+
+    def test_a_buffer_written_twice_fails_the_write_once_assertion(self):
+        specs = make_dataflow_specs(
+            [("mul", ["x", "y"], "t0"), ("add", ["x", "y"], "t0")]
+        )
+        with self.assertRaisesRegex(AssertionError, "'t0' is written by more"):
+            ktir.apply_plan_fusions(specs)
+
+    def test_a_reader_before_its_writer_fails_the_write_once_assertion(self):
+        specs = make_dataflow_specs(
+            [("add", ["t0", "y"], "out"), ("mul", ["x", "y"], "t0")]
+        )
+        with self.assertRaisesRegex(AssertionError, "'t0' is read by 'add' before"):
+            ktir.apply_plan_fusions(specs)
+
+    def test_an_entry_built_without_a_rewrite_is_a_type_error(self):
+        with self.assertRaises(TypeError):
+            ktir.PlanFusion(  # type: ignore[call-arg]
+                name="probe",
+                pattern=(("a", False), ("b", False)),
+                result_op="b",
+                why="",
+            )
+
+    def test_absmax_is_unchanged(self):
+        [fused] = fuse(make_absmax_pair())
+        self.assertEqual(fused.op, "absmax")
+
+    def test_an_identity_in_a_loop_body_is_fused_inside_it(self):
+        body = make_dataflow_specs(
+            [("identity", ["K"], "c0"), ("equal", ["x", "c0"], "out")],
+            scalars={"K": self.ZERO},
+            local=["c0"],
+        )
+        [loop] = fuse([LoopSpec(count=4, body=body)])
+        self.assertEqual([spec.op for spec in loop.body], ["equal"])
 
 
 class TestPlanFusionStructure(FusionCase):
@@ -2314,7 +2595,14 @@ class TestRefusals(unittest.TestCase):
         source = inspect.getsource(ktir)
         labels = re.findall(r'_unimplemented\(\s*\n?\s*"([^"]+)"', source)
         self.assertEqual(sorted(labels), sorted(set(labels)))
-        self.assertEqual(sorted(labels), ["staggered-element-arrangement"])
+        self.assertEqual(
+            sorted(labels),
+            [
+                "identity-copy",
+                "identity-scalar-broadcast",
+                "staggered-element-arrangement",
+            ],
+        )
 
     def test_no_refusal_message_blames_a_consumer(self):
         """A refusal says what is missing here, not what someone else rejects.
@@ -2335,11 +2623,43 @@ class TestRefusals(unittest.TestCase):
             if isinstance(node, ast.Call)
             and getattr(node.func, "id", None) == "_unimplemented"
         ]
-        self.assertEqual(len(messages), 1)
+        self.assertEqual(len(messages), 3)
         for message in messages:
             with self.subTest(message=message[:40]):
                 for blame in ("dbo-opt", "no consumer", "nothing lowers", "scheduler"):
                     self.assertNotIn(blame, message)
+
+
+class TestIdentityRefusals(unittest.TestCase):
+    """What is left of an ``identity`` after fusion is refused by name."""
+
+    def _refusal(self, steps, **options):
+        specs = make_dataflow_specs(steps, **options)
+        with self.assertRaises(ktir.Unimplemented) as ctx:
+            ktir.build_kernel_plan(specs)
+        return str(ctx.exception)
+
+    def test_a_scalar_broadcast_that_cannot_be_a_literal_says_so(self):
+        message = self._refusal(
+            [("identity", ["K"], "c0"), ("where3", ["m", "p", "c0"], "out")],
+            scalars={"K": "0x4480"},
+            local=["c0"],
+        )
+        self.assertIn("[identity-scalar-broadcast]", message)
+        self.assertIn("finite fp32 value or fp16 zero", message)
+
+    def test_a_scalar_broadcast_read_from_another_kernel_says_so(self):
+        message = self._refusal(
+            [("identity", ["K"], "c0")],
+            scalars={"K": "0x00000000"},
+            dtype=DataFormats.IEEE_FP32,
+        )
+        self.assertIn("[identity-scalar-broadcast]", message)
+
+    def test_a_standalone_copy_is_a_copy_with_no_recipe(self):
+        message = self._refusal([("identity", ["x"], "out")])
+        self.assertIn("[identity-copy]", message)
+        self.assertIn("a copy with no recipe", message)
 
 
 class TestBroadcastOperands(unittest.TestCase):

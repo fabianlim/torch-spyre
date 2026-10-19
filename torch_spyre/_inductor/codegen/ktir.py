@@ -1778,6 +1778,8 @@ class KernelPlan:
                     f"OpSpec->KTIR: unexpected spec entry {type(entry).__name__}"
                 )
             if entry.op not in KtirBuilder.RECIPES:
+                if entry.op == "identity":
+                    _refuse_identity(entry)
                 raise NotImplementedError(
                     f"OpSpec->KTIR: op {entry.op!r} is not supported yet "
                     f"(registered: {sorted(KtirBuilder.RECIPES)})"
@@ -2140,6 +2142,33 @@ def _assert_one_pool(plan: KernelPlan) -> None:
     )
 
 
+def _refuse_identity(spec: OpSpec) -> NoReturn:
+    """Refuse an ``identity`` that plan fusion left in the kernel, by name.
+
+    Fusion deletes the two kinds it can (a scalar broadcast written as a literal,
+    a same-layout copy read in place), so one that survives is one of two things,
+    and they are refused differently because the remedy differs.  A scalar
+    broadcast must never fall through to a copy: reading its one-stick buffer as a
+    full tensor is silently wrong, not merely unsupported.
+    """
+    if any(arg.replicated_scalar is not None for arg in spec.args if arg.is_input):
+        _unimplemented(
+            "identity-scalar-broadcast",
+            "an 'identity' expanding a one-stick constant to a full tensor was not "
+            "fused into its reader.  It can only be written as a literal in that "
+            "reader's body, which needs the constant to be a finite fp32 value or "
+            "fp16 zero, and the reader to be a single op in this same kernel that "
+            "takes a literal operand; here it is not, and reading the stick as a "
+            "full tensor would give wrong numbers",
+        )
+    _unimplemented(
+        "identity-copy",
+        "an 'identity' is a copy with no recipe: fusion removes one that only "
+        "re-reads its source in place, so this one moves data or writes the "
+        "kernel's output, which needs a copy recipe that does not exist yet",
+    )
+
+
 # ---------------------------------------------------------------------------
 # PlanFusion: OpSpec sequences the device computes as one op, fused at PLAN time
 # ---------------------------------------------------------------------------
@@ -2156,18 +2185,25 @@ def _assert_one_pool(plan: KernelPlan) -> None:
 # OPPORTUNISTIC -- a strict subset of the scheduler's own fusion decisions,
 # converting a chosen fusion into a better kernel and never creating one.
 #
-# A SPAN is the run of CONSECUTIVE OpSpecs a pattern matched -- ``specs[i:i+n]``
-# for a pattern of n slots -- and it is the unit everything here works on: what a
-# pattern matches and what a rewrite consumes.  For the one entry shipped, a span
-# is two specs, an ``abs`` and the ``max`` that reads it.
+# A fusion is a PAIR: a producer spec and the one spec that reads its output.
+# The pair is found by DEPENDENCE and not by position -- "a spec of op P whose
+# only reader is a spec of op C", wherever the two sit in the list -- because the
+# scheduler's order says nothing about which specs are related, and a scalar
+# expansion routinely has an unrelated op between it and its reader.  Matching
+# that way is sound only because every buffer is written once and read after its
+# writer (``_check_write_once``), so the producer's source cannot have changed by
+# the time the consumer runs.  A fusion never crosses a ``LoopSpec`` boundary.
 #
-# AN ENTRY IS A PATTERN AND A RESULT NAME.  The pattern is positional op names
-# and reduction flags, a prefilter deciding which spans are considered at all;
-# the result name is what the collapsed span is called.  The rewrite is SHARED
-# (``_collapse_producer``) because nothing in it is specific to one entry: every
-# condition it checks is a fact about deleting a producer and reading its source
-# in its place.  There is exactly ONE rewrite, so no field names it; a field
-# selecting the rewrite earns its place when there is a second thing to select.
+# AN ENTRY IS A PATTERN, A RESULT NAME AND A REWRITE.  The pattern is the two op
+# names and reduction flags, a prefilter deciding which pairs are considered at
+# all; the result name is what the surviving consumer is called; the rewrite says
+# what the consumer's operand becomes once the producer is gone.  What every
+# rewrite shares -- a unary, kernel-local producer with exactly one reader, and
+# the bookkeeping for the deleted output -- is done once, by the caller.  The
+# rewrite is a field because it is behaviour that varies per entry, and it is
+# REQUIRED so that every entry states what it does: ``_read_source`` reads the
+# producer's own source in the producer's place, ``_use_value`` writes the
+# producer's constant as a literal in the consumer's body.
 #
 # THERE IS NO KTIR COST MODEL.  Without a cost function over emitted kernels
 # there is no basis on which to justify a MANDATORY fusion, so opportunistic is
@@ -2178,25 +2214,29 @@ _ABSMAX_OP = "absmax"
 
 @dataclasses.dataclass(frozen=True)
 class PlanFusion:
-    """One sequence of OpSpecs the device computes as a single op.
+    """One producer/consumer pair of OpSpecs the device computes as a single op.
 
-    ``pattern``    ``(op name, is_reduction)`` per slot, in vector order.  A
-                   cheap positional prefilter and nothing else: it decides which
-                   spans the rewrite is even asked about, and it is deliberately
+    ``pattern``    ``(op name, is_reduction)`` for the producer, then the
+                   consumer.  A cheap prefilter and nothing else: it decides which
+                   pairs the rewrite is even asked about, and it is deliberately
                    not where conditions live.
-    ``result_op``  what the collapsed span is called.  A ``RECIPES`` key if the
-                   kernel is to emit, but nothing here checks that: an
+    ``result_op``  what the surviving consumer is called.  A ``RECIPES`` key if
+                   the kernel is to emit, but nothing here checks that: an
                    unemittable result is ``_stages``' refusal to make, and it
                    names the op.
+    ``why``        the device fact that makes the fusion a fusion.
+    ``rewrite``    ``(producer, consumer, read) -> OpSpec | None``, where ``read``
+                   is the consumer's arg that reads the producer: the consumer
+                   with that operand replaced, or None to decline.  Required, so
+                   that every entry says what it does to the operand.
+    ``name``       for the logs.  A decline is silent by design -- almost every
+                   pair in every kernel is one -- so the name is what makes "why
+                   did my absmax not fuse" answerable at ``debug``.
     ``viable``     ``(fused) -> bool``: is the form about to be emitted one the
                    device computes CORRECTLY?  Separate from the rewrite because
                    it is a fact about the RESULT op on this hardware rather than
                    about collapsing anything, so it is the entry's only claim
                    about the device.  ``None`` means unconditional.
-    ``why``        the device fact that makes the fusion a fusion.
-    ``name``       for the logs.  A decline is silent by design -- almost every
-                   span in every kernel is one -- so the name is what makes "why
-                   did my absmax not fuse" answerable at ``debug``.
 
     Nothing validates the fields: an entry is source, and a malformed one fails
     where it is written the first time it is exercised rather than at import.
@@ -2206,6 +2246,7 @@ class PlanFusion:
     pattern: tuple[tuple[str, bool], ...]
     result_op: str
     why: str
+    rewrite: Callable[[OpSpec, OpSpec, TensorArg], OpSpec | None]
     viable: Callable[[OpSpec], bool] | None = None
 
 
@@ -2286,79 +2327,25 @@ def _access_preserving(source: TensorArg, result: TensorArg) -> bool:
     )
 
 
-def _collapse_producer(
-    span: Sequence[OpSpec], specs: Sequence[Any], result_op: str
-) -> OpSpec | None:
-    """A pair into one ``result_op`` reading the producer's own source.
+def _source_of(producer: OpSpec) -> TensorArg:
+    """The one input of a unary ``producer``; the caller has checked there is one."""
+    roles = _roles(producer)
+    assert roles is not None and len(roles[1]) == 1, producer.op
+    return roles[1][0]
 
-    The one rewrite the table has, and it is shared: ``span`` is a producer and
-    the consumer that survives it, and the only thing an entry contributes is
-    the name the survivor comes out under.  None DECLINES, which is not an
-    error: a span that is not this shape reaches ``_stages``, whose per-op refusal
-    ("op 'abs' is not supported yet") is the truth about it.
 
-    The producer is DELETED, not threaded.  The device primitive standing behind
-    an entry does the pointwise pass's work inside the surviving op -- the min/max
-    unit takes the absolute value as a mode bit -- so there is no intermediate left
-    to put anywhere.  A fusion whose ops both survive would instead leave a value
-    crossing a compute stage, which aborts the backend outright.
-
-    Deleting the producer is what every condition below is about:
-
-    * it must be unary, or there is no single source to read instead of it;
-    * it must be ACCESS-PRESERVING, or the survivor's description of its input
-      does not describe that source;
-    * the link must be KERNEL-LOCAL and must be read exactly ONCE, by the
-      survivor.  Two halves of one condition: locality (``TensorArg``, filled by
-      the scheduler) rules out a reader this spec list cannot see, and the count
-      rules out ``a = abs(x); amax(a, -1) + sum(a, -1)``, where the second
-      consumer sits AFTER the pair -- so the pair is still adjacent, and a
-      matcher trusting adjacency deletes a buffer the ``sum`` still reads.
+def _reading(
+    consumer: OpSpec, read: TensorArg, source: TensorArg, **extra: Any
+) -> OpSpec:
+    """``consumer`` with its operand ``read`` taking over ``source``'s buffer.
 
     Only buffer IDENTITY moves across: name, arg index, allocation, format.  The
-    extents and coordinates stay the survivor's own, because each spec writes
-    its coordinates against its own iteration-space symbols and splicing one
-    into the other would mix two namespaces -- a kernel that compiles and
-    addresses the wrong elements, which is the worst failure available here.
+    extents and coordinates stay the consumer's own, because each spec writes its
+    coordinates against its own iteration-space symbols and splicing one into the
+    other would mix two namespaces -- a kernel that compiles and addresses the
+    wrong elements, which is the worst failure available here.  ``read`` is found
+    by identity, so which operand it is says nothing about where it sits.
     """
-    # A pair, because collapsing a producer into its consumer is what this is;
-    # an entry pairing a pattern of another length with it is a typo in the
-    # table, and one that fails here the first time the pattern matches.
-    producer, survivor = span
-    roles = _roles(producer)
-    if roles is None:
-        _decline("%r does not write exactly one output", producer.op)
-        return None
-    producer_out, producer_ins = roles
-    if len(producer_ins) != 1:
-        _decline("producer %r is not unary", producer.op)
-        return None
-    [source] = producer_ins
-    if not _access_preserving(source, producer_out):
-        _decline(
-            "producer %r is not access-preserving, so its source is not a "
-            "drop-in for its result",
-            producer.op,
-        )
-        return None
-    if not producer_out.kernel_local:
-        _decline(
-            "link %s is not kernel-local, so deleting its producer would strand "
-            "a reader outside this kernel",
-            buf_id(producer_out),
-        )
-        return None
-    link = buf_id(producer_out)
-    reads = _readers(link, specs)
-    if len(reads) != 1 or reads[0][0] is not survivor:
-        _decline(
-            "link %s is read %d time(s) in this kernel, not once by %r",
-            link,
-            len(reads),
-            survivor.op,
-        )
-        return None
-    [(_reader, read)] = reads
     args = [
         (
             dataclasses.replace(
@@ -2367,13 +2354,93 @@ def _collapse_producer(
                 arg_index=source.arg_index,
                 allocation=dict(source.allocation),
                 device_dtype=source.device_dtype,
+                **extra,
             )
             if arg is read
             else arg
         )
-        for arg in survivor.args
+        for arg in consumer.args
     ]
-    return dataclasses.replace(survivor, op=result_op, args=args)
+    return dataclasses.replace(consumer, args=args)
+
+
+def _read_source(producer: OpSpec, consumer: OpSpec, read: TensorArg) -> OpSpec | None:
+    """The consumer reads the producer's own source where it read the producer.
+
+    Right when the producer only re-reads its source in place -- the ``abs`` under
+    a ``max``, the bool cast under a select -- so ``_access_preserving`` is the
+    guard: the consumer's own description of its operand must already describe the
+    source.  Without it a BROADCASTING producer fuses, and the consumer reads past
+    the end of a smaller buffer, which the backend compiler accepts.
+    """
+    [result] = [arg for arg in producer.args if not arg.is_input]
+    source = _source_of(producer)
+    if not _access_preserving(source, result):
+        _decline(
+            "producer %r is not access-preserving, so its source is not a "
+            "drop-in for its result",
+            producer.op,
+        )
+        return None
+    return _reading(consumer, read, source)
+
+
+def _use_value(producer: OpSpec, consumer: OpSpec, read: TensorArg) -> OpSpec | None:
+    """The consumer uses the producer's constant as a literal in its body.
+
+    For a producer that expands a one-stick constant to a full tensor.  The
+    operand takes the constant's buffer, marked ``replicated_scalar``, and
+    ``_inlined_constants`` then writes the number into the consumer and drops the
+    read.  Reading that buffer as a full tensor instead would run past its end, so
+    this must decline unless the literal really is taken: the constant must pass
+    ``_inline_constant`` AND the consumer, as it would be after the replacement,
+    must still have ``_inlined_constants`` for it (a scalar payload arm, not
+    ``unfused``, a tensor operand left).  Asked of the replacement BEFORE anything
+    is deleted, so a decline leaves the producer and the kernel as they were.
+    """
+    source = _source_of(producer)
+    if _inline_constant(source) is None:
+        _decline(
+            "producer %r's input is not a constant the backend takes as a literal",
+            producer.op,
+        )
+        return None
+    fused = _reading(consumer, read, source, replicated_scalar=source.replicated_scalar)
+    recipe = KtirBuilder.RECIPES.get(fused.op)
+    inputs = [arg for arg in fused.args if arg.is_input]
+    try:
+        takes_literal = recipe is not None and bool(
+            _inlined_constants(recipe, dtype_of(fused), inputs)
+        )
+    except NotImplementedError:
+        takes_literal = False
+    if not takes_literal:
+        _decline(
+            "consumer %r cannot take a literal operand, so deleting %r would "
+            "leave a one-stick buffer read as a full tensor",
+            consumer.op,
+            producer.op,
+        )
+        return None
+    return fused
+
+
+# The consumers an ``identity`` scalar broadcast is fused into as a literal.  Each
+# has a scalar payload arm (``_has_payload_arm``), which is where a literal lives;
+# ``_inlined_constants`` still decides per kernel, so a name here is a prefilter.
+_LITERAL_CONSUMERS = (
+    "where3",
+    "equal",
+    "notequal",
+    "greaterequal",
+    "greaterthan",
+    "lesserequal",
+    "lesserthan",
+    "add",
+    "sub",
+    "mul",
+    "realdiv",
+)
 
 
 PLAN_FUSIONS: tuple[PlanFusion, ...] = (
@@ -2381,6 +2448,7 @@ PLAN_FUSIONS: tuple[PlanFusion, ...] = (
         name="absmax",
         pattern=(("abs", False), ("max", True)),
         result_op=_ABSMAX_OP,
+        rewrite=_read_source,
         why=(
             "the min/max unit takes the absolute value as a mode bit, so max(|x|) "
             "is one reduction and not a pointwise pass plus a reduction; and a "
@@ -2388,107 +2456,224 @@ PLAN_FUSIONS: tuple[PlanFusion, ...] = (
             "only shape it takes an abs in"
         ),
     ),
+    PlanFusion(
+        name="identity-copy-into-where3",
+        pattern=(("identity", False), ("where3", False)),
+        result_op="where3",
+        rewrite=_read_source,
+        why=(
+            "a same-layout copy changes no element, so the select can read the "
+            "copy's source directly; the bool cast of a comparison's result is "
+            "one, and a standalone identity has no recipe to emit it with"
+        ),
+    ),
+    *(
+        PlanFusion(
+            name=f"identity-scalar-into-{op}",
+            pattern=(("identity", False), (op, False)),
+            result_op=op,
+            rewrite=_use_value,
+            why=(
+                "an identity expanding a one-stick constant only exists to give "
+                f"{op} a full-size operand, and {op} takes the number as a literal "
+                "in its body; the expanded copy has no recipe to emit it with, "
+                "and reading the one-stick buffer as a full tensor runs past its end"
+            ),
+        )
+        for op in _LITERAL_CONSUMERS
+    ),
 )
+
+
+def _check_write_once(specs: Sequence[Any]) -> None:
+    """Raise unless every buffer has one writer and its readers come after it.
+
+    The property that makes matching by dependence sound.  A producer and its one
+    reader may have other specs between them, and deleting the producer is right
+    only if its source cannot have changed in that gap; with every buffer written
+    once, it cannot.  Asserted rather than assumed, so a spec list that breaks it
+    fails here, naming the buffer, and not as a wrong answer.  A spec that reads
+    the buffer it writes is in-place aliasing, which ``_compute_step`` refuses in
+    its own words, so it is not this check's to pre-empt.
+    """
+    written: dict[str, int] = {}
+    ordered = list(_op_specs(specs))
+    for position, spec in enumerate(ordered):
+        for arg in spec.args:
+            if arg.is_input:
+                continue
+            link = buf_id(arg)
+            if link in written:
+                raise AssertionError(
+                    f"plan fusion: buffer {link!r} is written by more than one "
+                    f"spec ({ordered[written[link]].op!r} and {spec.op!r}); "
+                    "matching a producer to its reader by dependence needs every "
+                    "buffer written once"
+                )
+            written[link] = position
+    for position, spec in enumerate(ordered):
+        for arg in spec.args:
+            if arg.is_input and written.get(buf_id(arg), position) > position:
+                raise AssertionError(
+                    f"plan fusion: buffer {buf_id(arg)!r} is read by "
+                    f"{spec.op!r} before the spec that writes it "
+                    f"({ordered[written[buf_id(arg)]].op!r})"
+                )
 
 
 def apply_plan_fusions(
     specs: Sequence[Any], table: Sequence[PlanFusion] = PLAN_FUSIONS
 ) -> tuple[tuple[Any, ...], tuple[TensorArg, ...]]:
-    """``specs`` with every table match collapsed, and every arg thereby orphaned.
+    """``specs`` with every table match fused, and every arg thereby orphaned.
 
     Recurses into ``LoopSpec`` bodies because ``_divisions`` reads every op at
-    every depth (``_op_specs``) and this runs before it.
+    every depth (``_op_specs``) and this runs before it.  A fusion never reaches
+    across a loop boundary: the producer and its reader are both in the list
+    being scanned, directly.
 
-    Matching is POSITIONAL and adjacent, which is what the vector is: a linear
-    step order the emitted kernel executes in sequence.  A dataflow matcher
-    would find pairs this misses, but it would then have to prove reordering
-    them into adjacency is legal, which is a scheduling decision this layer has
-    declined to make.  Adjacency is therefore not relied on for soundness: the
-    condition it used to stand in for -- one reader of the link buffer -- is
-    checked directly by the rewrite.
+    Matching is by DEPENDENCE.  A producer is a spec an entry's first slot names;
+    its reader is the one spec that reads its output, wherever that sits.  Where
+    the two sit says nothing, which is sound because of ``_check_write_once``,
+    asserted first.  A fusion deletes the producer and replaces the reader in
+    place, and can expose another (an ``identity`` feeding an ``identity``), so
+    the scan repeats until no entry fires.
 
-    The second element is every output arg of a collapsed span that the fused
-    spec does not write and that the caller still passes (``arg_index >= 0``):
-    a real kernel argument whose producer just got deleted.  ``KernelPlan.
-    add_specs`` re-declares it, which is the whole point of returning it rather
-    than letting it vanish here.
+    The second element is every output arg of a deleted spec that the fused spec
+    does not write and that the caller still passes (``arg_index >= 0``): a real
+    kernel argument whose producer just got deleted.  ``KernelPlan.add_specs``
+    re-declares it, which is the whole point of returning it rather than letting
+    it vanish here.
     """
-    out: list[Any] = []
+    _check_write_once(specs)
     dropped: list[TensorArg] = []
-    i = 0
-    while i < len(specs):
-        entry = specs[i]
+    out: list[Any] = []
+    for entry in specs:
         if isinstance(entry, LoopSpec):
             # ``LoopSpec.body`` is declared a list, so the rebuilt body is one:
             # this is the contract's own type and not a copy taken for safety.
             body, nested_dropped = apply_plan_fusions(entry.body, table)
-            out.append(dataclasses.replace(entry, body=list(body)))
+            entry = dataclasses.replace(entry, body=list(body))
             dropped.extend(nested_dropped)
-            i += 1
-            continue
-        for fusion in table:
-            fused = _apply(fusion, specs, i)
-            if fused is None:
-                continue
-            span = specs[i : i + len(fusion.pattern)]
-            logger.debug(
-                "plan fusion %r collapsed op %r into %r; buffer %s ceased to exist",
-                fusion.name,
-                entry.op,
-                fused.op,
-                ", ".join(buf_id(a) for a in entry.args if not a.is_input),
-            )
-            fused_writes = {buf_id(a) for a in fused.args if not a.is_input}
-            for spec in span:
-                for arg in spec.args:
-                    if arg.is_input or buf_id(arg) in fused_writes:
-                        continue
-                    if arg.arg_index < 0:
-                        continue  # never passed; nothing to keep declaring
-                    logger.warning(
-                        "plan fusion %r deleted op %r, whose output buffer %s "
-                        "(arg_index %d) the caller still allocates and passes; "
-                        "the kernel keeps declaring it to preserve positional "
-                        "argument binding, but nothing in the fused kernel "
-                        "writes it",
-                        fusion.name,
-                        spec.op,
-                        buf_id(arg),
-                        arg.arg_index,
-                    )
-                    dropped.append(arg)
-            out.append(fused)
-            i += len(fusion.pattern)
-            break
-        else:
-            out.append(entry)
-            i += 1
+        out.append(entry)
+    while (found := _find_fusion(out, table)) is not None:
+        fusion, producer, consumer, fused = found
+        logger.debug(
+            "plan fusion %r collapsed op %r into %r; buffer %s ceased to exist",
+            fusion.name,
+            producer.op,
+            fused.op,
+            ", ".join(buf_id(a) for a in producer.args if not a.is_input),
+        )
+        fused_writes = {buf_id(a) for a in fused.args if not a.is_input}
+        for spec in (producer, consumer):
+            for arg in spec.args:
+                if arg.is_input or buf_id(arg) in fused_writes:
+                    continue
+                if arg.arg_index < 0:
+                    continue  # never passed; nothing to keep declaring
+                logger.warning(
+                    "plan fusion %r deleted op %r, whose output buffer %s "
+                    "(arg_index %d) the caller still allocates and passes; "
+                    "the kernel keeps declaring it to preserve positional "
+                    "argument binding, but nothing in the fused kernel "
+                    "writes it",
+                    fusion.name,
+                    spec.op,
+                    buf_id(arg),
+                    arg.arg_index,
+                )
+                dropped.append(arg)
+        index = next(i for i, spec in enumerate(out) if spec is consumer)
+        out[index] = fused
+        out = [spec for spec in out if spec is not producer]
     return tuple(out), tuple(dropped)
 
 
-def _apply(fusion: PlanFusion, specs: Sequence[Any], i: int) -> OpSpec | None:
-    """The fused spec for ``specs[i : i + len(pattern)]``, or None: not a match.
+def _find_fusion(
+    specs: Sequence[Any], table: Sequence[PlanFusion]
+) -> tuple[PlanFusion, OpSpec, OpSpec, OpSpec] | None:
+    """The first ``(entry, producer, consumer, fused)`` the table fires on, or None.
 
-    Three questions in order of cost, and the order is the point: the pattern is
-    a positional comparison over every span of every kernel, the rewrite runs
-    only on spans that pass it, and viability is asked of the spec the rewrite
-    produced rather than of one it has to imagine.
+    Producers are tried in list order and entries in table order, so the result
+    is deterministic.  Only specs directly in ``specs`` are candidates on either
+    side; a reader inside a loop body still COUNTS as a reader (``_readers``
+    looks through loops), which is what declines a producer whose output a loop
+    reads, rather than fusing across the boundary.
     """
-    # An empty pattern would match at zero length everywhere and advance the walk
-    # by nothing.  A table is source, so this is a typo two hundred lines away
-    # and not a vector to decline.
-    assert fusion.pattern, f"fusion {fusion.name!r} has an empty pattern"
-    span = specs[i : i + len(fusion.pattern)]
-    if len(span) != len(fusion.pattern):
+    for producer in specs:
+        if not isinstance(producer, OpSpec):
+            continue
+        for fusion in table:
+            # An empty pattern would match everything; a table is source, so this
+            # is a typo two hundred lines away and not a vector to decline.
+            assert len(fusion.pattern) == 2, (
+                f"fusion {fusion.name!r} is not a producer/consumer pair"
+            )
+            matched = _apply(fusion, producer, specs)
+            if matched is not None:
+                consumer, fused = matched
+                return fusion, producer, consumer, fused
+    return None
+
+
+def _apply(
+    fusion: PlanFusion, producer: OpSpec, specs: Sequence[Any]
+) -> tuple[OpSpec, OpSpec] | None:
+    """``(consumer, fused)`` for ``producer`` under ``fusion``, or None: no match.
+
+    Questions in order of cost, and the order is the point: the pattern is a
+    comparison made for every spec of every kernel, the structural conditions run
+    only on those that pass it, the rewrite only on those that pass those, and
+    viability is asked of the spec the rewrite produced rather than of one it has
+    to imagine.  None DECLINES, which is not an error: a pair that is not this
+    shape reaches ``_stages``, whose per-op refusal is the truth about it.
+
+    The conditions are the ones deleting a producer needs whatever the rewrite:
+
+    * it must write exactly one output and read exactly one input, or there is
+      no single source to put in its place;
+    * the output must be KERNEL-LOCAL and read exactly ONCE, by the consumer.
+      Two halves of one condition: locality (``TensorArg``, filled by the
+      scheduler) rules out a reader this spec list cannot see, and the count rules
+      out ``a = abs(x); amax(a, -1) + sum(a, -1)``, where a second consumer would
+      lose a buffer that no longer exists.
+    """
+    (producer_op, producer_reduces), (consumer_op, consumer_reduces) = fusion.pattern
+    if producer.op != producer_op or bool(producer.is_reduction) != producer_reduces:
         return None
-    for (op, is_reduction), spec in zip(fusion.pattern, span, strict=True):
-        if not isinstance(spec, OpSpec):
-            return None
-        if spec.op != op or bool(spec.is_reduction) != is_reduction:
-            return None
-    fused = _collapse_producer(span, specs, fusion.result_op)
+    roles = _roles(producer)
+    if roles is None:
+        _decline("%r does not write exactly one output", producer.op)
+        return None
+    producer_out, producer_ins = roles
+    if len(producer_ins) != 1:
+        _decline("producer %r is not unary", producer.op)
+        return None
+    link = buf_id(producer_out)
+    reads = _readers(link, specs)
+    if len(reads) != 1:
+        _decline(
+            "link %s is read %d time(s) in this kernel, not once", link, len(reads)
+        )
+        return None
+    [(consumer, read)] = reads
+    if (
+        consumer.op != consumer_op
+        or bool(consumer.is_reduction) != consumer_reduces
+        or not any(consumer is spec for spec in specs)
+    ):
+        return None
+    if not producer_out.kernel_local:
+        _decline(
+            "link %s is not kernel-local, so deleting its producer would strand "
+            "a reader outside this kernel",
+            link,
+        )
+        return None
+    fused = fusion.rewrite(producer, consumer, read)
     if fused is None:
         return None
+    fused = dataclasses.replace(fused, op=fusion.result_op)
     if fusion.viable is not None:
         try:
             ok = fusion.viable(fused)
@@ -2505,7 +2690,7 @@ def _apply(fusion: PlanFusion, specs: Sequence[Any], i: int) -> OpSpec | None:
                 fused.op,
             )
             return None
-    return fused
+    return consumer, fused
 
 
 def validated_roles(spec: OpSpec) -> tuple[TensorArg, list[TensorArg]]:

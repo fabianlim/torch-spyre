@@ -28,6 +28,7 @@ import unittest
 from test_ktir_validate import (
     make_broadcast_op_spec,
     make_chained_op_specs,
+    make_dataflow_specs,
     make_nested_op_spec,
     make_onstick_sum_specs,
     make_op_spec,
@@ -1075,6 +1076,38 @@ class TestInlinedConstantEmission(unittest.TestCase):
         """Which op it is does not decide this: a scalar payload spelling does."""
         emitted = self._emit(self.FP32, "0x41200000", op="equal")
         self._assert_inlined(emitted)
+        self.assertIn("spyreop.compare <equal> %in, %cst", emitted)
+
+
+@unittest.skipUnless(
+    _mlir_ktdp_available(),
+    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
+)
+class TestFusedIdentityEmission(unittest.TestCase):
+    """A scalar-expansion ``identity`` fused away reaches the kernel as a literal."""
+
+    @staticmethod
+    def _emit(op, reads, scalar):
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        specs = make_dataflow_specs(
+            [("identity", ["K"], "c0"), (op, reads, "out")],
+            scalars={"K": scalar},
+            local=["c0"],
+            dtype=DataFormats.IEEE_FP32,
+        )
+        return generate_ktir("k_identity", specs)
+
+    def test_a_select_arm_is_a_literal_and_its_stick_is_not_viewed(self):
+        emitted = self._emit("where3", ["m", "p", "c0"], "0x41200000")  # 10.0
+        self.assertIn("arith.constant 1.000000e+01 : f32", emitted)
+        self.assertIn("spyreop.select", emitted)
+        # The constant's parameter is still declared, with no view built for it.
+        self.assertIn("%arg1: index", emitted)
+        self.assertNotIn("construct_memory_view %arg1", emitted)
+
+    def test_a_comparison_against_a_broadcast_zero_is_a_literal(self):
+        emitted = self._emit("equal", ["x", "c0"], "0x00000000")
         self.assertIn("spyreop.compare <equal> %in, %cst", emitted)
 
 
